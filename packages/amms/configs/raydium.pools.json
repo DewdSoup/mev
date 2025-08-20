@@ -1,0 +1,12 @@
+[
+    {
+        "id": "SOL_USDC_RAYDIUM_CPMM",
+        "ammId": "",
+        "baseMint": "So11111111111111111111111111111111111111112",
+        "quoteMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "baseDecimals": 9,
+        "quoteDecimals": 6,
+        "symbol": "SOL/USDC",
+        "name": "SOL/USDC (Raydium CPMM)"
+    }
+]

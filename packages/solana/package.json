@@ -1,0 +1,23 @@
+{
+    "name": "@mev/solana",
+    "version": "0.0.0",
+    "type": "module",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "build": "tsc -b"
+    },
+    "dependencies": {
+        "@mev/storage": "workspace:*",
+        "@solana/spl-token": "^0.4.13",
+        "@solana/web3.js": "^1.98.4"
+    },
+    "devDependencies": {
+        "@types/node": "^24.2.1",
+        "tsx": "^4.20.3",
+        "typescript": "^5.9.2"
+    }
+}

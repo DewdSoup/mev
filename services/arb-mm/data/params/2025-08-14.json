@@ -1,0 +1,34 @@
+{
+  "date": "2025-08-14",
+  "best": {
+    "TRADE_THRESHOLD_BPS": 2,
+    "MAX_SLIPPAGE_BPS": 0.5,
+    "TRADE_SIZE_BASE": 0.05,
+    "objective_total_expected_pnl": 0,
+    "contributing_rows": 0
+  },
+  "grid": {
+    "thresholds": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      8,
+      10
+    ],
+    "slips": [
+      0.5,
+      1,
+      1.5,
+      2
+    ],
+    "sizes": [
+      0.05,
+      0.1,
+      0.2
+    ]
+  },
+  "source_features": "services/arb-mm/data/features/sol_usdc/v1/2025-08-15.jsonl",
+  "generated_at": "2025-08-15T08:31:04.847Z"
+}

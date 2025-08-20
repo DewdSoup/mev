@@ -1,0 +1,15 @@
+{
+  "window_from": "1969-12-31T23:45:00.638Z",
+  "window_to": "1970-01-01T00:00:00.638Z",
+  "considered": 0,
+  "would_trade": 0,
+  "would_not_trade": 0,
+  "pnl_sum": 0,
+  "best_edge_bps": 0,
+  "worst_edge_bps": 0,
+  "threshold_bps": 5,
+  "slippage_bps": 1,
+  "trade_size_base": 0.1,
+  "book_ttl_ms": 5000,
+  "anchor_label": "19700101T000000Z"
+}

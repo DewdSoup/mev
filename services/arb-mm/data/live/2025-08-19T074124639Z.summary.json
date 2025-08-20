@@ -1,0 +1,18 @@
+{
+  "started_at": "2025-08-19T07:41:17.433Z",
+  "stopped_at": "2025-08-19T07:41:24.639Z",
+  "considered": 4,
+  "would_trade": 0,
+  "would_not_trade": 4,
+  "pnl_sum": 0,
+  "best_edge_bps": -0.3441,
+  "worst_edge_bps": -2.942,
+  "threshold_bps": 0.1,
+  "slippage_bps": 1,
+  "trade_size_base": 0.001,
+  "book_ttl_ms": 500,
+  "decision_dedupe_ms": 1000,
+  "decision_bucket_ms": 250,
+  "min_edge_delta_bps": 0.1,
+  "allow_synth_trades": false
+}

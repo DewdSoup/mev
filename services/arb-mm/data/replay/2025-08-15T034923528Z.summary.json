@@ -1,0 +1,12 @@
+{
+  "considered": 770,
+  "would_trade": 758,
+  "would_not_trade": 12,
+  "pnl_sum": 309.922697,
+  "best_edge_bps": 489.6375,
+  "worst_edge_bps": 0.2864,
+  "threshold_bps": 5,
+  "slippage_bps": 1,
+  "trade_size_base": 0.1,
+  "book_ttl_ms": 5000
+}

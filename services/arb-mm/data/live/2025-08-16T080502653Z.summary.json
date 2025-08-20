@@ -1,0 +1,25 @@
+{
+  "started_at": "2025-08-16T08:04:50.604Z",
+  "stopped_at": "2025-08-16T08:05:02.653Z",
+  "considered": 1,
+  "would_trade": 0,
+  "would_not_trade": 1,
+  "pnl_sum": 0,
+  "best_edge_bps": -6.5717,
+  "worst_edge_bps": -6.5717,
+  "threshold_bps": 2,
+  "slippage_bps": 0.5,
+  "trade_size_base": 0.05,
+  "book_ttl_ms": 5000,
+  "decision_dedupe_ms": 1000,
+  "decision_bucket_ms": 250,
+  "min_edge_delta_bps": 0.25,
+  "allow_synth_trades": false,
+  "rpc": {
+    "samples": 24,
+    "p50_ms": 126,
+    "p95_ms": 184,
+    "blocked_due_to_deviation": 0,
+    "used_swap_sim": "true"
+  }
+}

@@ -1,0 +1,2 @@
+{"ts":1755592224803,"kind":"submit","path":"AMM->PHX","size_base":0.001,"buy_px":179.846189,"sell_px":180.083996,"notional_quote":0.179965,"cu_limit":400000,"submit_mode":"rpc"}
+{"ts":1755592225102,"kind":"error","where":"send","error":"Error: Simulation failed. \nMessage: Transaction signature verification failure. \n\nCatch the `SendTransactionError` and call `getLogs()` on it for full details."}

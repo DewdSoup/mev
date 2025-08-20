@@ -1,0 +1,5 @@
+node_modules/
+dist/
+
+# ignore heavy tmp outputs
+packages/amms/configs/.tmp/

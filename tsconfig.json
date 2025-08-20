@@ -1,0 +1,26 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/core" },
+    { "path": "./packages/risk" },
+    { "path": "./packages/storage" },
+    { "path": "./packages/phoenix" },
+    { "path": "./packages/amms" },
+    { "path": "./packages/solana" },
+    { "path": "./services/arb-mm" }
+  ],
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "node",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "noEmitOnError": false,
+    "lib": ["ES2022"],
+    "types": ["node"]
+  }
+}

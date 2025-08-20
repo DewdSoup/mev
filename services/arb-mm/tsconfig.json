@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "composite": true,
+    "types": ["node"]
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../../packages/core" },
+    { "path": "../../packages/risk" },
+    { "path": "../../packages/storage" },
+    { "path": "../../packages/amms" },
+    { "path": "../../packages/phoenix" },
+    { "path": "../../packages/solana" }
+  ]
+}
