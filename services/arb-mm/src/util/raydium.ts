@@ -1,28 +1,29 @@
 // services/arb-mm/src/util/raydium.ts
-// Real AmmV4 swap builder that loads pre-dumped pool keys (configs/raydium.pool.json)
-// Accurate minOut handling: SDK compute when available; CPMM math fallback otherwise.
-// Compatible with @raydium-io/raydium-sdk 1.3.1-beta.58.
+// Raydium CPMM live swap builder using on-disk full pool keys (configs/raydium.pool.json).
+// Runtime is .env-only. No CLI flags, no guessing.
 
 import fs from "fs";
 import path from "path";
+import BN from "bn.js";
 import {
   Connection,
   PublicKey,
   TransactionInstruction,
   clusterApiUrl,
 } from "@solana/web3.js";
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore
 import {
   Liquidity,
-  MAINNET_PROGRAM_ID,
-  Token,
-  TokenAmount,
-  Percent,
+  LiquidityPoolKeys,
+  SPL_ACCOUNT_LAYOUT,
 } from "@raydium-io/raydium-sdk";
-import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
-export const CPMM_PROGRAM_ID = MAINNET_PROGRAM_ID.AmmV4;
+// ───────────────────────────────────────────────────────────────────────────────
+// Env-driven constants (safe defaults; .env overrides)
+export const CPMM_PROGRAM_ID = new PublicKey(
+  process.env.RAYDIUM_CPMM_PROGRAM_ID ??
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+);
 export const SOL_MINT = new PublicKey(
   process.env.SOL_MINT ?? "So11111111111111111111111111111111111111112"
 );
@@ -30,229 +31,325 @@ export const USDC_MINT = new PublicKey(
   process.env.USDC_MINT ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 );
 export const DEFAULT_SOL_USDC_POOL = new PublicKey(
-  process.env.RAYDIUM_POOL_ID ?? "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+  process.env.RAYDIUM_POOL_ID ??
+    "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
 );
 
-function makeConn() {
-  const url = process.env.RPC_URL || clusterApiUrl("mainnet-beta");
-  return new Connection(url, "processed");
+// Optional flags (all default OFF)
+const LOG_MINOUT = (process.env.LOG_RAYDIUM_MINOUT ?? "0") === "1";
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Pool JSON discovery: multiple sane locations + optional .env override
+function findPoolJsonPath(): string {
+  const envPath = process.env.RAYDIUM_POOL_JSON_PATH?.trim();
+  if (envPath && fs.existsSync(envPath)) return path.resolve(envPath);
+
+  const candidates = [
+    path.resolve(process.cwd(), "configs", "raydium.pool.json"),
+    path.resolve(process.cwd(), "..", "configs", "raydium.pool.json"),
+    path.resolve(process.cwd(), "..", "..", "configs", "raydium.pool.json"),
+    path.resolve(__dirname, "..", "..", "configs", "raydium.pool.json"),
+    path.resolve(__dirname, "..", "..", "..", "configs", "raydium.pool.json"),
+  ];
+  for (const p of candidates) if (fs.existsSync(p)) return p;
+  return "";
 }
 
-/* ───────────────────────────── Pool keys normalization ───────────────────────────── */
+const POOL_JSON_PATH = findPoolJsonPath();
 
-function normalizePoolKeys(raw: any) {
-  // Accept both legacy and v4 field names; map to what SDK expects (string values).
-  const out: any = { ...raw };
-  if (!out.authority && raw.ammAuthority) out.authority = raw.ammAuthority;
-  if (!out.openOrders && raw.ammOpenOrders) out.openOrders = raw.ammOpenOrders;
-  if (!out.targetOrders && raw.ammTargetOrders) out.targetOrders = raw.ammTargetOrders;
+// On-disk JSON shape (matches your full keys file)
+type DiskPoolKeys = {
+  id: string;
+  programId: string;
+  authority: string;
+  openOrders: string;
+  targetOrders: string;
+  baseVault: string;
+  quoteVault: string;
+  withdrawQueue: string;
+  lpVault: string;
+  baseMint: string;
+  quoteMint: string;
+  marketProgramId: string;
+  marketId: string;
+  marketBids: string;
+  marketAsks: string;
+  marketEventQueue: string;
+  marketBaseVault: string;
+  marketQuoteVault: string;
+  marketAuthority?: string;
+  lpMint?: string;
+  version: 4 | 5 | number;
+};
 
-  if (!out.baseVault && raw.poolCoinTokenAccount) out.baseVault = raw.poolCoinTokenAccount;
-  if (!out.quoteVault && raw.poolPcTokenAccount) out.quoteVault = raw.poolPcTokenAccount;
+function readPoolJson(): DiskPoolKeys {
+  if (!POOL_JSON_PATH) {
+    throw new Error(
+      "raydium_swap_build_error: Missing configs/raydium.pool.json. " +
+        "Set RAYDIUM_POOL_JSON_PATH in .env or place the file in repo root configs/."
+    );
+  }
+  const raw = fs.readFileSync(POOL_JSON_PATH, "utf8");
+  const j = JSON.parse(raw) as DiskPoolKeys;
 
-  if (!out.withdrawQueue && raw.poolWithdrawQueue) out.withdrawQueue = raw.poolWithdrawQueue;
-  if (!out.lpVault && raw.poolTempLpTokenAccount) out.lpVault = raw.poolTempLpTokenAccount;
+  const req = [
+    "id",
+    "programId",
+    "authority",
+    "openOrders",
+    "targetOrders",
+    "baseVault",
+    "quoteVault",
+    "withdrawQueue",
+    "lpVault",
+    "baseMint",
+    "quoteMint",
+    "marketProgramId",
+    "marketId",
+    "marketBids",
+    "marketAsks",
+    "marketEventQueue",
+    "marketBaseVault",
+    "marketQuoteVault",
+    "version",
+  ] as const;
+  for (const k of req) {
+    // @ts-ignore
+    if (!j[k]) throw new Error(`raydium_pool_json_invalid: missing ${k}`);
+  }
+  return j;
+}
 
-  if (!out.marketProgramId && raw.serumProgramId) out.marketProgramId = raw.serumProgramId;
-  if (!out.marketId && raw.serumMarket) out.marketId = raw.serumMarket;
-  if (!out.marketBids && raw.serumBids) out.marketBids = raw.serumBids;
-  if (!out.marketAsks && raw.serumAsks) out.marketAsks = raw.serumAsks;
-  if (!out.marketEventQueue && raw.serumEventQueue) out.marketEventQueue = raw.serumEventQueue;
-  if (!out.marketBaseVault && raw.serumCoinVaultAccount) out.marketBaseVault = raw.serumCoinVaultAccount;
-  if (!out.marketQuoteVault && raw.serumPcVaultAccount) out.marketQuoteVault = raw.serumPcVaultAccount;
-  if (!out.marketAuthority && raw.serumVaultSigner) out.marketAuthority = raw.serumVaultSigner;
+function toPoolKeys(d: DiskPoolKeys): LiquidityPoolKeys {
+  const v = (d.version === 5 ? 5 : 4) as 4 | 5;
 
-  const required = [
-    "id","programId","authority","openOrders","targetOrders",
-    "baseVault","quoteVault",
-    "marketProgramId","marketId","marketBids","marketAsks","marketEventQueue",
-    "marketBaseVault","marketQuoteVault","marketAuthority",
-    "baseMint","quoteMint"
-  ];
-  for (const k of required) if (!out[k]) throw new Error(`raydium.pool.json missing required key: ${k}`);
+  // Build then assert via unknown to bypass overly strict SDK typings.
+  const out = {
+    id: new PublicKey(d.id),
+    baseMint: new PublicKey(d.baseMint),
+    quoteMint: new PublicKey(d.quoteMint),
+    lpMint: new PublicKey(d.lpMint ?? d.baseMint), // not used by swap, satisfies type
+    version: v,
+    programId: new PublicKey(d.programId),
+    authority: new PublicKey(d.authority),
+    openOrders: new PublicKey(d.openOrders),
+    targetOrders: new PublicKey(d.targetOrders),
+    baseVault: new PublicKey(d.baseVault),
+    quoteVault: new PublicKey(d.quoteVault),
+
+    marketProgramId: new PublicKey(d.marketProgramId),
+    marketId: new PublicKey(d.marketId),
+    marketBids: new PublicKey(d.marketBids),
+    marketAsks: new PublicKey(d.marketAsks),
+    marketEventQueue: new PublicKey(d.marketEventQueue),
+    marketBaseVault: new PublicKey(d.marketBaseVault),
+    marketQuoteVault: new PublicKey(d.marketQuoteVault),
+
+    withdrawQueue: new PublicKey(d.withdrawQueue),
+    lpVault: new PublicKey(d.lpVault),
+
+    ...(d.marketAuthority ? { marketAuthority: new PublicKey(d.marketAuthority) } : {}),
+  } as unknown as LiquidityPoolKeys;
+
   return out;
 }
 
-function toPubkeyFields(obj: any) {
-  // Convert expected fields from string → PublicKey for the SDK.
-  const fields = [
-    "id","programId","authority","openOrders","targetOrders",
-    "baseVault","quoteVault","withdrawQueue","lpVault",
-    "marketProgramId","marketId","marketBids","marketAsks","marketEventQueue",
-    "marketBaseVault","marketQuoteVault","marketAuthority",
-    "baseMint","quoteMint"
-  ];
-  const o: any = { ...obj };
-  for (const k of fields) if (typeof o[k] === "string") o[k] = new PublicKey(o[k]);
-  return o;
+// ───────────────────────────────────────────────────────────────────────────────
+// RPC resolver: .env first, then Helius key, then cluster default
+function resolveRpc(): string {
+  const fromEnv = process.env.RPC_URL?.trim();
+  if (fromEnv) return fromEnv;
+  const helius = process.env.HELIUS_API_KEY?.trim();
+  if (helius) return `https://rpc.helius.xyz/?api-key=${helius}`;
+  return clusterApiUrl("mainnet-beta");
 }
 
-function loadPoolKeysFromDisk(): any {
-  const p = path.resolve(process.cwd(), "configs", "raydium.pool.json");
-  if (!fs.existsSync(p)) throw new Error(`Missing configs/raydium.pool.json. Create it before running live.`);
-  const raw = JSON.parse(fs.readFileSync(p, "utf8"));
-  return toPubkeyFields(normalizePoolKeys(raw));
+// Token accounts list for Raydium SDK (with programId included)
+async function fetchUserTokenAccounts(conn: Connection, owner: PublicKey) {
+  const resp = await conn.getTokenAccountsByOwner(
+    owner,
+    { programId: TOKEN_PROGRAM_ID },
+    "processed"
+  );
+  return resp.value.map(({ pubkey, account }) => ({
+    pubkey,
+    programId: TOKEN_PROGRAM_ID,
+    accountInfo: SPL_ACCOUNT_LAYOUT.decode(account.data),
+  }));
 }
 
-/* ───────────────────────────── Helpers: reserves & fees ───────────────────────────── */
+// ───────────────────────────────────────────────────────────────────────────────
+// CPMM math for minOut (exact formula using current vault balances).
 
-function toBigIntLike(v: any): bigint {
-  if (v == null) return 0n;
-  if (typeof v === "bigint") return v;
-  if (typeof v === "number") return BigInt(Math.floor(v));
-  if (typeof v === "string") return BigInt(v);
-  if (typeof v?.toString === "function") return BigInt(v.toString());
-  return 0n;
+const BPS = 10_000n;
+
+/** Read base/quote vault reserves (atoms) at 'processed' to minimize latency. */
+async function getVaultReserves(
+  conn: Connection,
+  pool: LiquidityPoolKeys
+): Promise<{ base: BN; quote: BN }> {
+  const accs = await conn.getMultipleAccountsInfo(
+    [pool.baseVault, pool.quoteVault],
+    { commitment: "processed" as any }
+  );
+  if (!accs[0]?.data || !accs[1]?.data)
+    throw new Error("raydium_pool_reserves_missing");
+
+  const baseInfo: any = SPL_ACCOUNT_LAYOUT.decode(accs[0].data);
+  const quoteInfo: any = SPL_ACCOUNT_LAYOUT.decode(accs[1].data);
+  return { base: new BN(baseInfo.amount), quote: new BN(quoteInfo.amount) };
 }
 
-/** Try multiple common field names across SDK variants to extract reserves in atoms. */
-function extractReserves(poolInfo: any): { base: bigint; quote: bigint } | null {
-  const candidatesBase = ["baseReserve","baseAmount","coinReserve","coinAmount","baseTotal"];
-  const candidatesQuote = ["quoteReserve","quoteAmount","pcReserve","pcAmount","quoteTotal"];
-  let base = 0n, quote = 0n;
-  for (const k of candidatesBase) { if (poolInfo?.[k] != null) { base = toBigIntLike(poolInfo[k]); break; } }
-  for (const k of candidatesQuote){ if (poolInfo?.[k] != null) { quote = toBigIntLike(poolInfo[k]); break; } }
-  if (base > 0n && quote > 0n) return { base, quote };
-  return null;
+/** Integer BPS multiply: floor(x * (BPS - bps) / BPS). */
+function applyBpsDown(x: BN, bps: number): BN {
+  const b = BigInt(Math.max(0, Math.min(10_000, Math.ceil(bps))));
+  const xb = x.mul(new BN(Number(BPS - b)));
+  return xb.div(new BN(Number(BPS)));
 }
 
-/** Extract trade fee in BPS (basis points) from poolInfo.fees or top-level fields. */
-function extractFeeBps(poolInfo: any): number | null {
-  // common patterns
-  const f = poolInfo?.fees ?? poolInfo;
-  // exact bps field
-  if (typeof f?.tradeFeeBps === "number") return Math.max(0, Math.floor(f.tradeFeeBps));
-  // numerator/denominator
-  const num = f?.tradeFeeNumerator ?? f?.tradeFee?.numerator ?? f?.tradeFeeRate?.numerator;
-  const den = f?.tradeFeeDenominator ?? f?.tradeFee?.denominator ?? f?.tradeFeeRate?.denominator;
-  if (num != null && den) {
-    const n = Number(num), d = Number(den);
-    if (isFinite(n) && isFinite(d) && d > 0) return Math.max(0, Math.floor((n * 10000) / d));
-  }
-  // decimal rate (0.xx)
-  const rate = f?.tradeFeeRate;
-  if (typeof rate === "number" && isFinite(rate)) return Math.max(0, Math.floor(rate * 10000));
-  return null;
-}
-
-/** CPMM dy = y - k/(x+dx_eff), with fee applied on input. All in atoms (bigint). */
-function cpmmMinOutAtoms(params: {
-  baseIn: boolean;
-  dxAtoms: bigint;
-  reserves: { base: bigint; quote: bigint };
+/** CPMM out = (dx*(1-fee) * y) / (x + dx*(1-fee))  with integer math */
+function cpmmExpectedOut({
+  dx,
+  x,
+  y,
+  feeBps,
+}: {
+  dx: BN; // input atoms
+  x: BN; // input-side reserve
+  y: BN; // output-side reserve
   feeBps: number;
-  slippageBps: number;
-}): bigint {
-  const { baseIn, dxAtoms, reserves, feeBps, slippageBps } = params;
-  const x0 = baseIn ? reserves.base : reserves.quote; // input reserve
-  const y0 = baseIn ? reserves.quote : reserves.base; // output reserve
-  if (dxAtoms <= 0n || x0 <= 0n || y0 <= 0n) return 0n;
-
-  // Apply fee on input: dx_eff = floor(dx * (10000 - feeBps) / 10000)
-  const dxEff = (dxAtoms * BigInt(10000 - Math.max(0, feeBps))) / 10000n;
-
-  // dy = y0 - floor( (x0*y0) / (x0 + dxEff) )
-  const k = x0 * y0;
-  const denom = x0 + dxEff;
-  if (denom === 0n) return 0n;
-  const yAfter = k / denom;
-  const dy = y0 > yAfter ? (y0 - yAfter) : 0n;
-
-  // Apply slippage buffer: floor(dy * (10000 - slippageBps) / 10000)
-  const dyMin = (dy * BigInt(10000 - Math.max(0, slippageBps))) / 10000n;
-  return dyMin > 0n ? dyMin : 0n;
+}): BN {
+  const dxLessFee = applyBpsDown(dx, feeBps);
+  const numerator = dxLessFee.mul(y);
+  const denominator = x.add(dxLessFee);
+  if (denominator.isZero()) throw new Error("cpmm_denominator_zero");
+  return numerator.div(denominator);
 }
 
-/* ───────────────────────────── Builder ───────────────────────────── */
+/** Compute minOut BN given current vault reserves + env slippage. */
+async function computeMinOutBn(opts: {
+  conn: Connection;
+  pool: LiquidityPoolKeys;
+  baseIn: boolean;
+  amountIn: BN;
+  slippageBps: number; // from .env (MAX_SLIPPAGE_BPS)
+}): Promise<{
+  expectedOut: BN;
+  minOut: BN;
+  usedFeeBps: number;
+  usedSlipBps: number;
+}> {
+  const { conn, pool, baseIn, amountIn, slippageBps } = opts;
 
-type BuildParams = {
-  user: PublicKey;
-  poolId: PublicKey;
-  baseMint: PublicKey;
-  quoteMint: PublicKey;
-  baseIn: boolean;       // true = SOL->USDC; false = USDC->SOL
-  amountInBase: bigint;  // atoms of *input* mint for this swap
-  slippageBps: number;
-};
+  // Try to get a fee override from env (default 25 bps which is Raydium CPMM standard).
+  const feeBpsEnv = Number.parseFloat(process.env.RAYDIUM_TRADE_FEE_BPS ?? "25");
+  const dynamicExtra = Number.parseFloat(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? "0");
+  const bufferBps = Number.parseFloat(process.env.RAYDIUM_MINOUT_BUFFER_BPS ?? "0");
+  const usedSlip = Math.max(0, slippageBps + dynamicExtra + bufferBps);
+
+  const { base, quote } = await getVaultReserves(conn, pool);
+  const x = baseIn ? base : quote;
+  const y = baseIn ? quote : base;
+
+  const expectedOut = cpmmExpectedOut({
+    dx: amountIn,
+    x,
+    y,
+    feeBps: feeBpsEnv,
+  });
+
+  const minOut = applyBpsDown(expectedOut, usedSlip);
+
+  if (LOG_MINOUT) {
+    // eslint-disable-next-line no-console
+    console.log("raydium_min_out", {
+      pool: pool.id.toBase58?.() ?? "unknown",
+      dir: baseIn ? "BASE->QUOTE" : "QUOTE->BASE",
+      amountIn: amountIn.toString(),
+      reserves: { base: base.toString(), quote: quote.toString() },
+      expectedOut: expectedOut.toString(),
+      minOut: minOut.toString(),
+      fee_bps: feeBpsEnv,
+      slip_bps: usedSlip,
+      note: "cpmm_reserves+env_fee",
+    });
+  }
+
+  return { expectedOut, minOut, usedFeeBps: feeBpsEnv, usedSlipBps: usedSlip };
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Public builder API
+
 export type CpmmIxBuildResult =
   | { ok: true; ixs: TransactionInstruction[] }
   | { ok: false; reason: string };
 
-export async function buildRaydiumSwapFixedInIxAsync(
-  params: BuildParams
-): Promise<CpmmIxBuildResult> {
+export async function buildRaydiumSwapFixedInIx(params: {
+  user: PublicKey;
+  baseIn: boolean;         // true => input is base mint (SOL in SOL/USDC)
+  amountInBase: bigint;    // atoms of INPUT mint (executor passes correct side)
+  slippageBps: number;     // enforced via on-chain threshold & decision/risk
+}): Promise<CpmmIxBuildResult> {
   try {
-    const connection = makeConn();
-    const poolKeys = loadPoolKeysFromDisk();
-
-    // Tokens (decimals: SOL 9, USDC 6) — object-form for SDK compatibility
-    const baseToken = new (Token as any)({ mint: params.baseMint, decimals: 9, symbol: "SOL", name: "SOL" });
-    const quoteToken = new (Token as any)({ mint: params.quoteMint, decimals: 6, symbol: "USDC", name: "USDC" });
-
-    const inToken  = params.baseIn ? baseToken : quoteToken;
-    const outToken = params.baseIn ? quoteToken : baseToken;
-
-    const amountIn = new TokenAmount(inToken, params.amountInBase.toString(), true);
-
-    // ATAs (pass actual PublicKeys; do NOT use inToken.mint due to SDK typing)
-    const ataIn  = getAssociatedTokenAddressSync(params.baseIn ? SOL_MINT : USDC_MINT, params.user);
-    const ataOut = getAssociatedTokenAddressSync(params.baseIn ? USDC_MINT : SOL_MINT, params.user);
-
-    // Pool info (for slippage calc / CPMM fallback)
-    const poolInfo = await (Liquidity as any).fetchInfo({ connection, poolKeys });
-
-    // Try SDK compute first (variant-safe)
-    let amountOutMin: any = undefined;
-    try {
-      const out = (Liquidity as any).computeAmountOut({
-        poolKeys,
-        poolInfo,
-        amountIn,
-        currencyOut: outToken,
-        slippage: new Percent(params.slippageBps, 10_000),
-      });
-      amountOutMin = out?.minAmountOut ?? out?.amountOutWithSlippage ?? out?.amountOut;
-    } catch { /* defer to CPMM fallback */ }
-
-    // CPMM fallback: exact dy from reserves & fee (no shortcuts)
-    if (!amountOutMin) {
-      const reserves = extractReserves(poolInfo);
-      if (!reserves) return { ok: false, reason: "missing_pool_reserves" };
-
-      const feeBps = extractFeeBps(poolInfo);
-      if (feeBps == null) return { ok: false, reason: "missing_trade_fee" };
-
-      const dyMinAtoms = cpmmMinOutAtoms({
-        baseIn: params.baseIn,
-        dxAtoms: params.amountInBase,
-        reserves,
-        feeBps,
-        slippageBps: params.slippageBps,
-      });
-      if (dyMinAtoms <= 0n) return { ok: false, reason: "min_out_zero" };
-
-      amountOutMin = new TokenAmount(outToken, dyMinAtoms.toString(), true);
+    // Load full keys and sanity-check env pool id
+    const disk = readPoolJson();
+    const envAmm = (process.env.RAYDIUM_POOL_ID ?? "").trim();
+    if (envAmm && envAmm !== disk.id) {
+      return {
+        ok: false,
+        reason: `raydium_swap_build_error: pool id mismatch (env=${envAmm} json=${disk.id})`,
+      };
     }
+    const poolKeys = toPoolKeys(disk);
 
-    // Build instruction(s)
-    const { innerTransactions } = await (Liquidity as any).makeSwapInstructionSimple({
-      connection,
-      poolKeys,
-      userKeys: {
-        owner: params.user,
-        tokenAccounts: [{ pubkey: ataIn }, { pubkey: ataOut }],
-      },
+    const rpc = resolveRpc();
+    const conn = new Connection(rpc, { commitment: "processed" });
+    const tokenAccounts = await fetchUserTokenAccounts(conn, params.user);
+
+    const amountIn = new BN(params.amountInBase.toString());
+
+    // Compute minOut using current vault reserves (exact CPMM math).
+    const { minOut } = await computeMinOutBn({
+      conn,
+      pool: poolKeys,
+      baseIn: params.baseIn,
       amountIn,
-      amountOutMin,
-      fixedSide: "in",
-      makeTxVersion: undefined,
+      slippageBps: params.slippageBps,
     });
 
-    const ixs: TransactionInstruction[] = innerTransactions?.[0]?.instructions ?? [];
-    if (!ixs.length) return { ok: false, reason: "raydium_sdk_returned_no_instructions" };
+    // Raydium simple builder — pass both threshold field names (SDK variant-safe).
+    const { innerTransactions } = await (Liquidity as any).makeSwapInstructionSimple({
+      connection: conn,
+      poolKeys,
+      userKeys: {
+        tokenAccounts: tokenAccounts as any,
+        owner: params.user,
+        payer: params.user,
+      },
+      amountIn,
+      fixedSide: "in",
+      otherAmountThreshold: minOut, // v5+ name
+      amountOutMin: minOut,         // older name; harmless on newer when cast as any
+    } as any);
+
+    const ixs: TransactionInstruction[] = [];
+    for (const itx of innerTransactions ?? []) {
+      for (const ix of itx.instructions ?? []) ixs.push(ix);
+    }
+    if (!ixs.length) {
+      return {
+        ok: false,
+        reason:
+          "raydium_swap_build_error: makeSwapInstructionSimple returned no instructions",
+      };
+    }
 
     return { ok: true, ixs };
   } catch (e: any) {
-    return { ok: false, reason: `raydium_swap_build_error: ${String(e?.message ?? e)}` };
+    return {
+      ok: false,
+      reason: `raydium_swap_ix_build_failed: ${String(e?.message ?? e)}`,
+    };
   }
 }

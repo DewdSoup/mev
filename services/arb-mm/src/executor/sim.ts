@@ -1,4 +1,7 @@
 // services/arb-mm/src/executor/sim.ts
+// Raydium CPMM fixed-in RPC simulation—timing/CU oriented.
+// We only measure RPC timing/CU; effective price fields are optional.
+
 import {
   Connection,
   PublicKey,
@@ -7,13 +10,15 @@ import {
   SimulatedTransactionResponse,
   ComputeBudgetProgram,
 } from "@solana/web3.js";
-import { buildRaydiumCpmmSwapIx } from "./buildRaydiumCpmmIx.js";
+import { buildRaydiumCpmmSwapIx, type BuildSwapIxParams } from "./buildRaydiumCpmmIx.js";
 
 export type RaydiumSimOk = {
   mode: "cpmm-sim-success";
   rpc_units?: number;
   rpc_sim_ms: number;
   logs_tail?: string[];
+  rpc_eff_px?: number;            // optional; joiner tolerates absence
+  rpc_price_impact_bps?: number;  // optional
 };
 export type RaydiumSimErr = {
   mode: "cpmm-sim-error" | "raydium-swap-ix-failed-fallback";
@@ -27,23 +32,32 @@ export async function simulateRaydiumSwapFixedIn(
   conn: Connection,
   params: {
     user: PublicKey;
-    amountInBase: bigint; // atoms of *input* mint
+    /** atoms of input mint (SOL if baseIn, USDC if !baseIn) */
+    amountInBase: bigint;
     baseIn: boolean;
     slippageBps: number;
     baseMint?: PublicKey;
     quoteMint?: PublicKey;
+    usdcMint?: string;
+    wsolMint?: string;
   }
 ): Promise<RaydiumSim> {
   const t0 = performance.now();
+
   try {
-    const build = await buildRaydiumCpmmSwapIx({
+    // IMPORTANT: The builder expects amountInBase = atoms of the *input* mint.
+    // Do NOT switch to amountInQuote; use baseIn to indicate the side.
+    const buildArgs: BuildSwapIxParams = {
       user: params.user,
-      baseMint: params.baseMint,
-      quoteMint: params.quoteMint,
       baseIn: params.baseIn,
       amountInBase: params.amountInBase,
       slippageBps: params.slippageBps,
-    });
+      // baseMint/quoteMint are accepted but currently not used by the builder
+      baseMint: params.baseMint,
+      quoteMint: params.quoteMint,
+    };
+
+    const build = await buildRaydiumCpmmSwapIx(buildArgs);
 
     if (!build.ok) {
       return {
@@ -58,7 +72,7 @@ export async function simulateRaydiumSwapFixedIn(
       payerKey: params.user,
       recentBlockhash: blockhash,
       instructions: [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
         ...build.ixs,
       ],
     }).compileToV0Message();
@@ -90,6 +104,7 @@ export async function simulateRaydiumSwapFixedIn(
       rpc_units: parsed.computeUnitsConsumed ?? undefined,
       rpc_sim_ms: ms,
       logs_tail: parsed.tail,
+      // rpc_eff_px / rpc_price_impact_bps are optional and can be omitted
     };
   } catch (e: any) {
     return {
@@ -101,7 +116,7 @@ export async function simulateRaydiumSwapFixedIn(
 }
 
 function parseSim(v: SimulatedTransactionResponse) {
-  const tail = (v?.logs ?? []).slice(-8);
+  const tail = (v?.logs ?? []).slice(-10);
   const computeUnitsConsumed =
     (v as any)?.unitsConsumed ??
     (v as any)?.computeUnitsConsumed ??

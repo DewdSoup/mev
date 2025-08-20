@@ -1,5 +1,6 @@
 // services/arb-mm/src/util/pretty.ts
 import { green, yellow, gray, bold } from "./colors.js";
+import { asNumber } from "./num.js";
 
 function on(): boolean {
   const v = process.env.PRETTY_LOGS?.toLowerCase();
@@ -9,8 +10,8 @@ function on(): boolean {
 }
 
 function fx(n: any, p = 4) {
-  const num = Number(n);
-  return Number.isFinite(num) ? num.toFixed(p) : String(n);
+  const num = asNumber(n);
+  return num !== undefined ? num.toFixed(p) : String(n);
 }
 
 export function prettyDecision(kind: "would_trade" | "would_not_trade", base: any) {
@@ -24,10 +25,8 @@ export function prettyDecision(kind: "would_trade" | "would_not_trade", base: an
   const sell  = fx(base?.sell_px, 3);
   const imp   = fx(base?.amm_price_impact_bps, 2);
 
-  // “rpc:on/off” marker helps remind us if rpc sim is wired this run.
   const rpcMarker = process.env.USE_RPC_SIM?.toLowerCase() === "true" ? "rpc:on" : "rpc:off";
 
-  // One-liner
   console.log(
     `${tag} ${bold(arrow)} ${side} sz=${sz} | net=${net}bps | buy=${buy} sell=${sell} | ammImpact=${imp}bps (${rpcMarker})`
   );
@@ -37,14 +36,3 @@ export function prettyBanner(label: string, obj: Record<string, any>) {
   if (!on()) return;
   console.log(gray(`${label} ${JSON.stringify(obj)}`));
 }
-
-// Optional, if you ever want a dim edge teaser:
-// export function prettyEdge(payload: any) {
-//   if (!on()) return;
-//   const abs = fx(payload?.absBps, 2);
-//   const amm = fx(payload?.amm_mid, 3);
-//   const bid = fx(payload?.phoenix_bid, 3);
-//   const ask = fx(payload?.phoenix_ask, 3);
-//   const src = payload?.phoenix_book_method ?? payload?.phoenix_source ?? "?";
-//   console.log(gray(`edge ${abs}bps | amm=${amm} | phx=${bid}/${ask} [${src}]`));
-// }

@@ -4,19 +4,20 @@
 
 import fs from "fs";
 import path from "path";
-import { Connection } from "@solana/web3.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 
 // ORIGINAL logger (restored) — keeps your runtime.jsonl + tags
 import { logger } from "@mev/storage";
 
-import { loadConfig, RPC, maskUrl, stamp } from "./config.js";
-import { EdgeJoiner, type DecisionHook, type RpcSampleHook } from "./edge/joiner.js";
-import { makeRpcSim } from "./rpc_sim.js";
+import { loadConfig, RPC, maskUrl, stamp, resolveFeeBps } from "./config.js";
+import { EdgeJoiner, type DecisionHook, type RpcSampleHook, type RpcSimFn } from "./edge/joiner.js";
 import { setChainTps } from "./feature_sink.js";
 import { initRisk } from "@mev/risk";
 import { initAccounts } from "./accounts.js";
 import { LiveExecutor } from "./executor/live.js";
 import { initSessionRecorder } from "./session_recorder.js";
+import { asNumber, roundN, coalesceRound } from "./util/num.js";
+import { simulateRaydiumSwapFixedIn } from "./executor/sim.js";
 
 // 🔹 ML emitters (clean schema; optional via LOG_SIM_FIELDS)
 import {
@@ -156,7 +157,7 @@ async function startHealth(conn: Connection) {
       setChainTps(tps);
       logger.log("arb health", {
         slot,
-        tps: Number(tps.toFixed(2)),
+        tps: roundN(tps, 2) ?? 0,
         version,
         httpHealth: { ok: true, body: "ok" },
       });
@@ -223,9 +224,9 @@ function writeLiveSummarySync(CFG: ReturnType<typeof loadConfig>) {
       considered: consideredCnt,
       would_trade: wouldTradeCnt,
       would_not_trade: wouldNotCnt,
-      pnl_sum: Number(cumSimPnLQuote.toFixed(6)),
-      best_edge_bps: Number.isFinite(bestEdgeNet) ? Number(bestEdgeNet.toFixed(4)) : 0,
-      worst_edge_bps: Number.isFinite(worstEdgeNet) ? Number(worstEdgeNet.toFixed(4)) : 0,
+      pnl_sum: roundN(cumSimPnLQuote, 6) ?? 0,
+      best_edge_bps: Number.isFinite(bestEdgeNet) ? (roundN(bestEdgeNet, 4) ?? 0) : 0,
+      worst_edge_bps: Number.isFinite(worstEdgeNet) ? (roundN(worstEdgeNet, 4) ?? 0) : 0,
       threshold_bps: CFG.TRADE_THRESHOLD_BPS,
       slippage_bps: CFG.MAX_SLIPPAGE_BPS,
       trade_size_base: CFG.TRADE_SIZE_BASE,
@@ -275,9 +276,10 @@ async function main() {
   const LOG_ML = Boolean(CFG.LOG_SIM_FIELDS);
 
   let liveExec: LiveExecutor | null = null;
+  let accounts: Awaited<ReturnType<typeof initAccounts>> | null = null;
 
   if (LIVE && !SHADOW) {
-    const accounts = await initAccounts(conn);
+    accounts = await initAccounts(conn);
     await initSessionRecorder(conn, accounts.owner, CFG); // harmless additive
     liveExec = new LiveExecutor(conn, accounts, CFG);
     await liveExec.startPhoenix();
@@ -288,6 +290,18 @@ async function main() {
       shadow: SHADOW,
     });
   }
+
+  // Resolve authoritative fees per venue (global default + per-id override)
+  const RAYDIUM_POOL = (process.env.RAYDIUM_POOL_ID ?? "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2").trim();
+  const PHX_MARKET   = (CFG.PHOENIX_MARKET || "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg").trim();
+
+  const AMM_FEE_BPS = resolveFeeBps("AMM", RAYDIUM_POOL, CFG.AMM_TAKER_FEE_BPS);
+  const PHX_FEE_BPS = resolveFeeBps("PHOENIX", PHX_MARKET, CFG.PHOENIX_TAKER_FEE_BPS);
+
+  logger.log("fee_config", {
+    raydium_pool: RAYDIUM_POOL, amm_fee_bps: AMM_FEE_BPS,
+    phoenix_market: PHX_MARKET, phoenix_fee_bps: PHX_FEE_BPS
+  });
 
   logger.log("edge_paths", {
     amms: CFG.AMMS_JSONL,
@@ -305,8 +319,8 @@ async function main() {
     max_slippage_bps: CFG.MAX_SLIPPAGE_BPS,
     phoenix_slippage_bps: CFG.PHOENIX_SLIPPAGE_BPS,
     trade_size_base: CFG.TRADE_SIZE_BASE,
-    phoenix_taker_fee_bps: CFG.PHOENIX_TAKER_FEE_BPS,
-    amm_taker_fee_bps: CFG.AMM_TAKER_FEE_BPS,
+    phoenix_taker_fee_bps: PHX_FEE_BPS,
+    amm_taker_fee_bps: AMM_FEE_BPS,
     fixed_tx_cost_quote: CFG.FIXED_TX_COST_QUOTE,
     decision_dedupe_ms: CFG.DECISION_DEDUPE_MS,
     decision_bucket_ms: CFG.DECISION_BUCKET_MS,
@@ -323,16 +337,48 @@ async function main() {
     shadow_trading: SHADOW,
   });
 
-  const rpcSimFn = makeRpcSim(conn, CFG.USE_RPC_SIM);
+  // Build rpcSimFn only if we have a real payer (LIVE, non-shadow)
+  const rpcSimFn: RpcSimFn | undefined = (CFG.USE_RPC_SIM && accounts && LIVE && !SHADOW)
+    ? (async (input: { path: "AMM->PHX" | "PHX->AMM"; sizeBase: number; ammMid: number; }) => {
+        const baseIn = (input.path === "PHX->AMM");
+        const amountInAtoms = baseIn
+          ? BigInt(Math.round(input.sizeBase * 1e9))               // SOL atoms
+          : BigInt(Math.round(input.sizeBase * input.ammMid * 1e6)); // USDC atoms
+
+        const out = await simulateRaydiumSwapFixedIn(conn, {
+          user: (accounts as any).owner as PublicKey,
+          baseIn,
+          amountInBase: amountInAtoms,
+          slippageBps: 50,
+        });
+
+        if (out.mode !== "cpmm-sim-success") {
+          return {
+            rpc_sim_mode: out.mode,
+            rpc_sim_ms: (out as any).rpc_sim_ms ?? 0,
+            rpc_sim_error: (out as any).reason,
+          };
+        }
+        // We intentionally omit rpc_eff_px / rpc_price_impact_bps here.
+        return {
+          rpc_sim_ms: out.rpc_sim_ms,
+          rpc_sim_mode: out.mode,
+          rpc_units: out.rpc_units
+        };
+      })
+    : undefined;
+
   const mkShadowSig = () =>
     `shadow_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e9).toString(36)}`;
 
+  // safe fallback to avoid `.toFixed` on undefined
   function fillPxForPath(
     path: "PHX->AMM" | "AMM->PHX",
     d: { rpc_eff_px?: number; buy_px: number; sell_px: number }
   ) {
-    if (d.rpc_eff_px && Number.isFinite(d.rpc_eff_px)) return Number(d.rpc_eff_px.toFixed(6));
-    return Number((path === "PHX->AMM" ? d.sell_px : d.buy_px).toFixed(6));
+    const rpc = asNumber(d.rpc_eff_px);
+    const sidePx = path === "PHX->AMM" ? asNumber(d.sell_px) : asNumber(d.buy_px);
+    return coalesceRound(6, rpc, sidePx);
   }
 
   const onDecision: DecisionHook = (wouldTrade, _edgeNetBps, _expectedPnl, d) => {
@@ -356,9 +402,9 @@ async function main() {
       size_base: LIVE_SIZE_BASE,
       buy_px: d.buy_px,
       sell_px: d.sell_px,
-      notional_quote: Number((LIVE_SIZE_BASE * ((d.buy_px + d.sell_px) / 2)).toFixed(6)),
+      notional_quote: coalesceRound(6, LIVE_SIZE_BASE * ((d.buy_px + d.sell_px) / 2)),
       phoenix: {
-        market: CFG.PHOENIX_MARKET,
+        market: PHX_MARKET || CFG.PHOENIX_MARKET,
         side: d.side as "buy" | "sell",
         limit_px: d.side === "buy" ? d.buy_px : d.sell_px,
       },
@@ -392,7 +438,7 @@ async function main() {
         shadow: true,
         fill_px: fp,
         filled_base: payload.size_base,
-        filled_quote: Number((payload.size_base * fp).toFixed(6)),
+        filled_quote: coalesceRound(6, payload.size_base * fp),
       };
       logger.log("landed", landed);
       if (LOG_ML) { try { emitLanded(landed); } catch {} }
@@ -422,8 +468,8 @@ async function main() {
       thresholdBps: CFG.TRADE_THRESHOLD_BPS,
       flatSlippageBps: CFG.MAX_SLIPPAGE_BPS,
       tradeSizeBase: CFG.TRADE_SIZE_BASE,
-      phoenixFeeBps: CFG.PHOENIX_TAKER_FEE_BPS,
-      ammFeeBps: CFG.AMM_TAKER_FEE_BPS,
+      phoenixFeeBps: PHX_FEE_BPS,
+      ammFeeBps: AMM_FEE_BPS,
       fixedTxCostQuote: CFG.FIXED_TX_COST_QUOTE,
     },
     {
@@ -462,14 +508,14 @@ async function main() {
       if (ev === "phoenix_mid" || ev === "phoenix_l2" || ev === "phoenix_l2_empty") {
         joiner.upsertPhoenix(obj);
       }
+      // Optionally harvest RPC timing from other sources that may log it
       try {
         const ms = Number(obj?.data?.rpc_sim_ms ?? obj?.rpc_sim_ms);
         if (Number.isFinite(ms)) {
           rpcSamples++;
           rpcMsP50 = ewma(rpcMsP50, ms, 0.1);
           rpcMsP95 = Math.max(rpcMsP95, ms);
-          // ML sim result from stream too
-          if (LOG_ML) { emitRpcSample(ms, Boolean(obj?.data?.guard_blocked ?? obj?.guard_blocked)); }
+          if (LOG_ML) { try { emitRpcSample(ms, Boolean(obj?.data?.guard_blocked ?? obj?.guard_blocked)); } catch {} }
         }
         const blocked = obj?.data?.guard_blocked ?? obj?.guard_blocked;
         if (blocked === true) rpcBlocked++;
@@ -482,12 +528,8 @@ async function main() {
 
   // Graceful shutdown + summary
   const shutdown = (signal: string) => {
-    try {
-      ammsFollower.stop();
-    } catch {}
-    try {
-      phxFollower.stop();
-    } catch {}
+    try { ammsFollower.stop(); } catch {}
+    try { phxFollower.stop(); } catch {}
     if (!wroteSummary) writeLiveSummarySync(CFG);
     logger.log("arb_shutdown", { ok: true, signal });
     process.exit(0);
@@ -495,32 +537,16 @@ async function main() {
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("beforeExit", () => {
-    if (!wroteSummary) {
-      const CFG = loadConfig();
-      writeLiveSummarySync(CFG);
-    }
-  });
-  process.on("exit", () => {
-    if (!wroteSummary) {
-      const CFG = loadConfig();
-      writeLiveSummarySync(CFG);
-    }
-  });
+  process.on("beforeExit", () => { if (!wroteSummary) writeLiveSummarySync(CFG); });
+  process.on("exit", () => { if (!wroteSummary) writeLiveSummarySync(CFG); });
   process.on("uncaughtException", (e) => {
     logger.log("arb_fatal", { error: String(e) });
-    if (!wroteSummary) {
-      const CFG = loadConfig();
-      writeLiveSummarySync(CFG);
-    }
+    if (!wroteSummary) writeLiveSummarySync(CFG);
     process.exit(1);
   });
   process.on("unhandledRejection", (e) => {
     logger.log("arb_fatal", { error: String(e) });
-    if (!wroteSummary) {
-      const CFG = loadConfig();
-      writeLiveSummarySync(CFG);
-    }
+    if (!wroteSummary) writeLiveSummarySync(CFG);
     process.exit(1);
   });
 }

@@ -1,12 +1,17 @@
 // packages/phoenix/src/index.ts
-// Phoenix BBO publisher with robust .env loading, Helius-first RPC, SDK multi-path L2,
+// Phoenix L2 publisher with robust .env loading, Helius-first RPC, SDK multi-path L2,
 // optional WS subscribe, and Pyth fallback (Hermes).
-// Now supports multi-market via configs/markets.json while keeping env-first behavior.
+// Adds top-N depth arrays (levels_bids/levels_asks) for depth-walking on the consumer side.
 //
-// Emits (unchanged shapes; only adds `symbol`):
-//   - phoenix_l2 {ts, best_bid, best_ask, phoenix_mid, source, tick_ms, market, symbol}
-//   - phoenix_mid {ts, px, px_str, best_bid?, best_ask?, source, tick_ms, market, symbol}
-//   - phoenix_l2_empty {ts, ...}
+// Emits:
+//   - phoenix_l2 {
+//       ts, market, symbol,
+//       best_bid, best_bid_str, best_ask, best_ask_str, phoenix_mid,
+//       tick_ms, source,
+//       levels_bids?: [{px, qty}...], levels_asks?: [{px, qty}...]
+//     }
+//   - phoenix_mid {ts, market, symbol, px, px_str, best_bid?, best_ask?, tick_ms, source}
+//   - phoenix_l2_empty {ts, market, symbol, haveBid, haveAsk, tick_ms, source}
 
 import fs from "fs";
 import path from "path";
@@ -38,7 +43,7 @@ function parseMsEnv(v: string | undefined, def = 2000, min = 200, max = 60000) {
   if (!Number.isFinite(n)) return def;
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
-function parseIntEnv(v: string | undefined, def = 1, min = 1, max = 10) {
+function parseIntEnv(v: string | undefined, def = 1, min = 1, max = 50) {
   const n = Number(v);
   if (!Number.isFinite(n)) return def;
   return Math.max(min, Math.min(max, Math.floor(n)));
@@ -69,7 +74,8 @@ function maskUrl(u: string): string {
 const RPC = resolveRpc();
 
 const TICK_MS = parseMsEnv(process.env.PHOENIX_TICK_MS, 2000, 200, 60000);
-const L2_DEPTH = parseIntEnv(process.env.PHOENIX_L2_DEPTH, 1, 1, 10);
+const L2_FETCH_DEPTH = parseIntEnv(process.env.PHOENIX_L2_DEPTH, 12, 1, 50); // how much we ask SDK for
+const PUBLISH_DEPTH = parseIntEnv(process.env.PHOENIX_DEPTH_LEVELS, L2_FETCH_DEPTH, 1, 50); // how much we emit
 const TRY_WS = parseBoolEnv(process.env.PHOENIX_WS_ENABLED, true);
 
 // ── Config models ───────────────────────────────────────────────────────────
@@ -103,7 +109,13 @@ async function makeClient(conn: Connection): Promise<Client> {
   return new anyClient(conn) as Client;
 }
 
-type MaybeBbo = { bestBid?: number; bestAsk?: number; source: string };
+type MaybeBbo = {
+  bestBid?: number;
+  bestAsk?: number;
+  source: string;
+  bids?: Array<{ px: number; qty: number }>;
+  asks?: Array<{ px: number; qty: number }>;
+};
 
 function extractPx(lvl: any): number | undefined {
   if (!lvl) return undefined;
@@ -112,6 +124,28 @@ function extractPx(lvl: any): number | undefined {
   if (typeof lvl.price?.toNumber === "function") return lvl.price.toNumber();
   if (typeof lvl?.toNumber === "function") return lvl.toNumber();
   return undefined;
+}
+function extractQty(lvl: any): number | undefined {
+  if (!lvl) return undefined;
+  if (typeof lvl.quantity === "number") return lvl.quantity;
+  if (typeof lvl.uiQuantity === "number") return lvl.uiQuantity;
+  if (typeof lvl.quantity?.toNumber === "function") return lvl.quantity.toNumber();
+  if (typeof lvl?.baseLots?.toNumber === "function" && typeof lvl?.lotSize === "number") {
+    return lvl.baseLots.toNumber() * lvl.lotSize;
+  }
+  return undefined;
+}
+function mapDepthSide(sideArr: any[] | undefined, max: number) {
+  const out: Array<{ px: number; qty: number }> = [];
+  if (!Array.isArray(sideArr)) return out;
+  for (const lvl of sideArr.slice(0, max)) {
+    const px = extractPx(lvl);
+    const qty = extractQty(lvl);
+    if (typeof px === "number" && px > 0 && typeof qty === "number" && qty > 0) {
+      out.push({ px, qty });
+    }
+  }
+  return out;
 }
 
 // Helper: await if promise-like, else return directly
@@ -125,77 +159,81 @@ async function maybeAwait<T>(v: T): Promise<T extends Promise<infer U> ? U : T> 
 // Try a set of SDK methods that exist in different versions.
 async function trySdkL2(client: any, marketStr: string, marketPk: PublicKey): Promise<MaybeBbo | null> {
   // 0) getUiLadder / getLadder
-  if (typeof client.getUiLadder === "function") {
-    try {
-      let ladder = client.getUiLadder.length >= 2
-        ? client.getUiLadder(marketStr, L2_DEPTH)
-        : client.getUiLadder(marketStr);
-      ladder = await maybeAwait(ladder);
-      const bestBid = Array.isArray((ladder as any)?.bids) && (ladder as any).bids[0] ? extractPx((ladder as any).bids[0]) : undefined;
-      const bestAsk = Array.isArray((ladder as any)?.asks) && (ladder as any).asks[0] ? extractPx((ladder as any).asks[0]) : undefined;
-      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getUiLadder" };
-    } catch (e) { logger.log("phoenix_warn", { stage: "getUiLadder", err: String(e), market: marketStr }); }
-  }
-  if (typeof client.getLadder === "function") {
-    try {
-      let ladder = client.getLadder.length >= 2
-        ? client.getLadder(marketStr, L2_DEPTH)
-        : client.getLadder(marketStr);
-      ladder = await maybeAwait(ladder);
-      const bestBid = Array.isArray((ladder as any)?.bids) && (ladder as any).bids[0] ? extractPx((ladder as any).bids[0]) : undefined;
-      const bestAsk = Array.isArray((ladder as any)?.asks) && (ladder as any).asks[0] ? extractPx((ladder as any).asks[0]) : undefined;
-      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getLadder" };
-    } catch (e) { logger.log("phoenix_warn", { stage: "getLadder", err: String(e), market: marketStr }); }
+  for (const method of ["getUiLadder", "getLadder"] as const) {
+    const f = (client as any)[method];
+    if (typeof f === "function") {
+      try {
+        let ladder = f.length >= 2 ? f.call(client, marketStr, L2_FETCH_DEPTH) : f.call(client, marketStr);
+        ladder = await maybeAwait(ladder);
+        const bids = mapDepthSide((ladder as any)?.bids, PUBLISH_DEPTH);
+        const asks = mapDepthSide((ladder as any)?.asks, PUBLISH_DEPTH);
+        const bestBid = bids[0]?.px ?? extractPx((ladder as any)?.bestBid);
+        const bestAsk = asks[0]?.px ?? extractPx((ladder as any)?.bestAsk);
+        if (bestBid || bestAsk) return { bestBid, bestAsk, source: `sdk:${method}`, bids, asks };
+      } catch (e) {
+        logger.log("phoenix_warn", { stage: method, err: String(e), market: marketStr });
+      }
+    }
   }
 
   // 1) getL2 (try string then PublicKey)
-  if (typeof client.getL2 === "function") {
+  if (typeof (client as any).getL2 === "function") {
     try {
-      const l2s = await maybeAwait(client.getL2(marketStr, L2_DEPTH));
-      const bestBid = Array.isArray(l2s?.bids) && l2s.bids[0] ? extractPx(l2s.bids[0]) : undefined;
-      const bestAsk = Array.isArray(l2s?.asks) && l2s.asks[0] ? extractPx(l2s.asks[0]) : undefined;
-      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getL2:str" };
+      const l2s = await maybeAwait((client as any).getL2(marketStr, L2_FETCH_DEPTH));
+      const bids = mapDepthSide(l2s?.bids, PUBLISH_DEPTH);
+      const asks = mapDepthSide(l2s?.asks, PUBLISH_DEPTH);
+      const bestBid = bids[0]?.px;
+      const bestAsk = asks[0]?.px;
+      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getL2:str", bids, asks };
     } catch {}
     try {
-      const l2p = await maybeAwait(client.getL2(marketPk, L2_DEPTH));
-      const bestBid = Array.isArray(l2p?.bids) && l2p.bids[0] ? extractPx(l2p.bids[0]) : undefined;
-      const bestAsk = Array.isArray(l2p?.asks) && l2p.asks[0] ? extractPx(l2p.asks[0]) : undefined;
-      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getL2:pk" };
-    } catch (e) { logger.log("phoenix_warn", { stage: "getL2", err: String(e), market: marketStr }); }
+      const l2p = await maybeAwait((client as any).getL2(marketPk, L2_FETCH_DEPTH));
+      const bids = mapDepthSide(l2p?.bids, PUBLISH_DEPTH);
+      const asks = mapDepthSide(l2p?.asks, PUBLISH_DEPTH);
+      const bestBid = bids[0]?.px;
+      const bestAsk = asks[0]?.px;
+      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getL2:pk", bids, asks };
+    } catch (e) {
+      logger.log("phoenix_warn", { stage: "getL2", err: String(e), market: marketStr });
+    }
   }
 
-  // 2) getBbo (try string then PublicKey)
-  if (typeof client.getBbo === "function") {
+  // 2) getBbo (fallback, no depth)
+  if (typeof (client as any).getBbo === "function") {
     try {
-      const bboS = await maybeAwait(client.getBbo(marketStr));
+      const bboS = await maybeAwait((client as any).getBbo(marketStr));
       const bestBid = typeof bboS?.bestBid === "number" ? bboS.bestBid : extractPx(bboS?.bestBid);
       const bestAsk = typeof bboS?.bestAsk === "number" ? bboS.bestAsk : extractPx(bboS?.bestAsk);
       if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getBbo:str" };
     } catch {}
     try {
-      const bboP = await maybeAwait(client.getBbo(marketPk));
+      const bboP = await maybeAwait((client as any).getBbo(marketPk));
       const bestBid = typeof bboP?.bestBid === "number" ? bboP.bestBid : extractPx(bboP?.bestBid);
       const bestAsk = typeof bboP?.bestAsk === "number" ? bboP.bestAsk : extractPx(bboP?.bestAsk);
       if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getBbo:pk" };
-    } catch (e) { logger.log("phoenix_warn", { stage: "getBbo", err: String(e), market: marketStr }); }
+    } catch (e) {
+      logger.log("phoenix_warn", { stage: "getBbo", err: String(e), market: marketStr });
+    }
   }
 
-  // 3) refreshMarket and inspect OB
+  // 3) refreshMarket and inspect OB (depth capable)
   try {
     let ms: MarketState | undefined;
-    try { ms = await maybeAwait(client.refreshMarket(marketStr, false)); } catch {}
-    if (!ms) { try { ms = await maybeAwait(client.refreshMarket(marketPk, false)); } catch {} }
+    try { ms = await maybeAwait((client as any).refreshMarket(marketStr, false)); } catch {}
+    if (!ms) { try { ms = await maybeAwait((client as any).refreshMarket(marketPk, false)); } catch {} }
     if (ms) {
       const ob: any = (ms as any)?.orderBook ?? (ms as any)?.book ?? undefined;
-      const bidsArr: any[] =
+      const bidsRaw: any[] =
         (Array.isArray(ob?.bids) ? ob.bids :
         Array.isArray(ob?.book?.bids) ? ob.book.bids : []) as any[];
-      const asksArr: any[] =
+      const asksRaw: any[] =
         (Array.isArray(ob?.asks) ? ob.asks :
         Array.isArray(ob?.book?.asks) ? ob.book.asks : []) as any[];
-      const bestBid = bidsArr.length ? extractPx(bidsArr[0]) : undefined;
-      const bestAsk = asksArr.length ? extractPx(asksArr[0]) : undefined;
-      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "refreshMarket:orderBook" };
+      const bids = mapDepthSide(bidsRaw, PUBLISH_DEPTH);
+      const asks = mapDepthSide(asksRaw, PUBLISH_DEPTH);
+      const bestBid = bids[0]?.px;
+      const bestAsk = asks[0]?.px;
+      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "refreshMarket:orderBook", bids, asks };
     }
   } catch (e) {
     logger.log("phoenix_warn", { stage: "refreshMarket_inspect", err: String(e), market: marketStr });
@@ -205,7 +243,12 @@ async function trySdkL2(client: any, marketStr: string, marketPk: PublicKey): Pr
 }
 
 // Optional WS subscription (best-effort): per market
-async function tryAttachWs(client: any, marketStr: string, marketPk: PublicKey, setWs: (bbo: { bid?: number; ask?: number } | null) => void) {
+async function tryAttachWs(
+  client: any,
+  marketStr: string,
+  marketPk: PublicKey,
+  setWs: (bbo: { bid?: number; ask?: number } | null) => void
+) {
   if (!TRY_WS) return;
   const candidates = ["subscribeL2", "subscribeToL2", "subscribeToMarket", "onMarketUpdate"];
 
@@ -222,11 +265,11 @@ async function tryAttachWs(client: any, marketStr: string, marketPk: PublicKey, 
     };
 
     try {
-      try { await f.call(client, marketStr, L2_DEPTH, cb); } catch {}
-      try { await f.call(client, marketStr, cb, L2_DEPTH); } catch {}
+      try { await f.call(client, marketStr, L2_FETCH_DEPTH, cb); } catch {}
+      try { await f.call(client, marketStr, cb, L2_FETCH_DEPTH); } catch {}
       try { await f.call(client, marketStr, cb); } catch {}
-      try { await f.call(client, marketPk, L2_DEPTH, cb); } catch {}
-      try { await f.call(client, marketPk, cb, L2_DEPTH); } catch {}
+      try { await f.call(client, marketPk, L2_FETCH_DEPTH, cb); } catch {}
+      try { await f.call(client, marketPk, cb, L2_FETCH_DEPTH); } catch {}
       try { await f.call(client, marketPk, cb); } catch {}
       logger.log("phoenix_ws_attach_attempted", { method: fn, market: marketStr });
     } catch (e) {
@@ -267,25 +310,37 @@ function fmtPx(n: number | undefined): { px?: number; px_str?: string } {
   return { px, px_str };
 }
 
-function publishL2(symbol: string, marketStr: string, bestBid: number, bestAsk: number, meta: Record<string, unknown> = {}) {
+function publishL2(
+  symbol: string,
+  marketStr: string,
+  bestBid: number,
+  bestAsk: number,
+  meta: Record<string, unknown> = {}
+) {
   const bidFmt = fmtPx(bestBid);
   const askFmt = fmtPx(bestAsk);
   const mid = (bestBid + bestAsk) / 2;
   logger.log("phoenix_l2", {
     ts: Date.now(),
     market: marketStr,
-    symbol,                 // ← added (additive)
+    symbol,
     best_bid: bidFmt.px,
     best_bid_str: bidFmt.px_str,
     best_ask: askFmt.px,
     best_ask_str: askFmt.px_str,
     phoenix_mid: Number(mid.toFixed(6)),
     tick_ms: TICK_MS,
-    ...meta,
+    ...meta, // may include source + levels_bids/levels_asks
   });
 }
 
-function publishMid(symbol: string, marketStr: string, bestBid?: number, bestAsk?: number, meta: Record<string, unknown> = {}) {
+function publishMid(
+  symbol: string,
+  marketStr: string,
+  bestBid?: number,
+  bestAsk?: number,
+  meta: Record<string, unknown> = {}
+) {
   if (typeof bestBid !== "number" || typeof bestAsk !== "number") return;
   const mid = (bestBid + bestAsk) / 2;
   const bidFmt = fmtPx(bestBid);
@@ -295,7 +350,7 @@ function publishMid(symbol: string, marketStr: string, bestBid?: number, bestAsk
   logger.log("phoenix_mid", {
     ts: Date.now(),
     market: marketStr,
-    symbol,                 // ← added (additive)
+    symbol,
     ...midFmt,
     best_bid: bidFmt.px,
     best_bid_str: bidFmt.px_str,
@@ -313,8 +368,8 @@ async function runMarket(client: any, symbol: string, marketStr: string, pythId?
   // One-time “loaded”
   try {
     let ms: MarketState | undefined;
-    try { ms = await maybeAwait(client.refreshMarket(marketStr, false)); } catch {}
-    if (!ms) { try { ms = await maybeAwait(client.refreshMarket(marketPk, false)); } catch {} }
+    try { ms = await (client as any).refreshMarket?.(marketStr, false); } catch {}
+    if (!ms) { try { ms = await (client as any).refreshMarket?.(marketPk, false); } catch {} }
     const ob: any = (ms as any)?.orderBook ?? (ms as any)?.book ?? undefined;
     const hasBids =
       !!((Array.isArray(ob?.bids) && ob.bids.length > 0) ||
@@ -350,7 +405,10 @@ async function runMarket(client: any, symbol: string, marketStr: string, pythId?
     }
 
     if (got && typeof got.bestBid === "number" && typeof got.bestAsk === "number") {
-      publishL2(symbol, marketStr, got.bestBid, got.bestAsk, { source: got.source });
+      const meta: Record<string, unknown> = { source: got.source };
+      if (Array.isArray(got.bids)) meta.levels_bids = got.bids;
+      if (Array.isArray(got.asks)) meta.levels_asks = got.asks;
+      publishL2(symbol, marketStr, got.bestBid, got.bestAsk, meta);
       publishMid(symbol, marketStr, got.bestBid, got.bestAsk, { source: got.source });
       return;
     }

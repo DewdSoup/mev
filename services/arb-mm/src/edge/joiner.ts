@@ -1,5 +1,6 @@
 // services/arb-mm/src/edge/joiner.ts
 // Book-first edge calc + decision layer (CPMM/adaptive) + optional RPC-sim.
+// Depth-aware Phoenix (optional) and fee-accurate effective prices.
 // Emits clean edge_report logs and ML features.
 
 import { logger } from "../ml_logger.js";
@@ -11,7 +12,16 @@ import type { SlipMode } from "../config.js";
 function nnum(x: any): number | undefined {
   return typeof x === "number" && Number.isFinite(x) ? x : undefined;
 }
-function round(n: number, p = 6) { return Number(n.toFixed(p)); }
+
+// SAFE round: tolerate undefined/NaN/strings/bigints without throwing.
+function round(n: any, p = 6): number {
+  const num =
+    typeof n === "bigint" ? Number(n) :
+    typeof n === "string" ? Number(n) :
+    Number(n);
+  return Number.isFinite(num) ? Number(num.toFixed(p)) : Number.NaN;
+}
+
 function sig(obj: any): string {
   const pick = {
     s: obj.symbol,
@@ -35,6 +45,8 @@ type Reserves = {
   quoteDecimals: number;
   ts: number;
 };
+
+type DepthSide = { px: number; qty: number };
 
 export interface JoinerParams {
   minAbsBps: number;
@@ -79,6 +91,8 @@ export type DecisionHook = (
 
 export type RpcSampleHook = (sample: { ms: number; blocked: boolean }) => void;
 
+// NOTE: rpc_eff_px / rpc_price_impact_bps are optional — callers may
+// return timing-only objects and skip price gating.
 export type RpcSimFn = (input: {
   path: "AMM->PHX" | "PHX->AMM";
   sizeBase: number;
@@ -87,8 +101,8 @@ export type RpcSimFn = (input: {
   ammFeeBps: number;
 }) => Promise<
   | {
-      rpc_eff_px: number;
-      rpc_price_impact_bps: number;
+      rpc_eff_px?: number;
+      rpc_price_impact_bps?: number;
       rpc_sim_ms: number;
       rpc_sim_mode: string;
       rpc_sim_error?: string;
@@ -102,7 +116,13 @@ export type RpcSimFn = (input: {
 export class EdgeJoiner {
   private amms?: Mid;
   private phxMid?: Mid;
-  private phxBook: (PhoenixBook & { ts: number; book_method?: string }) | null = null;
+  // Extended book: include depth arrays when provided by the feed
+  private phxBook: (PhoenixBook & {
+    ts: number;
+    book_method?: string;
+    levels_bids?: DepthSide[];
+    levels_asks?: DepthSide[];
+  }) | null = null;
   private lastWaitLog = 0;
 
   private reserves?: Reserves;
@@ -150,6 +170,9 @@ export class EdgeJoiner {
     if (ev === "phoenix_l2") {
       const bid = nnum(obj?.best_bid);
       const ask = nnum(obj?.best_ask);
+      const bidsArr = Array.isArray(obj?.levels_bids) ? (obj.levels_bids as any[]).map((l) => ({ px: Number(l.px), qty: Number(l.qty) })) : undefined;
+      const asksArr = Array.isArray(obj?.levels_asks) ? (obj.levels_asks as any[]).map((l) => ({ px: Number(l.px), qty: Number(l.qty) })) : undefined;
+
       if (bid && ask) {
         this.phxBook = {
           best_bid: bid,
@@ -158,6 +181,8 @@ export class EdgeJoiner {
           ts: Date.now(),
           source: "book",
           book_method: String(obj?.source ?? "unknown"),
+          levels_bids: bidsArr,
+          levels_asks: asksArr,
         };
       }
     } else if (ev === "phoenix_mid") {
@@ -179,12 +204,12 @@ export class EdgeJoiner {
     void this.maybeReport();
   }
 
-  private getFreshBook(): (PhoenixBook & { ts: number; book_method?: string }) | null {
+  private getFreshBook(): (PhoenixBook & { ts: number; book_method?: string; levels_bids?: DepthSide[]; levels_asks?: DepthSide[] }) | null {
     const now = Date.now();
     if (this.phxBook && now - this.phxBook.ts <= this.C.bookTtlMs) return this.phxBook;
     if (this.phxMid) {
       const synth = synthFromMid(this.phxMid.px, this.phxMid.ts);
-      if (synth) return { ...synth, ts: Date.now() };
+      if (synth) return { ...synth, ts: Date.now() } as any;
     }
     return null;
   }
@@ -208,8 +233,8 @@ export class EdgeJoiner {
     }
 
     const ammPx = amm.px;
-    const bid = book.best_bid;
-    const ask = book.best_ask;
+    const bid = (book as any).best_bid;
+    const ask = (book as any).best_ask;
     if (!(ammPx > 0 && bid > 0 && ask > 0)) return;
 
     const toPhoenixSellBps = (ammPx / bid - 1) * 10_000;
@@ -313,10 +338,41 @@ export class EdgeJoiner {
       return false;
     }
     this.lastDecisionAtMs = now;
-    this.lastPath = path;
+       this.lastPath = path;
     this.lastSide = side;
     this.lastEdgeNetBps = edgeNetBps;
     return true;
+  }
+
+  // Depth-walk Phoenix book to our size (optional, env-driven)
+  private walkPhoenix(side: "buy"|"sell", sizeBase: number, feeBps: number) {
+    const B = this.getFreshBook();
+    if (!B) return undefined;
+    const ladder: DepthSide[] | undefined = side === "sell" ? (B as any).levels_bids : (B as any).levels_asks;
+    if (!ladder || ladder.length === 0 || !(sizeBase > 0)) return undefined;
+
+    let rem = sizeBase, notional = 0;
+    for (const { px, qty } of ladder) {
+      if (!(px > 0 && qty > 0)) continue;
+      const take = Math.min(rem, qty);
+      notional += take * px;
+      rem -= take;
+      if (rem <= 1e-12) break;
+    }
+    if (rem > 1e-12) return undefined; // not enough depth
+
+    const fee = Math.max(0, feeBps) / 10_000;
+    const extra = Math.max(0, Number(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? this.C.dynamicSlippageExtraBps) / 10_000);
+    const depthExtra = Math.max(0, Number(process.env.PHOENIX_DEPTH_EXTRA_BPS ?? 0) / 10_000);
+
+    const avgPx = notional / sizeBase;
+    if (side === "sell") {
+      // receive on PHX
+      return avgPx * (1 - depthExtra - extra) * (1 - fee);
+    } else {
+      // pay on PHX
+      return avgPx * (1 + depthExtra + extra) * (1 + fee);
+    }
   }
 
   private async decideAndLog(
@@ -352,8 +408,13 @@ export class EdgeJoiner {
       }
     }
 
+    // Depth-aware Phoenix (if enabled and depth present)
+    const phxDepthOn = String(process.env.PHOENIX_DEPTH_ENABLED ?? "0").toLowerCase() === "1" || String(process.env.PHOENIX_DEPTH_ENABLED ?? "").toLowerCase() === "true";
+    const phxSellEffDepth = phxDepthOn ? this.walkPhoenix("sell", sizeBase, this.P.phoenixFeeBps) : undefined;
+    const phxBuyEffDepth  = phxDepthOn ? this.walkPhoenix("buy",  sizeBase, this.P.phoenixFeeBps) : undefined;
+
     const buyA_flat = buyFlat(ammMid, ammFee, flatSlip);
-    const sellA = sellFlat(phxBid, phxFee, phxSlip);
+    const sellA = phxSellEffDepth ?? sellFlat(phxBid, phxFee, phxSlip);
     const buyA_used =
       this.C.activeSlippageMode === "flat" || ammBuyPxSim == null
         ? buyA_flat
@@ -364,7 +425,7 @@ export class EdgeJoiner {
     const pnlNetA = (sellA - buyA_used) * sizeBase - this.P.fixedTxCostQuote;
     const bpsGrossA = (phxBid / ammMid - 1) * 10_000;
 
-    const buyB = buyFlat(phxAsk, phxFee, phxSlip);
+    const buyB = phxBuyEffDepth ?? buyFlat(phxAsk, phxFee, phxSlip);
     const sellB_flat = sellFlat(ammMid, ammFee, flatSlip);
     const sellB_used =
       this.C.activeSlippageMode === "flat" || ammSellPxSim == null
@@ -403,6 +464,7 @@ export class EdgeJoiner {
     if (this.C.logSimFields) {
       base.phx_spread_bps = round(((phxAsk / phxBid) - 1) * 10_000, 4);
       base.phx_slippage_bps_used = round(Math.max(this.C.phoenixSlippageBps, (((phxAsk / phxBid) - 1) * 10_000) * 0.5) + this.C.dynamicSlippageExtraBps, 4);
+      if (phxDepthOn) base.phx_depth_used = true;
       if (this.C.activeSlippageMode === "amm_cpmm" || this.C.activeSlippageMode === "adaptive") {
         if (ammBuyPxSim != null) base.amm_buy_px_sim = round(ammBuyPxSim);
         if (ammSellPxSim != null) base.amm_sell_px_sim = round(ammSellPxSim);
@@ -418,6 +480,7 @@ export class EdgeJoiner {
     base.amm_eff_px = round(ammEffPx);
     base.amm_price_impact_bps = round((ammEffPx / ammMid - 1) * 10_000, 4);
 
+    // ── Optional RPC sim (only attach fields when they are real numbers)
     if (this.C.useRpcSim && this.rpcSim && this.reserves) {
       try {
         const out = await this.rpcSim({
@@ -427,21 +490,24 @@ export class EdgeJoiner {
           reserves: { base: this.reserves.base, quote: this.reserves.quote },
           ammFeeBps: this.P.ammFeeBps,
         });
+
         if (out) {
-          base.rpc_eff_px = round(out.rpc_eff_px);
-          base.rpc_price_impact_bps = round(out.rpc_price_impact_bps, 4);
-          base.rpc_sim_ms = out.rpc_sim_ms;
-          base.rpc_sim_mode = out.rpc_sim_mode;
-          if (out.rpc_qty_out != null) base.rpc_qty_out = round(out.rpc_qty_out, 9);
-          if (out.rpc_units != null) base.rpc_units = out.rpc_units;
+          if (typeof out.rpc_eff_px === "number" && Number.isFinite(out.rpc_eff_px)) {
+            base.rpc_eff_px = round(out.rpc_eff_px);
+            base.sim_eff_px = base.rpc_eff_px;
+          }
+          if (typeof out.rpc_price_impact_bps === "number" && Number.isFinite(out.rpc_price_impact_bps)) {
+            base.rpc_price_impact_bps = round(out.rpc_price_impact_bps, 4);
+            base.sim_slippage_bps = base.rpc_price_impact_bps;
+          }
+          if (typeof out.rpc_sim_ms === "number" && out.rpc_sim_ms >= 0) base.rpc_sim_ms = out.rpc_sim_ms;
+          if (typeof out.rpc_sim_mode === "string") base.rpc_sim_mode = out.rpc_sim_mode;
+          if (typeof out.rpc_qty_out === "number" && Number.isFinite(out.rpc_qty_out)) base.rpc_qty_out = round(out.rpc_qty_out, 9);
+          if (typeof out.rpc_units === "number" && Number.isFinite(out.rpc_units)) { base.rpc_units = out.rpc_units; base.compute_units = out.rpc_units; }
+          if (typeof out.prioritization_fee === "number" && Number.isFinite(out.prioritization_fee)) base.prioritization_fee = out.prioritization_fee;
           if (out.rpc_sim_error) base.rpc_sim_error = out.rpc_sim_error;
-          if (out.prioritization_fee != null) base.prioritization_fee = out.prioritization_fee;
 
-          base.sim_eff_px = base.rpc_eff_px;
-          base.sim_slippage_bps = base.rpc_price_impact_bps;
-          if (base.rpc_units != null) base.compute_units = base.rpc_units;
-
-          this.onRpcSample?.({ ms: out.rpc_sim_ms ?? 0, blocked: false });
+          this.onRpcSample?.({ ms: (out.rpc_sim_ms ?? 0), blocked: false });
         }
       } catch (e: any) {
         base.rpc_sim_error = String(e?.message ?? e);

@@ -4,9 +4,16 @@
     "rootDir": "src",
     "outDir": "dist",
     "composite": true,
-    "types": ["node"]
+    "types": ["node"],
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "moduleResolution": "Bundler"
   },
-  "include": ["src"],
+  "include": [
+    "src",
+    "src/types/**/*.d.ts",
+    "types/**/*.d.ts"
+  ],
   "references": [
     { "path": "../../packages/core" },
     { "path": "../../packages/risk" },

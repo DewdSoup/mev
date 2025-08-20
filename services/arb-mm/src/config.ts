@@ -39,9 +39,13 @@ export function parseFloatEnv(v: string | undefined, def = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 }
-export function parseIntEnv(v: string | undefined, def = 0) {
+// supports optional min/max clamping
+export function parseIntEnv(v: string | undefined, def = 0, min?: number, max?: number) {
   const n = Number(v);
-  return Number.isInteger(n) ? n : Math.trunc(Number.isFinite(n) ? n : def);
+  const base = Number.isInteger(n) ? n : Math.trunc(Number.isFinite(n) ? n : def);
+  const lo = min ?? Number.MIN_SAFE_INTEGER;
+  const hi = max ?? Number.MAX_SAFE_INTEGER;
+  return Math.max(lo, Math.min(hi, base));
 }
 export function parseBoolEnv(v: string | undefined, def = false) {
   if (v == null) return def;
@@ -56,7 +60,7 @@ export function envBool(k: string, def: boolean): boolean {
   return def;
 }
 
-// 🚨 FIX: don’t use cwd → always service-root + repo-root fallback
+// ── Paths (don’t use cwd; anchor to service root, then repo root) ───────────
 export function resolvePathCandidates(rel: string) {
   return [
     path.resolve(SVC_ROOT, rel),
@@ -70,7 +74,10 @@ export function firstExistingPathOrDefault(relOrAbs: string): string {
   return path.resolve(SVC_ROOT, relOrAbs);
 }
 
+// ── RPC resolver (honor your RPC_URL first) ─────────────────────────────────
 function resolveRpc(): string {
+  const explicit = process.env.RPC_URL?.trim();
+  if (explicit) return explicit;                       // ← your .env.live setting
   const primary = process.env.RPC_PRIMARY?.trim();
   if (primary) return primary;
   const heliusKey = process.env.HELIUS_API_KEY?.trim();
@@ -86,8 +93,47 @@ export function maskUrl(u: string): string {
     return u;
   }
 }
-
 export const RPC = resolveRpc();
+
+// ── Fee resolver (env globals, per-id overrides, optional JSON map) ─────────
+function asNum(v: any, dflt: number) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : dflt;
+}
+
+// Optional JSON map: FEES_JSON=/path/to/fees.json
+// {
+//   "global": { "AMM": 25, "PHOENIX": 0 },
+//   "AMM": { "<poolId>": 25 },
+//   "PHOENIX": { "<marketId>": 0 }
+// }
+function loadFeesJson() {
+  const p = process.env.FEES_JSON?.trim();
+  if (!p) return null;
+  try {
+    const abs = firstExistingPathOrDefault(p);
+    return JSON.parse(fs.readFileSync(abs, "utf8"));
+  } catch {
+    return null;
+  }
+}
+const FEES_JSON = loadFeesJson();
+
+export function resolveFeeBps(kind: "AMM" | "PHOENIX", id: string | undefined, fallback: number) {
+  let bps = asNum(process.env[`${kind}_TAKER_FEE_BPS`], fallback);
+  const altGlobal = process.env[`FEE_BPS_${kind}`];
+  if (altGlobal != null) bps = asNum(altGlobal, bps);
+
+  if (FEES_JSON?.global?.[kind] != null) bps = asNum(FEES_JSON.global[kind], bps);
+
+  if (id) {
+    const envOv = process.env[`${kind}_TAKER_FEE_BPS__${id}`] ?? process.env[`FEE_BPS_${kind}__${id}`];
+    if (envOv != null) bps = asNum(envOv, bps);
+    const jsonOv = FEES_JSON?.[kind]?.[id];
+    if (jsonOv != null) bps = asNum(jsonOv, bps);
+  }
+  return bps;
+}
 
 // ── Params loader ───────────────────────────────────────────────────────────
 type DailyParams = Partial<{
@@ -153,7 +199,7 @@ export interface AppConfig {
   ACTIVE_SLIPPAGE_MODE: SlipMode;
   USE_RPC_SIM: boolean;
   USE_RAYDIUM_SWAP_SIM: boolean;
-  PHOENIX_SLIPPAGE_BPS: number; // legacy floor
+  PHOENIX_SLIPPAGE_BPS: number;
   CPMM_MAX_POOL_TRADE_FRAC: number;
   DYNAMIC_SLIPPAGE_EXTRA_BPS: number;
   LOG_SIM_FIELDS: boolean;
@@ -183,6 +229,11 @@ export interface AppConfig {
 
   // guards
   MIN_SOL_BALANCE_LAMPORTS: number;
+
+  // depth (exposed for completeness; optional)
+  PHOENIX_DEPTH_ENABLED?: boolean;
+  PHOENIX_DEPTH_LEVELS?: number;
+  PHOENIX_DEPTH_EXTRA_BPS?: number;
 }
 
 export function stamp() {
@@ -197,7 +248,8 @@ export function loadConfig(): AppConfig {
   const EDGE_WAIT_LOG_MS = parseMsEnv(process.env.EDGE_WAIT_LOG_MS, 5000, 100, 60000);
   const EDGE_FOLLOW_POLL_MS = parseMsEnv(process.env.EDGE_FOLLOW_POLL_MS, 500, 50, 5000);
 
-  const BOOK_TTL_MS = parseMsEnv(process.env.PHOENIX_BOOK_TTL_MS, 5000, 100, 60000);
+  // Honor either PHOENIX_BOOK_TTL_MS or BOOK_TTL_MS (your .env.live uses BOOK_TTL_MS)
+  const BOOK_TTL_MS = parseMsEnv(process.env.PHOENIX_BOOK_TTL_MS ?? process.env.BOOK_TTL_MS, 500, 100, 60000);
   const SYNTH_WIDTH_BPS = parseFloatEnv(process.env.PHOENIX_SYNTH_WIDTH_BPS, 8);
 
   // Make DATA_DIR absolute and stable relative to the service root
@@ -273,7 +325,11 @@ export function loadConfig(): AppConfig {
   const USDC_ATA = process.env.USDC_ATA?.trim();
   const WSOL_ATA = process.env.WSOL_ATA?.trim();
 
-  const PHOENIX_MARKET = process.env.PHOENIX_MARKET?.trim() || "";
+  // Accept PHOENIX_MARKET or PHOENIX_MARKET_ID (your .env.live uses the latter)
+  const PHOENIX_MARKET =
+    process.env.PHOENIX_MARKET?.trim() ||
+    process.env.PHOENIX_MARKET_ID?.trim() ||
+    "";
 
   const MIN_SOL_BALANCE_LAMPORTS = parseIntEnv(process.env.MIN_SOL_BALANCE_LAMPORTS, 5_000_000);
 
@@ -328,5 +384,10 @@ export function loadConfig(): AppConfig {
 
     PHOENIX_MARKET,
     MIN_SOL_BALANCE_LAMPORTS,
+
+    // Optional Phoenix “depth” knobs (just exposed for completeness)
+    PHOENIX_DEPTH_ENABLED: parseBoolEnv(process.env.PHOENIX_DEPTH_ENABLED, false),
+    PHOENIX_DEPTH_LEVELS: parseIntEnv(process.env.PHOENIX_DEPTH_LEVELS, 12, 1, 50),
+    PHOENIX_DEPTH_EXTRA_BPS: parseFloatEnv(process.env.PHOENIX_DEPTH_EXTRA_BPS, 0.15),
   };
 }
