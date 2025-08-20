@@ -1,11 +1,11 @@
 // services/arb-mm/src/executor/buildRaydiumCpmmIx.ts
 import { PublicKey, TransactionInstruction } from "@solana/web3.js";
 import {
-  buildRaydiumSwapFixedInIx,
+  buildRaydiumSwapFixedInIxAsync,
   SOL_MINT,
   USDC_MINT,
   DEFAULT_SOL_USDC_POOL,
-} from "../util/raydium.js"; // KEEP .js (NodeNext imports)
+} from "../util/raydium.js";
 
 export type BuildSwapIxParams = {
   user: PublicKey;
@@ -13,7 +13,7 @@ export type BuildSwapIxParams = {
   quoteMint?: PublicKey;
   poolId?: PublicKey;
   baseIn: boolean;
-  amountInBase: bigint;
+  amountInBase: bigint;   // atoms of *input* mint
   slippageBps: number;
 };
 
@@ -21,8 +21,10 @@ export type BuildSwapIxResult =
   | { ok: true; ixs: TransactionInstruction[] }
   | { ok: false; reason: string };
 
-export function buildRaydiumCpmmSwapIx(p: BuildSwapIxParams): BuildSwapIxResult {
-  const res = buildRaydiumSwapFixedInIx({
+export async function buildRaydiumCpmmSwapIx(
+  p: BuildSwapIxParams
+): Promise<BuildSwapIxResult> {
+  return buildRaydiumSwapFixedInIxAsync({
     user: p.user,
     poolId: p.poolId ?? DEFAULT_SOL_USDC_POOL,
     baseMint: p.baseMint ?? SOL_MINT,
@@ -31,5 +33,4 @@ export function buildRaydiumCpmmSwapIx(p: BuildSwapIxParams): BuildSwapIxResult 
     amountInBase: p.amountInBase,
     slippageBps: p.slippageBps,
   });
-  return res.ok ? res : { ok: false, reason: res.reason };
 }

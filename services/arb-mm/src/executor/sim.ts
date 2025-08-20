@@ -10,39 +10,33 @@ import {
 import { buildRaydiumCpmmSwapIx } from "./buildRaydiumCpmmIx.js";
 
 export type RaydiumSimOk = {
-  mode: "cpmm-sim-success" | "raydium-swap-ix-failed-fallback" | "cpmm-fallback+noop";
-  rpc_eff_px?: number;
-  rpc_price_impact_bps?: number;
-  rpc_qty_out?: number;
+  mode: "cpmm-sim-success";
   rpc_units?: number;
   rpc_sim_ms: number;
   logs_tail?: string[];
-  reason?: string;
 };
-
 export type RaydiumSimErr = {
-  mode: "cpmm-sim-error";
+  mode: "cpmm-sim-error" | "raydium-swap-ix-failed-fallback";
   reason: string;
   rpc_sim_ms?: number;
   logs_tail?: string[];
 };
-
 export type RaydiumSim = RaydiumSimOk | RaydiumSimErr;
 
 export async function simulateRaydiumSwapFixedIn(
   conn: Connection,
   params: {
     user: PublicKey;
-    baseMint: PublicKey;
-    quoteMint: PublicKey;
-    amountInBase: bigint;
+    amountInBase: bigint; // atoms of *input* mint
     baseIn: boolean;
     slippageBps: number;
+    baseMint?: PublicKey;
+    quoteMint?: PublicKey;
   }
 ): Promise<RaydiumSim> {
   const t0 = performance.now();
   try {
-    const build = buildRaydiumCpmmSwapIx({
+    const build = await buildRaydiumCpmmSwapIx({
       user: params.user,
       baseMint: params.baseMint,
       quoteMint: params.quoteMint,
@@ -54,8 +48,8 @@ export async function simulateRaydiumSwapFixedIn(
     if (!build.ok) {
       return {
         mode: "raydium-swap-ix-failed-fallback",
-        rpc_sim_ms: Math.round(performance.now() - t0),
         reason: build.reason,
+        rpc_sim_ms: Math.round(performance.now() - t0),
       };
     }
 
@@ -70,15 +64,26 @@ export async function simulateRaydiumSwapFixedIn(
     }).compileToV0Message();
 
     const vtx = new VersionedTransaction(msg);
-
-    const simRes = await conn.simulateTransaction(vtx, {
+    const sim = await conn.simulateTransaction(vtx, {
       replaceRecentBlockhash: true,
       sigVerify: false,
       commitment: "processed",
     });
 
     const ms = Math.round(performance.now() - t0);
-    const parsed = parseSim(simRes.value);
+    const parsed = parseSim(sim.value);
+
+    if (sim.value?.err) {
+      return {
+        mode: "cpmm-sim-error",
+        reason:
+          typeof sim.value.err === "string"
+            ? sim.value.err
+            : JSON.stringify(sim.value.err),
+        rpc_sim_ms: ms,
+        logs_tail: parsed.tail,
+      };
+    }
 
     return {
       mode: "cpmm-sim-success",
@@ -96,10 +101,11 @@ export async function simulateRaydiumSwapFixedIn(
 }
 
 function parseSim(v: SimulatedTransactionResponse) {
-  const tail = (v?.logs ?? []).slice(-6);
+  const tail = (v?.logs ?? []).slice(-8);
   const computeUnitsConsumed =
     (v as any)?.unitsConsumed ??
     (v as any)?.computeUnitsConsumed ??
+    (v as any)?.meta?.computeUnitsConsumed ??
     undefined;
   return { tail, computeUnitsConsumed };
 }

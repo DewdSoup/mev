@@ -31,14 +31,14 @@
   "scripts": {
     "//": "──────────── Dev runners ────────────",
     "dev": "pnpm dev:all",
-    "dev:all": "dotenv -e .env -- env FORCE_COLOR=1 concurrently -k --raw -n PHOENIX,AMMS,ARB -c \"green,yellow,cyan\" \"bash -lc 'pnpm -C packages/phoenix dev'\" \"bash -lc 'pnpm -C packages/amms dev'\" \"bash -lc 'pnpm -C services/arb-mm dev'\"",
-    "dev:phoenix": "dotenv -e .env -- env FORCE_COLOR=1 pnpm -C packages/phoenix dev",
-    "dev:amms": "dotenv -e .env -- env FORCE_COLOR=1 pnpm -C packages/amms dev",
-    "dev:arb": "dotenv -e .env -- env FORCE_COLOR=1 pnpm -C services/arb-mm dev",
+    "dev:all": "env FORCE_COLOR=1 concurrently -k --raw -n PHOENIX,AMMS,ARB -c \"green,yellow,cyan\" \"bash -lc 'pnpm -C packages/phoenix dev'\" \"bash -lc 'pnpm -C packages/amms dev'\" \"bash -lc 'pnpm -C services/arb-mm dev'\"",
+    "dev:phoenix": "env FORCE_COLOR=1 pnpm -C packages/phoenix dev",
+    "dev:amms": "env FORCE_COLOR=1 pnpm -C packages/amms dev",
+    "dev:arb": "env FORCE_COLOR=1 pnpm -C services/arb-mm dev",
     "//live": "──────────── One-button sessions (manual stop with Ctrl+C) ────────────",
-    "live": "dotenv -e .env -- bash -lc 'SHADOW_TRADING=0 LIVE_TRADING=1 SUBMIT_MODE=${SUBMIT_MODE:-rpc} SUBMIT_CU_LIMIT=${SUBMIT_CU_LIMIT:-400000} TIP_MODE=${TIP_MODE:-dynamic} USE_RPC_SIM=${USE_RPC_SIM:-0} USE_RAYDIUM_SWAP_SIM=${USE_RAYDIUM_SWAP_SIM:-1} SIM_FAIL_ON_FALLBACK=false pnpm dev:all || true; pnpm report:live || true; pnpm -C services/arb-mm daily:if-needed || true'",
-    "live:jito": "dotenv -e .env -- bash -lc 'SHADOW_TRADING=0 LIVE_TRADING=1 SUBMIT_MODE=jito SUBMIT_CU_LIMIT=${SUBMIT_CU_LIMIT:-400000} TIP_MODE=${TIP_MODE:-dynamic} USE_RPC_SIM=${USE_RPC_SIM:-0} USE_RAYDIUM_SWAP_SIM=${USE_RAYDIUM_SWAP_SIM:-1} SIM_FAIL_ON_FALLBACK=false pnpm dev:all || true; pnpm report:live || true; pnpm -C services/arb-mm daily:if-needed || true'",
-    "shadow": "dotenv -e .env -- bash -lc 'SHADOW_TRADING=1 LIVE_TRADING=0 USE_RPC_SIM=0 USE_RAYDIUM_SWAP_SIM=0 SIM_FAIL_ON_FALLBACK=false pnpm dev:all || true; pnpm report:live || true; pnpm -C services/arb-mm daily:if-needed || true'",
+    "live": "dotenv -e .env.live -- bash -lc 'SHADOW_TRADING=${SHADOW_TRADING:-0} LIVE_TRADING=${LIVE_TRADING:-1} pnpm dev:all || true; pnpm report:live:live || true; pnpm -C services/arb-mm daily:if-needed || true'",
+    "live:jito": "dotenv -e .env.live -- bash -lc 'SHADOW_TRADING=${SHADOW_TRADING:-0} LIVE_TRADING=${LIVE_TRADING:-1} SUBMIT_MODE=jito pnpm dev:all || true; pnpm report:live:live || true; pnpm -C services/arb-mm daily:if-needed || true'",
+    "shadow": "dotenv -e .env.shadow -- bash -lc 'SHADOW_TRADING=${SHADOW_TRADING:-1} LIVE_TRADING=${LIVE_TRADING:-0} pnpm dev:all || true; pnpm report:live:shadow || true; pnpm -C services/arb-mm daily:if-needed || true'",
     "//prod": "──────────── Prod-style runners ────────────",
     "start:all": "dotenv -e .env -- env FORCE_COLOR=1 concurrently -k --raw -n PHOENIX,AMMS,ARB -c auto \"bash -lc 'pnpm -C packages/phoenix start || true'\" \"bash -lc 'pnpm -C packages/amms start || true'\" \"bash -lc 'pnpm -C services/arb-mm start || true'\"",
     "start:phoenix": "dotenv -e .env -- env FORCE_COLOR=1 pnpm -C packages/phoenix start",
@@ -64,8 +64,10 @@
     "//repo": "──────────── Repo plumbing ────────────",
     "prepare": "bash -lc '[ -d .git ] && simple-git-hooks || echo \"(no .git) skipping hooks)\"'",
     "rebuild:native": "pnpm rebuild",
-    "//report": "──────────── Live session report (called by shadow/live) ────────────",
-    "report:live": "dotenv -e .env -- tsx services/arb-mm/scripts/live_report.ts"
+    "//report": "──────────── Live session report (env-aware) ────────────",
+    "report:live": "dotenv -e .env -- tsx services/arb-mm/scripts/live_report.ts",
+    "report:live:shadow": "dotenv -e .env.shadow -- tsx services/arb-mm/scripts/live_report.ts",
+    "report:live:live": "dotenv -e .env.live -- tsx services/arb-mm/scripts/live_report.ts"
   },
   "simple-git-hooks": {
     "pre-commit": "pnpm -r typecheck && pnpm -r lint && lint-staged"
