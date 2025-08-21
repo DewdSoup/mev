@@ -1,6 +1,6 @@
 // services/arb-mm/src/util/raydium.ts
 // Raydium CPMM live swap builder using on-disk full pool keys (configs/raydium.pool.json).
-// Runtime is .env-only. No CLI flags, no guessing.
+// Runtime is .env-only. Hardened for Raydium SDK variants.
 
 import fs from "fs";
 import path from "path";
@@ -15,6 +15,9 @@ import {
   Liquidity,
   LiquidityPoolKeys,
   SPL_ACCOUNT_LAYOUT,
+  Percent,
+  Token,
+  TokenAmount,
 } from "@raydium-io/raydium-sdk";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
@@ -35,15 +38,16 @@ export const DEFAULT_SOL_USDC_POOL = new PublicKey(
     "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
 );
 
-// Optional flags (all default OFF)
+// Optional flags (default OFF)
 const LOG_MINOUT = (process.env.LOG_RAYDIUM_MINOUT ?? "0") === "1";
+const LOG_TOKEN_CTOR = (process.env.LOG_RAYDIUM_TOKEN_CTOR ?? "0") === "1";
+const LOG_SWAP_BUILD = (process.env.LOG_RAYDIUM_SWAP_BUILD ?? "0") === "1";
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Pool JSON discovery: multiple sane locations + optional .env override
+// Pool JSON discovery
 function findPoolJsonPath(): string {
   const envPath = process.env.RAYDIUM_POOL_JSON_PATH?.trim();
   if (envPath && fs.existsSync(envPath)) return path.resolve(envPath);
-
   const candidates = [
     path.resolve(process.cwd(), "configs", "raydium.pool.json"),
     path.resolve(process.cwd(), "..", "configs", "raydium.pool.json"),
@@ -54,10 +58,8 @@ function findPoolJsonPath(): string {
   for (const p of candidates) if (fs.existsSync(p)) return p;
   return "";
 }
-
 const POOL_JSON_PATH = findPoolJsonPath();
 
-// On-disk JSON shape (matches your full keys file)
 type DiskPoolKeys = {
   id: string;
   programId: string;
@@ -122,8 +124,6 @@ function readPoolJson(): DiskPoolKeys {
 
 function toPoolKeys(d: DiskPoolKeys): LiquidityPoolKeys {
   const v = (d.version === 5 ? 5 : 4) as 4 | 5;
-
-  // Build then assert via unknown to bypass overly strict SDK typings.
   const out = {
     id: new PublicKey(d.id),
     baseMint: new PublicKey(d.baseMint),
@@ -150,21 +150,19 @@ function toPoolKeys(d: DiskPoolKeys): LiquidityPoolKeys {
 
     ...(d.marketAuthority ? { marketAuthority: new PublicKey(d.marketAuthority) } : {}),
   } as unknown as LiquidityPoolKeys;
-
   return out;
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// RPC resolver: .env first, then Helius key, then cluster default
+// RPC
 function resolveRpc(): string {
-  const fromEnv = process.env.RPC_URL?.trim();
+  const fromEnv = process.env.RPC_URL?.trim() || process.env.RPC_PRIMARY?.trim();
   if (fromEnv) return fromEnv;
   const helius = process.env.HELIUS_API_KEY?.trim();
   if (helius) return `https://rpc.helius.xyz/?api-key=${helius}`;
   return clusterApiUrl("mainnet-beta");
 }
 
-// Token accounts list for Raydium SDK (with programId included)
 async function fetchUserTokenAccounts(conn: Connection, owner: PublicKey) {
   const resp = await conn.getTokenAccountsByOwner(
     owner,
@@ -173,17 +171,29 @@ async function fetchUserTokenAccounts(conn: Connection, owner: PublicKey) {
   );
   return resp.value.map(({ pubkey, account }) => ({
     pubkey,
-    programId: TOKEN_PROGRAM_ID,
     accountInfo: SPL_ACCOUNT_LAYOUT.decode(account.data),
   }));
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// CPMM math for minOut (exact formula using current vault balances).
+// Fetch token decimals (fast path for SOL/USDC; fallback to parsed mint)
+async function resolveMintDecimals(conn: Connection, mint: PublicKey): Promise<number> {
+  if (mint.equals(SOL_MINT)) return 9;
+  if (mint.equals(USDC_MINT)) return 6;
+  try {
+    const info = await conn.getParsedAccountInfo(mint);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const dec = (info.value?.data as any)?.parsed?.info?.decimals;
+    if (typeof dec === "number") return dec;
+  } catch (_) {
+    // ignore
+  }
+  return 9;
+}
 
+// ───────────────────────────────────────────────────────────────────────────────
+// CPMM math & minOut
 const BPS = 10_000n;
 
-/** Read base/quote vault reserves (atoms) at 'processed' to minimize latency. */
 async function getVaultReserves(
   conn: Connection,
   pool: LiquidityPoolKeys
@@ -200,23 +210,21 @@ async function getVaultReserves(
   return { base: new BN(baseInfo.amount), quote: new BN(quoteInfo.amount) };
 }
 
-/** Integer BPS multiply: floor(x * (BPS - bps) / BPS). */
 function applyBpsDown(x: BN, bps: number): BN {
   const b = BigInt(Math.max(0, Math.min(10_000, Math.ceil(bps))));
   const xb = x.mul(new BN(Number(BPS - b)));
   return xb.div(new BN(Number(BPS)));
 }
 
-/** CPMM out = (dx*(1-fee) * y) / (x + dx*(1-fee))  with integer math */
 function cpmmExpectedOut({
   dx,
   x,
   y,
   feeBps,
 }: {
-  dx: BN; // input atoms
-  x: BN; // input-side reserve
-  y: BN; // output-side reserve
+  dx: BN;
+  x: BN;
+  y: BN;
   feeBps: number;
 }): BN {
   const dxLessFee = applyBpsDown(dx, feeBps);
@@ -226,13 +234,12 @@ function cpmmExpectedOut({
   return numerator.div(denominator);
 }
 
-/** Compute minOut BN given current vault reserves + env slippage. */
 async function computeMinOutBn(opts: {
   conn: Connection;
   pool: LiquidityPoolKeys;
   baseIn: boolean;
   amountIn: BN;
-  slippageBps: number; // from .env (MAX_SLIPPAGE_BPS)
+  slippageBps: number;
 }): Promise<{
   expectedOut: BN;
   minOut: BN;
@@ -240,30 +247,23 @@ async function computeMinOutBn(opts: {
   usedSlipBps: number;
 }> {
   const { conn, pool, baseIn, amountIn, slippageBps } = opts;
-
-  // Try to get a fee override from env (default 25 bps which is Raydium CPMM standard).
   const feeBpsEnv = Number.parseFloat(process.env.RAYDIUM_TRADE_FEE_BPS ?? "25");
   const dynamicExtra = Number.parseFloat(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? "0");
   const bufferBps = Number.parseFloat(process.env.RAYDIUM_MINOUT_BUFFER_BPS ?? "0");
-  const usedSlip = Math.max(0, slippageBps + dynamicExtra + bufferBps);
+  const baseSlip = Number.isFinite(slippageBps) ? slippageBps : Number(process.env.AMM_MINOUT_BASE_BPS ?? 50);
+  const usedSlip = Math.max(0, baseSlip + dynamicExtra + bufferBps);
 
   const { base, quote } = await getVaultReserves(conn, pool);
   const x = baseIn ? base : quote;
   const y = baseIn ? quote : base;
 
-  const expectedOut = cpmmExpectedOut({
-    dx: amountIn,
-    x,
-    y,
-    feeBps: feeBpsEnv,
-  });
-
+  const expectedOut = cpmmExpectedOut({ dx: amountIn, x, y, feeBps: feeBpsEnv });
   const minOut = applyBpsDown(expectedOut, usedSlip);
 
   if (LOG_MINOUT) {
     // eslint-disable-next-line no-console
     console.log("raydium_min_out", {
-      pool: pool.id.toBase58?.() ?? "unknown",
+      pool: (pool as any).id?.toBase58?.() ?? "unknown",
       dir: baseIn ? "BASE->QUOTE" : "QUOTE->BASE",
       amountIn: amountIn.toString(),
       reserves: { base: base.toString(), quote: quote.toString() },
@@ -278,6 +278,26 @@ async function computeMinOutBn(opts: {
   return { expectedOut, minOut, usedFeeBps: feeBpsEnv, usedSlipBps: usedSlip };
 }
 
+// Build Percent from bps as integer ppm (handles 50.25 bps safely)
+function percentFromBpsFloat(bps: number): Percent {
+  const numeratorPpm = Math.round(bps * 100); // e.g. 50.25 bps => 5025
+  return new Percent(numeratorPpm.toString(), "1000000");
+}
+
+// Use the **diagnosed** Token constructor: (programId, mint, decimals, symbol?, name?)
+function makeSdkToken(mint: PublicKey, decimals: number, symbol: string): Token {
+  const tok = new (Token as any)(TOKEN_PROGRAM_ID, mint, decimals, symbol, symbol);
+  if (LOG_TOKEN_CTOR) {
+    // eslint-disable-next-line no-console
+    console.log("raydium_token_ctor_variant", {
+      symbol,
+      address: mint.toBase58(),
+      used: "programId,mint,decimals,symbol,name",
+    });
+  }
+  return tok as Token;
+}
+
 // ───────────────────────────────────────────────────────────────────────────────
 // Public builder API
 
@@ -285,16 +305,74 @@ export type CpmmIxBuildResult =
   | { ok: true; ixs: TransactionInstruction[] }
   | { ok: false; reason: string };
 
-export async function buildRaydiumSwapFixedInIx(params: {
+// Tries multiple argument shapes for makeSwapInstructionSimple to support CPMM/CLMM variants.
+async function tryBuildSwapIxCompat(argsBase: any) {
+  const tries: Array<{ label: string; patch: Record<string, any> }> = [
+    // CPMM-style
+    { label: "amountOutMin+slippage", patch: { amountOutMin: argsBase._minOutTA, slippage: argsBase._slipPercent } },
+    { label: "amountOutMin only",     patch: { amountOutMin: argsBase._minOutTA } },
+    // CLMM-style
+    { label: "otherAmountThreshold+slippage", patch: { otherAmountThreshold: argsBase._minOutTA, slippage: argsBase._slipPercent } },
+    { label: "otherAmountThreshold only",     patch: { otherAmountThreshold: argsBase._minOutTA } },
+    // Belt-and-suspenders
+    { label: "both+slippage", patch: { amountOutMin: argsBase._minOutTA, otherAmountThreshold: argsBase._minOutTA, slippage: argsBase._slipPercent } },
+  ];
+
+  let lastErr: unknown;
+
+  for (const t of tries) {
+    try {
+      const built = await (Liquidity as any).makeSwapInstructionSimple({
+        connection: argsBase.connection,
+        poolKeys: argsBase.poolKeys,
+        userKeys: argsBase.userKeys,
+        fixedSide: "in",
+        amountIn: argsBase.amountIn,
+        tokenIn: argsBase.tokenIn,
+        tokenOut: argsBase.tokenOut,
+        ...t.patch,
+      });
+
+      const ixs: TransactionInstruction[] = [];
+      for (const itx of built?.innerTransactions ?? []) {
+        for (const ix of itx?.instructions ?? []) ixs.push(ix);
+      }
+      if (ixs.length) {
+        if (LOG_SWAP_BUILD) {
+          // eslint-disable-next-line no-console
+          console.log("raydium_swap_build_variant", { used: t.label, ixs: ixs.length });
+        }
+        return { ok: true as const, ixs };
+      }
+      lastErr = new Error("no_instructions_returned");
+      if (LOG_SWAP_BUILD) {
+        // eslint-disable-next-line no-console
+        console.warn("raydium_swap_build_variant_empty", { used: t.label });
+      }
+    } catch (e) {
+      lastErr = e;
+      if (LOG_SWAP_BUILD) {
+        // eslint-disable-next-line no-console
+        console.warn("raydium_swap_build_variant_failed", {
+          used: t.label,
+          err: (e as any)?.message ?? String(e),
+        });
+      }
+    }
+  }
+  return { ok: false as const, reason: `raydium_swap_ix_build_failed: ${String((lastErr as any)?.message ?? lastErr)}` };
+}
+
+export async function buildRaydiumSwapIx(params: {
   user: PublicKey;
   baseIn: boolean;         // true => input is base mint (SOL in SOL/USDC)
-  amountInBase: bigint;    // atoms of INPUT mint (executor passes correct side)
-  slippageBps: number;     // enforced via on-chain threshold & decision/risk
+  amountInBase: bigint;    // atoms of INPUT mint
+  slippageBps: number;     // may be fractional (e.g., 50.25)
 }): Promise<CpmmIxBuildResult> {
   try {
-    // Load full keys and sanity-check env pool id
     const disk = readPoolJson();
-    const envAmm = (process.env.RAYDIUM_POOL_ID ?? "").trim();
+    const envAmm =
+      (process.env.RAYDIUM_POOL_ID ?? process.env.RAYDIUM_POOL_ID_SOL_USDC ?? "").trim();
     if (envAmm && envAmm !== disk.id) {
       return {
         ok: false,
@@ -306,11 +384,21 @@ export async function buildRaydiumSwapFixedInIx(params: {
     const rpc = resolveRpc();
     const conn = new Connection(rpc, { commitment: "processed" });
     const tokenAccounts = await fetchUserTokenAccounts(conn, params.user);
-
     const amountIn = new BN(params.amountInBase.toString());
 
-    // Compute minOut using current vault reserves (exact CPMM math).
-    const { minOut } = await computeMinOutBn({
+    // decimals -> Token -> TokenAmount for SDK .toFixed() usage
+    const [baseDecimals, quoteDecimals] = await Promise.all([
+      resolveMintDecimals(conn, poolKeys.baseMint),
+      resolveMintDecimals(conn, poolKeys.quoteMint),
+    ]);
+
+    const baseToken  = makeSdkToken(poolKeys.baseMint,  baseDecimals,  "BASE");
+    const quoteToken = makeSdkToken(poolKeys.quoteMint, quoteDecimals, "QUOTE");
+
+    const tokenIn  = params.baseIn ? baseToken : quoteToken;
+    const tokenOut = params.baseIn ? quoteToken : baseToken;
+
+    const { minOut, usedSlipBps } = await computeMinOutBn({
       conn,
       pool: poolKeys,
       baseIn: params.baseIn,
@@ -318,38 +406,78 @@ export async function buildRaydiumSwapFixedInIx(params: {
       slippageBps: params.slippageBps,
     });
 
-    // Raydium simple builder — pass both threshold field names (SDK variant-safe).
-    const { innerTransactions } = await (Liquidity as any).makeSwapInstructionSimple({
+    // TokenAmount (raw atom units)
+    const amountInTA = new TokenAmount(tokenIn, amountIn.toString(), true);
+    const minOutTA   = new TokenAmount(tokenOut, minOut.toString(), true);
+    const slipPercent = percentFromBpsFloat(usedSlipBps);
+
+    const baseArgs = {
       connection: conn,
       poolKeys,
-      userKeys: {
-        tokenAccounts: tokenAccounts as any,
-        owner: params.user,
-        payer: params.user,
-      },
-      amountIn,
+      userKeys: { tokenAccounts: tokenAccounts as any, owner: params.user, payer: params.user },
       fixedSide: "in",
-      otherAmountThreshold: minOut, // v5+ name
-      amountOutMin: minOut,         // older name; harmless on newer when cast as any
-    } as any);
-
-    const ixs: TransactionInstruction[] = [];
-    for (const itx of innerTransactions ?? []) {
-      for (const ix of itx.instructions ?? []) ixs.push(ix);
-    }
-    if (!ixs.length) {
-      return {
-        ok: false,
-        reason:
-          "raydium_swap_build_error: makeSwapInstructionSimple returned no instructions",
-      };
-    }
-
-    return { ok: true, ixs };
-  } catch (e: any) {
-    return {
-      ok: false,
-      reason: `raydium_swap_ix_build_failed: ${String(e?.message ?? e)}`,
+      amountIn: amountInTA,
+      tokenIn,
+      tokenOut,
+      _minOutTA: minOutTA,
+      _slipPercent: slipPercent,
     };
+
+    const built = await tryBuildSwapIxCompat(baseArgs);
+    if (!built.ok) return built;
+
+    return { ok: true, ixs: built.ixs };
+  } catch (e: any) {
+    const msg = e?.stack || e?.message || String(e);
+    return { ok: false, reason: `raydium_swap_ix_build_failed: ${msg}` };
   }
 }
+
+// ───────────────────────────────────────────────────────────────────────────────
+// ★ On-chain fee sanity (best-effort). Returns resolved fee_bps.
+// ───────────────────────────────────────────────────────────────────────────────
+// util/raydium.ts
+export async function tryAssertRaydiumFeeBps(
+  connection: Connection,
+  poolId: string,
+  configuredFeeBps: number
+): Promise<number> {
+  const wantAssert = process.env.RAYDIUM_ASSERT_FEE === "1";
+  if (!wantAssert) return configuredFeeBps;
+
+  try {
+    // use the same disk json as the swap builder
+    const disk = readPoolJson();
+    if (disk.id !== poolId) {
+      console.warn("[raydium_fee_check] poolId mismatch env/json", { env: poolId, json: disk.id });
+    }
+    const poolKeys = toPoolKeys(disk); // full keys with programId, vaults, etc.
+
+    const info = await Liquidity.fetchInfo({ connection, poolKeys });
+    const s: any = (info as any)?.state ?? (info as any) ?? {};
+    let onchainBps: number | null = null;
+
+    if (typeof s.tradeFeeRate === "number") onchainBps = Math.round(s.tradeFeeRate * 10_000);
+    else if (typeof s.swapFeeRate === "number") onchainBps = Math.round(s.swapFeeRate * 10_000);
+    else if (typeof s.feeRate === "number") onchainBps = Math.round(s.feeRate);
+    else if (typeof s.swapFeeNumerator === "number" && typeof s.swapFeeDenominator === "number" && s.swapFeeDenominator > 0) {
+      onchainBps = Math.round((s.swapFeeNumerator / s.swapFeeDenominator) * 10_000);
+    }
+
+    if (onchainBps != null && Number.isFinite(onchainBps)) {
+      if (onchainBps !== configuredFeeBps) {
+        console.warn("[raydium_fee_mismatch] overriding", configuredFeeBps, "→", onchainBps);
+        return onchainBps;
+      }
+      console.info("[raydium_fee_ok]", onchainBps);
+      return onchainBps;
+    }
+
+    console.warn("[raydium_fee_unknown] keeping configured fee", configuredFeeBps);
+    return configuredFeeBps;
+  } catch (e) {
+    console.warn("[raydium_fee_check_failed] keeping configured fee", configuredFeeBps, String(e));
+    return configuredFeeBps;
+  }
+}
+
