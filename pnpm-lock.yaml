@@ -219,6 +219,9 @@ importers:
       '@mev/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@mev/phoenix':
+        specifier: workspace:*
+        version: link:../../packages/phoenix
       '@mev/risk':
         specifier: workspace:*
         version: link:../../packages/risk

@@ -24,6 +24,7 @@
         "@mev/core": "workspace:*",
         "@mev/storage": "workspace:*",
         "@mev/risk": "workspace:*",
+        "@mev/phoenix": "workspace:*",
         "@solana/web3.js": "^1.95.3",
         "dotenv": "^16.4.5"
     },

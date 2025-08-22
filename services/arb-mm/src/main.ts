@@ -1,19 +1,28 @@
 // services/arb-mm/src/main.ts
 // Live arbitrage runner (Raydium <-> Phoenix) with:
+// - .env.live auto-load (override .env)
+// - Embedded publisher supervisor (optional) to auto-run low-latency feeds
 // - Robust balance reads (env ATAs -> fallback to scan by mint)
-// - Clear terminal logs for start/end and deltas
+// - Clear terminal logs for START/END and DELTAs
 // - Executes only when joiner says EV>0 (no forced unprofitable sends)
-// - Direction lock via EXEC_ALLOWED_PATH (default BOTH so we don't miss)
-// - Atomic-preferred payload
-// - ML event JSONL + summary
+// - Direction lock via EXEC_ALLOWED_PATH (default BOTH)
+// - Atomic-preferred payload (ATOMIC_MODE=single_tx supported)
+// - 30-minute auto-stop (RUN_FOR_MINUTES) + clean SIGINT/SIGTERM shutdown
 
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
+import * as dotenv from "dotenv";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { logger } from "@mev/storage";
 
 import { loadConfig, RPC, maskUrl, stamp, resolveFeeBps } from "./config.js";
-import { EdgeJoiner, type DecisionHook, type RpcSampleHook, type RpcSimFn } from "./edge/joiner.js";
+import {
+  EdgeJoiner,
+  type DecisionHook,
+  type RpcSampleHook,
+  type RpcSimFn,
+} from "./edge/joiner.js";
 import { setChainTps } from "./feature_sink.js";
 import { initRisk } from "@mev/risk";
 import { initAccounts } from "./accounts.js";
@@ -29,8 +38,32 @@ import {
   emitRpcSample,
 } from "./ml_schema.js";
 
-import { type PhoenixBook } from "./executor/size.js";
+import {
+  pnlQuoteForSizeBase,
+  type PhoenixBook as PxBook,
+  type CpmmReserves,
+} from "./executor/size.js";
 import { tryAssertRaydiumFeeBps } from "./util/raydium.js";
+import { PublisherSupervisor } from "./publishers/supervisor.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ────────────────────────────────────────────────────────────────────────────
+// Load env: .env (via config.ts) + .env.live override here (if present)
+// ────────────────────────────────────────────────────────────────────────────
+(function loadEnvLiveOverride() {
+  const candidates = [
+    path.resolve(__dirname, "..", "..", ".env.live"),      // services/arb-mm/.env.live
+    path.resolve(__dirname, "..", "..", "..", ".env.live") // repo/.env.live
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) {
+      dotenv.config({ path: p, override: true });
+      break;
+    }
+  }
+})();
 
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers / constants
@@ -298,6 +331,7 @@ function writeLiveSummarySync(CFG: ReturnType<typeof loadConfig>, mlEventsFile?:
         allowed_path: String(process.env.EXEC_ALLOWED_PATH ?? "both"),
         atomic_preferred: true,
       },
+      atomic_mode: process.env.ATOMIC_MODE ?? "none",
     };
     fs.writeFileSync(file, JSON.stringify(summary, null, 2));
     wroteSummary = true;
@@ -310,7 +344,7 @@ function writeLiveSummarySync(CFG: ReturnType<typeof loadConfig>, mlEventsFile?:
 // ────────────────────────────────────────────────────────────────────────────
 // Latest market state
 // ────────────────────────────────────────────────────────────────────────────
-let LAST_BOOK: PhoenixBook | null = null;
+let LAST_BOOK: PxBook | null = null;
 let LAST_PHX_MID: number | null = null;
 let LAST_CPMM: { base: number; quote: number } | null = null;
 
@@ -320,8 +354,33 @@ let LAST_CPMM: { base: number; quote: number } | null = null;
 
 async function main() {
   const CFG = loadConfig();
-  logger.log("arb boot", { rpc: maskUrl(RPC) });
-  console.log(`BOOT rpc=${maskUrl(RPC)} live=${process.env.LIVE_TRADING} shadow=${process.env.SHADOW_TRADING}`);
+
+  // Very explicit boot banner
+  console.log(
+    [
+      `BOOT rpc=${maskUrl(RPC)}`,
+      `LIVE_TRADING=${process.env.LIVE_TRADING ?? "(unset)"}`,
+      `SHADOW_TRADING=${process.env.SHADOW_TRADING ?? "(unset)"}`,
+      `EXEC_ALLOWED_PATH=${process.env.EXEC_ALLOWED_PATH ?? "both"}`,
+      `USE_RPC_SIM=${process.env.USE_RPC_SIM ?? "(unset)"}`,
+      `USE_RAYDIUM_SWAP_SIM=${process.env.USE_RAYDIUM_SWAP_SIM ?? "(unset)"}`,
+      `ATOMIC_MODE=${process.env.ATOMIC_MODE ?? "none"}`,
+      `ENABLE_EMBEDDED_PUBLISHERS=${process.env.ENABLE_EMBEDDED_PUBLISHERS ?? "1"}`,
+      `RUN_FOR_MINUTES=${process.env.RUN_FOR_MINUTES ?? 30}`
+    ].join("  ")
+  );
+  logger.log("arb boot", { rpc: maskUrl(RPC), atomic_mode: process.env.ATOMIC_MODE ?? "none" });
+
+  // Embedded publishers (optional; auto when enabled)
+  const sup = new PublisherSupervisor({
+    enable: String(process.env.ENABLE_EMBEDDED_PUBLISHERS ?? "1") === "1",
+    phoenixJsonl: CFG.PHOENIX_JSONL,
+    ammsJsonl: CFG.AMMS_JSONL,
+    freshnessMs: 3500,
+    pollMs: 2000,
+    repoRoot: path.resolve(__dirname, "..", "..", ".."),
+  });
+  sup.start();
 
   const conn = new Connection(RPC, { commitment: "processed" });
   startHealth(conn).catch(() => {});
@@ -350,7 +409,9 @@ async function main() {
     const usdcAtaHint = envUsdcAta ?? (accounts as any)?.atas?.usdc;
 
     console.log(
-      `BAL_PREF owner=${ownerPk.toBase58()} wsolATA=${wsolAtaHint ? wsolAtaHint.toBase58() : "-"} usdcATA=${usdcAtaHint ? usdcAtaHint.toBase58() : "-"}`
+      `START_PREF owner=${ownerPk.toBase58()} ` +
+        `wsolATA=${wsolAtaHint ? wsolAtaHint.toBase58() : "-"} ` +
+        `usdcATA=${usdcAtaHint ? usdcAtaHint.toBase58() : "-"}`
     );
 
     try {
@@ -393,13 +454,13 @@ async function main() {
     decision_dedupe_ms: CFG.DECISION_DEDUPE_MS,
     decision_bucket_ms: CFG.DECISION_BUCKET_MS,
     decision_min_edge_delta_bps: CFG.DECISION_MIN_EDGE_DELTA_BPS,
-    enforce_dedupe: CFG.ENFORCE_DEDUPE,
+    enforceDedupe: CFG.ENFORCE_DEDUPE,
     slippage_mode: CFG.ACTIVE_SLIPPAGE_MODE,
     use_pool_impact_sim: CFG.USE_POOL_IMPACT_SIM,
     use_rpc_sim: CFG.USE_RPC_SIM,
     use_raydium_swap_sim: String(process.env.USE_RAYDIUM_SWAP_SIM ?? "false"),
     cpmm_max_pool_trade_frac: CFG.CPMM_MAX_POOL_TRADE_FRAC,
-    dynamic_slippage_extra_bps: CFG.DYNAMIC_SLIPPAGE_EXTRA_BPS,
+    dynamicSlippageExtraBps: CFG.DYNAMIC_SLIPPAGE_EXTRA_BPS,
     allow_synth_trades: CFG.ALLOW_SYNTH_TRADES,
     edge_follow_poll_ms: Number(process.env.EDGE_FOLLOW_POLL_MS ?? 500),
     shadow_trading: SHADOW,
@@ -420,14 +481,13 @@ async function main() {
     return coalesceRound(6, rpc, sidePx);
   }
 
-  // default BOTH so we don't miss directionally-biased edges
   const ALLOWED = String(process.env.EXEC_ALLOWED_PATH ?? "both");
 
   // ML events log (jsonl)
   const LIVE_DIR = path.join(CFG.DATA_DIR, "live");
   ensureDir(LIVE_DIR);
   const ML_EVENTS_FILE = path.join(LIVE_DIR, `${stamp()}.events.jsonl`);
-  const emitMl = (obj: any) => {
+  const emitMlLocal = (obj: any) => {
     try { fs.appendFileSync(ML_EVENTS_FILE, JSON.stringify(obj) + "\n"); } catch {}
   };
 
@@ -437,44 +497,60 @@ async function main() {
   const onDecision: DecisionHook = (_wouldTrade, _edgeNetBps, _expectedPnl, d) => {
     const edgeNetBps = Number(_edgeNetBps ?? 0);
     const expPnl     = Number(_expectedPnl ?? 0);
-    // if joiner didn't include details, do nothing (type-safe)
-    if (!d) {
-      recordDecision(false, edgeNetBps, expPnl);
-      return;
-    }
+    if (!d) { recordDecision(false, edgeNetBps, expPnl); return; }
 
-    // Direction lock
     if (ALLOWED !== "both" && d.path && d.path !== ALLOWED) {
       logger.log("skip_due_to_path", { have: d.path, allowed: ALLOWED });
       recordDecision(false, edgeNetBps, expPnl);
       return;
     }
 
-    // ML snapshot
+    // Emit both-path EVs for ops/debug (fee-consistent)
+    if (String(process.env.DECISION_LOG_BOTH ?? "0") === "1" && LAST_BOOK && LAST_CPMM) {
+      try {
+        const book: PxBook = LAST_BOOK;
+        const cpmm: CpmmReserves = { base: LAST_CPMM.base, quote: LAST_CPMM.quote, feeBps: 25 }; // on-chain Raydium taker fee
+        const sizeBase = Number(process.env.LIVE_SIZE_BASE ?? 0) || CFG.TRADE_SIZE_BASE;
+
+        const pnlPhxToAmm = pnlQuoteForSizeBase(
+          { kind: "PHX->AMM", book, cpmm, maxPoolFrac: CFG.CPMM_MAX_POOL_TRADE_FRAC, lowerBase: sizeBase },
+          sizeBase
+        );
+        const pnlAmmToPhx = pnlQuoteForSizeBase(
+          { kind: "AMM->PHX", book, cpmm, maxPoolFrac: CFG.CPMM_MAX_POOL_TRADE_FRAC, lowerBase: sizeBase },
+          sizeBase
+        );
+
+        const dbg = {
+          trade_size_base: sizeBase,
+          phx_to_amm: { pnl_quote: Number(roundN(pnlPhxToAmm, 6)) },
+          amm_to_phx: { pnl_quote: Number(roundN(pnlAmmToPhx, 6)) }
+        };
+        logger.log("decision_dbg", dbg);
+        emitMlLocal({ ts: Date.now(), ev: "decision_dbg", ...dbg });
+      } catch {}
+    }
+
     if (LOG_ML) {
       try {
-        emitEdgeSnapshot({ ...d, trade_size_base: LIVE_SIZE_BASE });
+        emitEdgeSnapshot({ ...d, trade_size_base: Number(process.env.LIVE_SIZE_BASE ?? CFG.TRADE_SIZE_BASE) });
         emitDecision(Boolean(_wouldTrade), _wouldTrade ? "edge_above_threshold" : undefined, d, _expectedPnl);
       } catch {}
-      emitMl({ ts: Date.now(), ev: "decision", d });
+      emitMlLocal({ ts: Date.now(), ev: "decision", d });
     }
 
     const threshold  = Number(CFG.TRADE_THRESHOLD_BPS ?? 0);
-
-    // final gate: only trades that are already profitable in sim
     const doExecute = Boolean(_wouldTrade) && expPnl > 0 && edgeNetBps >= threshold;
 
-    // keep stats
     recordDecision(doExecute, edgeNetBps, expPnl);
     if (!doExecute) return;
 
-    // size: use the configured live size (simple & predictable)
-    const execSize = LIVE_SIZE_BASE;
+    const execSize = Number(process.env.LIVE_SIZE_BASE ?? 0) || CFG.TRADE_SIZE_BASE;
     const notional = coalesceRound(6, execSize * ((d.buy_px + d.sell_px) / 2));
 
     const payload: any = {
-      path: d.path,                                   // "PHX->AMM" or "AMM->PHX"
-      size_base: execSize,                            // e.g. 0.02 SOL
+      path: d.path,
+      size_base: execSize,
       buy_px: d.buy_px,
       sell_px: d.sell_px,
       notional_quote: notional,
@@ -488,44 +564,29 @@ async function main() {
     };
 
     console.log(
-      `EXEC (EV>0) ${payload.path} base=${roundN(payload.size_base,6)} notional≈${roundN(notional,4)} ` +
-      `mid=${roundN(LAST_PHX_MID ?? 0,3)}`
+      `EXEC (EV>0) ${payload.path} base=${roundN(payload.size_base,6)} ` +
+      `notional≈${roundN(notional,4)} mid=${roundN(LAST_PHX_MID ?? 0,3)}`
     );
 
-    if (SHADOW) {
+    const isShadow = String(process.env.SHADOW_TRADING ?? "0") === "1";
+    if (isShadow) {
       const submitted = {
-        path: payload.path,
-        size_base: payload.size_base,
-        buy_px: payload.buy_px,
-        sell_px: payload.sell_px,
-        ix_count: 0,
-        cu_limit: 0,
-        tip_lamports: undefined as number | undefined,
-        live: false,
-        shadow: true,
+        path: payload.path, size_base: payload.size_base, buy_px: payload.buy_px, sell_px: payload.sell_px,
+        ix_count: 0, cu_limit: 0, tip_lamports: undefined as number | undefined,
+        live: false, shadow: true,
       };
       logger.log("submitted_tx", submitted);
       if (LOG_ML) { try { emitSubmittedTx(submitted); } catch {} }
-      emitMl({ ts: Date.now(), ev: "submitted", submitted });
+      emitMlLocal({ ts: Date.now(), ev: "submitted", submitted });
 
       const fp = fillPxForPath(payload.path as "PHX->AMM" | "AMM->PHX", {
-        rpc_eff_px: d.rpc_eff_px,
-        buy_px: d.buy_px,
-        sell_px: d.sell_px,
+        rpc_eff_px: d.rpc_eff_px, buy_px: d.buy_px, sell_px: d.sell_px,
       });
-
-      const landed = {
-        sig: mkShadowSig(),
-        slot: null as number | null,
-        conf_ms: 0,
-        shadow: true,
-        fill_px: fp,
-        filled_base: payload.size_base,
-        filled_quote: coalesceRound(6, payload.size_base * fp),
-      };
+      const landed = { sig: mkShadowSig(), slot: null as number | null, conf_ms: 0, shadow: true,
+        fill_px: fp, filled_base: payload.size_base, filled_quote: coalesceRound(6, payload.size_base * fp) };
       logger.log("landed", landed);
       if (LOG_ML) { try { emitLanded(landed); } catch {} }
-      emitMl({ ts: Date.now(), ev: "landed", landed });
+      emitMlLocal({ ts: Date.now(), ev: "landed", landed });
       return;
     }
 
@@ -547,26 +608,26 @@ async function main() {
 
   const joiner = new EdgeJoiner(
     {
-      minAbsBps: CFG.EDGE_MIN_ABS_BPS,
-      waitLogMs: CFG.EDGE_WAIT_LOG_MS,
-      thresholdBps: CFG.TRADE_THRESHOLD_BPS,
-      flatSlippageBps: CFG.MAX_SLIPPAGE_BPS,
-      tradeSizeBase: CFG.TRADE_SIZE_BASE,
+      minAbsBps: Number(process.env.EDGE_MIN_ABS_BPS ?? 0),
+      waitLogMs: Number(process.env.EDGE_WAIT_LOG_MS ?? 5000),
+      thresholdBps: Number(process.env.TRADE_THRESHOLD_BPS ?? 0.05),
+      flatSlippageBps: Number(process.env.MAX_SLIPPAGE_BPS ?? 2.0),
+      tradeSizeBase: Number(process.env.TRADE_SIZE_BASE ?? 0.02),
       phoenixFeeBps: PHX_FEE_BPS,
       ammFeeBps: AMM_FEE_BPS,
-      fixedTxCostQuote: CFG.FIXED_TX_COST_QUOTE,
+      fixedTxCostQuote: Number(process.env.FIXED_TX_COST_QUOTE ?? 0),
     },
     {
-      bookTtlMs: CFG.BOOK_TTL_MS,
-      activeSlippageMode: CFG.ACTIVE_SLIPPAGE_MODE,
-      phoenixSlippageBps: CFG.PHOENIX_SLIPPAGE_BPS,
-      cpmmMaxPoolTradeFrac: CFG.CPMM_MAX_POOL_TRADE_FRAC,
-      dynamicSlippageExtraBps: CFG.DYNAMIC_SLIPPAGE_EXTRA_BPS,
-      logSimFields: CFG.LOG_SIM_FIELDS,
-      enforceDedupe: CFG.ENFORCE_DEDUPE,
-      decisionBucketMs: CFG.DECISION_BUCKET_MS,
-      decisionMinEdgeDeltaBps: CFG.DECISION_MIN_EDGE_DELTA_BPS,
-      useRpcSim: CFG.USE_RPC_SIM,
+      bookTtlMs: Number(process.env.BOOK_TTL_MS ?? 500),
+      activeSlippageMode: "adaptive",
+      phoenixSlippageBps: Number(process.env.PHOENIX_SLIPPAGE_BPS ?? 3),
+      cpmmMaxPoolTradeFrac: Number(process.env.CPMM_MAX_POOL_TRADE_FRAC ?? 0.05),
+      dynamicSlippageExtraBps: Number(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? 0.25),
+      logSimFields: String(process.env.LOG_SIM_FIELDS ?? "1") === "1",
+      enforceDedupe: true,
+      decisionBucketMs: Number(process.env.DECISION_BUCKET_MS ?? 200),
+      decisionMinEdgeDeltaBps: Number(process.env.DECISION_MIN_EDGE_DELTA_BPS ?? 0.05),
+      useRpcSim: false,
     },
     onDecision,
     rpcSimFn,
@@ -602,18 +663,34 @@ async function main() {
     (obj) => {
       const ev = (obj?.event ?? obj?.name ?? obj?.type ?? "") as string;
       if (ev === "phoenix_mid") {
-        LAST_PHX_MID = Number(obj?.px ?? obj?.phoenix_mid ?? obj?.mid ?? obj?.price ?? NaN);
+        LAST_PHX_MID = Number(
+          obj?.px ?? obj?.phoenix_mid ?? obj?.mid ?? obj?.price ?? NaN
+        );
         joiner.upsertPhoenix(obj);
       } else if (ev === "phoenix_l2" || ev === "phoenix_l2_empty") {
         joiner.upsertPhoenix(obj);
         try {
-          const bids = (obj?.levels_bids ?? []).map((l: any) => ({ px: Number(l.px), qtyBase: Number(l.qty ?? l.qtyBase ?? 0) }));
-          const asks = (obj?.levels_asks ?? []).map((l: any) => ({ px: Number(l.px), qtyBase: Number(l.qty ?? l.qtyBase ?? 0) }));
-          LAST_BOOK = { bids, asks, takerFeeBps: Number(process.env.PHOENIX_TAKER_FEE_BPS ?? 0) };
+          const bids = (obj?.levels_bids ?? []).map((l: any) => ({
+            px: Number(l.px),
+            qtyBase: Number(l.qty ?? l.qtyBase ?? 0),
+          }));
+          const asks = (obj?.levels_asks ?? []).map((l: any) => ({
+            px: Number(l.px),
+            qtyBase: Number(l.qty ?? l.qtyBase ?? 0),
+          }));
+          LAST_BOOK = {
+            bids,
+            asks,
+            takerFeeBps: Number(process.env.PHOENIX_TAKER_FEE_BPS ?? 0),
+          };
 
-          if (Number.isFinite(obj?.phoenix_mid)) LAST_PHX_MID = Number(obj.phoenix_mid);
-          else if (Number.isFinite(obj?.px))     LAST_PHX_MID = Number(obj.px);
-          else if (Number.isFinite(obj?.best_bid) && Number.isFinite(obj?.best_ask)) {
+          if (Number.isFinite(obj?.phoenix_mid))
+            LAST_PHX_MID = Number(obj.phoenix_mid);
+          else if (Number.isFinite(obj?.px)) LAST_PHX_MID = Number(obj.px);
+          else if (
+            Number.isFinite(obj?.best_bid) &&
+            Number.isFinite(obj?.best_ask)
+          ) {
             LAST_PHX_MID = (Number(obj.best_bid) + Number(obj.best_ask)) / 2;
           }
         } catch {}
@@ -624,7 +701,14 @@ async function main() {
             rpcSamples++;
             rpcMsP50 = ewma(rpcMsP50, ms, 0.1);
             rpcMsP95 = Math.max(rpcMsP95, ms);
-            if (LOG_ML) { try { emitRpcSample(ms, Boolean(obj?.data?.guard_blocked ?? obj?.guard_blocked)); } catch {} }
+            if (LOG_ML) {
+              try {
+                emitRpcSample(
+                  ms,
+                  Boolean(obj?.data?.guard_blocked ?? obj?.guard_blocked)
+                );
+              } catch {}
+            }
           }
           const blocked = obj?.data?.guard_blocked ?? obj?.guard_blocked;
           if (blocked === true) rpcBlocked++;
@@ -636,23 +720,42 @@ async function main() {
 
   await Promise.all([ammsFollower.start(), phxFollower.start()]);
 
+  // 30-minute auto-stop
+  const maxMin = Number(process.env.RUN_FOR_MINUTES ?? 30);
+  const autoTimer = setTimeout(() => {
+    console.log(`AUTO-STOP: run window ${maxMin} minutes reached`);
+    shutdown("AUTO_STOP");
+  }, maxMin * 60_000);
+
   // Graceful shutdown
-  const shutdown = (signal: string) => {
+  function shutdown(signal: string) {
     (async () => {
       try { ammsFollower.stop(); } catch {}
       try { phxFollower.stop(); } catch {}
+      try { sup.stop(); } catch {}
+      try { clearTimeout(autoTimer); } catch {}
+
       try {
         if (accounts) {
-          const ownerPk = tryPubkey(process.env.WALLET_PUBKEY) ?? ((accounts as any).owner as PublicKey);
-          const wsolAtaHint = tryPubkey(process.env.WSOL_ATA) ?? (accounts as any)?.atas?.wsol;
-          const usdcAtaHint = tryPubkey(process.env.USDC_ATA) ?? (accounts as any)?.atas?.usdc;
+          const ownerPk =
+            tryPubkey(process.env.WALLET_PUBKEY) ??
+            ((accounts as any).owner as PublicKey);
+          const wsolAtaHint =
+            tryPubkey(process.env.WSOL_ATA) ?? (accounts as any)?.atas?.wsol;
+          const usdcAtaHint =
+            tryPubkey(process.env.USDC_ATA) ?? (accounts as any)?.atas?.usdc;
 
-          END_BAL = await readBalances(conn, ownerPk, { wsol: wsolAtaHint, usdc: usdcAtaHint });
+          END_BAL = await readBalances(conn, ownerPk, {
+            wsol: wsolAtaHint,
+            usdc: usdcAtaHint,
+          });
           logger.log("balances_end", END_BAL);
-          console.log(`END    SOL=${END_BAL.sol}  WSOL=${END_BAL.wsol}  USDC=${END_BAL.usdc}`);
-          const dsol  = roundN((END_BAL.sol  - (START_BAL?.sol  ?? 0)), 9);
-          const dwsol = roundN((END_BAL.wsol - (START_BAL?.wsol ?? 0)), 9);
-          const dusdc = roundN((END_BAL.usdc - (START_BAL?.usdc ?? 0)), 6);
+          console.log(
+            `END    SOL=${END_BAL.sol}  WSOL=${END_BAL.wsol}  USDC=${END_BAL.usdc}`
+          );
+          const dsol = roundN(END_BAL.sol - (START_BAL?.sol ?? 0), 9);
+          const dwsol = roundN(END_BAL.wsol - (START_BAL?.wsol ?? 0), 9);
+          const dusdc = roundN(END_BAL.usdc - (START_BAL?.usdc ?? 0), 6);
           console.log(`DELTA  dSOL=${dsol}  dWSOL=${dwsol}  dUSDC=${dusdc}`);
         }
       } catch (e) {
@@ -665,7 +768,7 @@ async function main() {
       if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
       process.exit(0);
     });
-  };
+  }
 
   process.on("SIGINT",  () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));

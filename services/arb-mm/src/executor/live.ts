@@ -1,5 +1,5 @@
 // services/arb-mm/src/executor/live.ts
-// Live executor with preflight guards, optional RPC-sim gating, and proper Raydium v4 swap build.
+// Live executor with guards, optional sim gate, and ATOMIC two-leg PHX+Raydium wiring (single v0 tx).
 // NOTE: amountInAtoms is atoms of the *input* mint: SOL(9) if baseIn, USDC(6) if !baseIn.
 
 import {
@@ -23,6 +23,7 @@ import { emitMl } from "../feature_sink.js";
 import { loadConfig, type AppConfig } from "../config.js";
 import { computeTipLamports as computeDynTip } from "./dynamic_tip.js";
 import { simulateRaydiumSwapFixedIn } from "./sim.js";
+import { buildPhoenixSwapIxs } from "../util/phoenix.js";
 
 export type ExecPath = "PHX->AMM" | "AMM->PHX";
 
@@ -60,7 +61,7 @@ export class LiveExecutor {
 
   async startPhoenix(): Promise<void> {
     this.phxReady = true;
-    logger.log("phoenix_exec_ready", { single_leg: true });
+    logger.log("phoenix_exec_ready", { single_leg: false, atomic_ready: true });
   }
 
   private resolvePayerPk(): PublicKey {
@@ -104,10 +105,12 @@ export class LiveExecutor {
   }
 
   async maybeExecute(exec: ExecPayload) {
+    const ATOMIC_MODE = String(process.env.ATOMIC_MODE ?? "none").toLowerCase();
+
     if (killSwitchActive())
       return void logger.log("guard_violation", { type: "kill_switch_active" });
 
-    // Guard checks (rate limits, consecutive fails, etc.)
+    // Guard checks
     const g = guardCheck({
       pathId: exec.path,
       notionalQuote: exec.notional_quote,
@@ -144,24 +147,24 @@ export class LiveExecutor {
       return;
     }
 
-    // Amount-in atoms = input mint units
-    const baseIn = exec.path === "PHX->AMM";
+    // Amount-in atoms for Raydium leg (input mint units)
+    const baseInForAmm = exec.path === "PHX->AMM"; // sell base to AMM; buy on PHX first
     const px = exec.sell_px ?? exec.buy_px ?? exec.phoenix.limit_px ?? 0;
-    const amountInAtoms = baseIn
-      ? BigInt(Math.round(exec.size_base * 1e9)) // SOL atoms
-      : BigInt(Math.round(exec.size_base * px * 1e6)); // USDC atoms
+    const amountInAtomsForAmm = baseInForAmm
+      ? BigInt(Math.round(exec.size_base * 1e9)) // BASE atoms
+      : BigInt(Math.round(exec.size_base * px * 1e6)); // QUOTE atoms
 
-    // ── RPC sim gate (SOFT) ──
+    // ── RPC sim gate (SOFT) — Raydium leg only ──
     if (this.useRpcSim && USE_RAYDIUM_SWAP_SIM) {
       try {
         const sim = await simulateRaydiumSwapFixedIn(this.conn, {
           user: payerPk,
-          baseIn,
-          amountInBase: amountInAtoms,
+          baseIn: baseInForAmm,
+          amountInBase: amountInAtomsForAmm,
           slippageBps: 50,
         });
         const mode = (sim as any)?.mode ?? "unknown";
-        const ok = String(mode).endsWith("success"); // accept any *-success
+        const ok = String(mode).endsWith("success");
         logger.log("rpc_sim", {
           ok,
           mode,
@@ -184,13 +187,15 @@ export class LiveExecutor {
       }
     }
 
+    // Build legs
     let tx: VersionedTransaction | undefined;
 
     try {
+      // Always build Raydium leg
       const ray = await buildRaydiumCpmmSwapIx({
         user: payerPk,
-        baseIn,
-        amountInBase: amountInAtoms, // atoms of *input* mint
+        baseIn: baseInForAmm,
+        amountInBase: amountInAtomsForAmm,
         slippageBps: 50,
       });
       if (!ray.ok) {
@@ -200,15 +205,51 @@ export class LiveExecutor {
         return;
       }
 
+      // Optionally build Phoenix leg for atomic mode
+      const phxIxs: any[] = [];
+      if (ATOMIC_MODE === "single_tx") {
+        const side = exec.phoenix.side === "buy" ? "bid" : "ask";
+        // inAmount: quote if bid (USDC), base if ask (SOL)
+        const phxSlipBps = Number(this.cfg.PHOENIX_SLIPPAGE_BPS ?? 0);
+        const inAmount =
+          side === "bid"
+            ? exec.size_base * exec.phoenix.limit_px * (1 + phxSlipBps / 10_000)
+            : exec.size_base;
+
+        const phx = await buildPhoenixSwapIxs({
+          connection: this.conn,
+          market: exec.phoenix.market,
+          trader: payerPk,
+          side: side as "bid" | "ask",
+          inAmount,
+        });
+        if (!phx.ok) {
+          noteError();
+          logger.log("submit_error", { where: "phoenix_build", error: phx.reason });
+          emitMl("error", { where: "phoenix_build", error: phx.reason });
+          return;
+        }
+        phxIxs.push(...phx.ixs);
+      }
+
       const { blockhash } = await this.conn.getLatestBlockhash("processed");
-      const { ixs: budgetIxs, lamports: tipLamports } =
-        this.computeBudgetIxs(this.cuLimit);
-      const ixs = [...budgetIxs, ...ray.ixs];
+      const { ixs: budgetIxs, lamports: tipLamports } = this.computeBudgetIxs(this.cuLimit);
+
+      // Instruction order for atomic execution:
+      //  PHX->AMM : [CU] + PHX (buy base)  → Raydium (sell base for quote)
+      //  AMM->PHX : [CU] + Raydium (buy base) → PHX (sell base for quote)
+      const ixs =
+        ATOMIC_MODE === "single_tx"
+          ? (exec.path === "PHX->AMM"
+              ? [...budgetIxs, ...phxIxs, ...ray.ixs]
+              : [...budgetIxs, ...ray.ixs, ...phxIxs])
+          : [...budgetIxs, ...ray.ixs];
 
       const skipPreflight = this.useRpcSim && USE_RAYDIUM_SWAP_SIM;
 
       logger.log("submitted_tx", {
         path: exec.path,
+        atomic_mode: ATOMIC_MODE,
         size_base: exec.size_base,
         buy_px: exec.buy_px,
         sell_px: exec.sell_px,
@@ -221,6 +262,7 @@ export class LiveExecutor {
       });
       emitMl("submit", {
         path: exec.path,
+        atomic_mode: ATOMIC_MODE,
         size_base: exec.size_base,
         buy_px: exec.buy_px,
         sell_px: exec.sell_px,
@@ -251,9 +293,7 @@ export class LiveExecutor {
               signature: sig || undefined,
             });
           } else {
-            logger.log("jito_bundle_fallback_rpc", {
-              error: res?.error || "unknown",
-            });
+            logger.log("jito_bundle_fallback_rpc", { error: res?.error || "unknown" });
           }
         } catch (e) {
           logger.log("jito_unavailable", { error: String(e) });
@@ -277,10 +317,7 @@ export class LiveExecutor {
       if (conf?.value?.err) {
         noteConsecutiveResult(exec.path, false);
         noteError();
-        logger.log("land_error", {
-          sig,
-          err: JSON.stringify(conf.value.err),
-        });
+        logger.log("land_error", { sig, err: JSON.stringify(conf.value.err) });
         emitMl("error", { where: "land", sig, err: conf.value.err });
       } else {
         let unitsConsumed: number | undefined;
@@ -301,9 +338,7 @@ export class LiveExecutor {
           conf_ms: confMs,
           fill_px: exec.phoenix.limit_px,
           filled_base: exec.size_base,
-          filled_quote: Number(
-            (exec.size_base * (exec.sell_px ?? exec.buy_px ?? 0)).toFixed(6)
-          ),
+          filled_quote: Number((exec.size_base * (exec.sell_px ?? exec.buy_px ?? 0)).toFixed(6)),
           compute_units: unitsConsumed,
           fee_lamports: feeLamports,
           tip_lamports: tipLamports || 0,
@@ -311,6 +346,7 @@ export class LiveExecutor {
         emitMl("fill", {
           sig,
           path: exec.path,
+          atomic_mode: ATOMIC_MODE,
           conf_ms: confMs,
           compute_units: unitsConsumed,
           fee_lamports: feeLamports,

@@ -4,14 +4,9 @@
 // Adds top-N depth arrays (levels_bids/levels_asks) for depth-walking on the consumer side.
 //
 // Emits:
-//   - phoenix_l2 {
-//       ts, market, symbol,
-//       best_bid, best_bid_str, best_ask, best_ask_str, phoenix_mid,
-//       tick_ms, source,
-//       levels_bids?: [{px, qty}...], levels_asks?: [{px, qty}...]
-//     }
-//   - phoenix_mid {ts, market, symbol, px, px_str, best_bid?, best_ask?, tick_ms, source}
-//   - phoenix_l2_empty {ts, market, symbol, haveBid, haveAsk, tick_ms, source}
+//   - phoenix_l2 { ts, market, symbol, best_bid/best_ask, phoenix_mid, tick_ms, source, levels_*? }
+//   - phoenix_mid { ts, market, symbol, px, px_str, best_bid?, best_ask?, tick_ms, source }
+//   - phoenix_l2_empty { ts, market, symbol, haveBid, haveAsk, tick_ms, source }
 
 import fs from "fs";
 import path from "path";
@@ -74,8 +69,8 @@ function maskUrl(u: string): string {
 const RPC = resolveRpc();
 
 const TICK_MS = parseMsEnv(process.env.PHOENIX_TICK_MS, 2000, 200, 60000);
-const L2_FETCH_DEPTH = parseIntEnv(process.env.PHOENIX_L2_DEPTH, 12, 1, 50); // how much we ask SDK for
-const PUBLISH_DEPTH = parseIntEnv(process.env.PHOENIX_DEPTH_LEVELS, L2_FETCH_DEPTH, 1, 50); // how much we emit
+const L2_FETCH_DEPTH = parseIntEnv(process.env.PHOENIX_L2_DEPTH, 12, 1, 50);
+const PUBLISH_DEPTH = parseIntEnv(process.env.PHOENIX_DEPTH_LEVELS, L2_FETCH_DEPTH, 1, 50);
 const TRY_WS = parseBoolEnv(process.env.PHOENIX_WS_ENABLED, true);
 
 // ── Config models ───────────────────────────────────────────────────────────
@@ -373,10 +368,10 @@ async function runMarket(client: any, symbol: string, marketStr: string, pythId?
     const ob: any = (ms as any)?.orderBook ?? (ms as any)?.book ?? undefined;
     const hasBids =
       !!((Array.isArray(ob?.bids) && ob.bids.length > 0) ||
-         (Array.isArray(ob?.book?.bids) && ob.book.bids.length > 0));
+        (Array.isArray(ob?.book?.bids) && ob.book.bids.length > 0));
     const hasAsks =
       !!((Array.isArray(ob?.asks) && ob.asks.length > 0) ||
-         (Array.isArray(ob?.book?.asks) && ob.book.asks.length > 0));
+        (Array.isArray(ob?.book?.asks) && ob.book.asks.length > 0));
     logger.log("phoenix_loaded", { id: marketStr, name: symbol, hasBids, hasAsks });
   } catch (err) {
     logger.log("phoenix_error", { stage: "refresh_market", market: symbol, err: String(err) });
@@ -491,3 +486,11 @@ async function main() {
 }
 
 main().catch((e) => logger.log("phoenix_fatal", { err: String(e) }));
+
+// ────────────────────────────────────────────────────────────────────────────
+// Export atomic taker builder for arb-mm (lives in ./atomic.ts)
+export {
+  buildPhoenixSwapIxs,
+  type PhoenixSwapIxParams,
+  type PhoenixIxBuildResult,
+} from "./atomic.js";

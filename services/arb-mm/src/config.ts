@@ -1,10 +1,10 @@
 // services/arb-mm/src/config.ts
 // Centralized env + defaults + params merge + path helpers.
+// Enhanced to prefer .env.live (then fall back to .env). Supports ENV_FILE override.
 
 import fs from "fs";
 import path from "path";
 import * as dotenv from "dotenv";
-import { clusterApiUrl } from "@solana/web3.js";
 import { fileURLToPath } from "url";
 
 export type SlipMode = "flat" | "amm_cpmm" | "adaptive";
@@ -14,23 +14,41 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SVC_ROOT = path.resolve(__dirname, "..");
 
+// Load .env.live with highest precedence, then .env
 function loadRootEnv() {
+  const ENV_FILE = process.env.ENV_FILE?.trim();
   const candidates = [
+    // explicit file (absolute or relative)
+    ...(ENV_FILE ? [path.isAbsolute(ENV_FILE) ? ENV_FILE : path.resolve(SVC_ROOT, ENV_FILE)] : []),
+
+    // service-local .env.live / .env
+    path.resolve(SVC_ROOT, ".env.live"),
+    path.resolve(SVC_ROOT, ".env"),
+
+    // repo root .env.live / .env
+    path.resolve(SVC_ROOT, "..", "..", ".env.live"),
+    path.resolve(SVC_ROOT, "..", "..", ".env"),
+
+    // process cwd (rare, but keep)
+    path.resolve(process.cwd(), ".env.live"),
     path.resolve(process.cwd(), ".env"),
-    path.resolve(SVC_ROOT, "..", "..", ".env"), // repo root
-    path.resolve(SVC_ROOT, ".env"),             // service-local .env (if any)
   ];
+
   for (const p of candidates) {
-    if (fs.existsSync(p)) {
-      dotenv.config({ path: p });
-      return;
-    }
+    try {
+      if (fs.existsSync(p)) {
+        dotenv.config({ path: p });
+        return;
+      }
+    } catch {}
   }
+
+  // fallback to default resolution if nothing found
   dotenv.config();
 }
 loadRootEnv();
 
-export function parseMsEnv(v: string | undefined, def = 5000, min = 200, max = 60000) {
+export function parseMsEnv(v: string | undefined, def = 5000, min = 50, max = 60000) {
   const n = Number(v);
   if (!Number.isFinite(n)) return def;
   return Math.max(min, Math.min(max, Math.floor(n)));
@@ -39,7 +57,6 @@ export function parseFloatEnv(v: string | undefined, def = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 }
-// supports optional min/max clamping
 export function parseIntEnv(v: string | undefined, def = 0, min?: number, max?: number) {
   const n = Number(v);
   const base = Number.isInteger(n) ? n : Math.trunc(Number.isFinite(n) ? n : def);
@@ -60,7 +77,7 @@ export function envBool(k: string, def: boolean): boolean {
   return def;
 }
 
-// ── Paths (don’t use cwd; anchor to service root, then repo root) ───────────
+// ── Paths (anchor to service root, then repo root) ───────────
 export function resolvePathCandidates(rel: string) {
   return [
     path.resolve(SVC_ROOT, rel),
@@ -74,15 +91,16 @@ export function firstExistingPathOrDefault(relOrAbs: string): string {
   return path.resolve(SVC_ROOT, relOrAbs);
 }
 
-// ── RPC resolver (honor your RPC_URL first) ─────────────────────────────────
+// ── RPC resolver ───────────
 function resolveRpc(): string {
   const explicit = process.env.RPC_URL?.trim();
-  if (explicit) return explicit;                       // ← your .env.live setting
+  if (explicit) return explicit;
   const primary = process.env.RPC_PRIMARY?.trim();
   if (primary) return primary;
   const heliusKey = process.env.HELIUS_API_KEY?.trim();
   if (heliusKey) return `https://rpc.helius.xyz/?api-key=${heliusKey}`;
-  return clusterApiUrl("mainnet-beta");
+  // absolute fallback
+  return "https://api.mainnet-beta.solana.com";
 }
 export function maskUrl(u: string): string {
   try {
@@ -95,18 +113,11 @@ export function maskUrl(u: string): string {
 }
 export const RPC = resolveRpc();
 
-// ── Fee resolver (env globals, per-id overrides, optional JSON map) ─────────
+// ── Fee resolver ───────────
 function asNum(v: any, dflt: number) {
   const n = Number(v);
   return Number.isFinite(n) ? n : dflt;
 }
-
-// Optional JSON map: FEES_JSON=/path/to/fees.json
-// {
-//   "global": { "AMM": 25, "PHOENIX": 0 },
-//   "AMM": { "<poolId>": 25 },
-//   "PHOENIX": { "<marketId>": 0 }
-// }
 function loadFeesJson() {
   const p = process.env.FEES_JSON?.trim();
   if (!p) return null;
@@ -166,24 +177,20 @@ function loadLatestParamsSync(PARAMS_DIR: string): { file?: string; params: Dail
 }
 
 export interface AppConfig {
-  // edge inputs
   AMMS_JSONL: string;
   PHOENIX_JSONL: string;
   EDGE_MIN_ABS_BPS: number;
   EDGE_WAIT_LOG_MS: number;
   EDGE_FOLLOW_POLL_MS: number;
 
-  // phoenix synth/ttl
   BOOK_TTL_MS: number;
   SYNTH_WIDTH_BPS: number;
 
-  // data/params
   DATA_DIR: string;
   PARAMS_DIR: string;
   AUTO_APPLY_PARAMS: boolean;
   PARAM_FILE?: string;
 
-  // decision
   TRADE_THRESHOLD_BPS: number;
   MAX_SLIPPAGE_BPS: number;
   TRADE_SIZE_BASE: number;
@@ -205,35 +212,33 @@ export interface AppConfig {
   LOG_SIM_FIELDS: boolean;
   ALLOW_SYNTH_TRADES: boolean;
 
-  // sim/submit knobs
   RPC_SIM_CU_LIMIT: number;
   RPC_SIM_CU_PRICE_MICROLAMPORTS: number;
   SUBMIT_CU_LIMIT: number;
   SUBMIT_TIP_LAMPORTS: number;
 
-  // dynamic tip policy
   TIP_MODE: "fixed" | "cu_price";
   TIP_MICROLAMPORTS_PER_CU: number;
   TIP_MULTIPLIER: number;
   TIP_MAX_LAMPORTS: number;
 
-  // wallet + token context
   WALLET_PUBKEY?: string;
   USDC_MINT?: string;
   SOL_MINT?: string;
   USDC_ATA?: string;
   WSOL_ATA?: string;
 
-  // phoenix market id
   PHOENIX_MARKET: string;
 
-  // guards
   MIN_SOL_BALANCE_LAMPORTS: number;
 
-  // depth (exposed for completeness; optional)
   PHOENIX_DEPTH_ENABLED?: boolean;
   PHOENIX_DEPTH_LEVELS?: number;
   PHOENIX_DEPTH_EXTRA_BPS?: number;
+
+  // runtime control
+  ATOMIC_MODE?: "none" | "single_tx";
+  RUN_FOR_MINUTES?: number; // auto-stop window
 }
 
 export function stamp() {
@@ -248,11 +253,9 @@ export function loadConfig(): AppConfig {
   const EDGE_WAIT_LOG_MS = parseMsEnv(process.env.EDGE_WAIT_LOG_MS, 5000, 100, 60000);
   const EDGE_FOLLOW_POLL_MS = parseMsEnv(process.env.EDGE_FOLLOW_POLL_MS, 500, 50, 5000);
 
-  // Honor either PHOENIX_BOOK_TTL_MS or BOOK_TTL_MS (your .env.live uses BOOK_TTL_MS)
   const BOOK_TTL_MS = parseMsEnv(process.env.PHOENIX_BOOK_TTL_MS ?? process.env.BOOK_TTL_MS, 500, 100, 60000);
   const SYNTH_WIDTH_BPS = parseFloatEnv(process.env.PHOENIX_SYNTH_WIDTH_BPS, 8);
 
-  // Make DATA_DIR absolute and stable relative to the service root
   const DATA_ENV = process.env.DATA_DIR?.trim();
   const DATA_DIR = DATA_ENV
     ? (path.isAbsolute(DATA_ENV) ? DATA_ENV : path.resolve(SVC_ROOT, DATA_ENV))
@@ -297,7 +300,7 @@ export function loadConfig(): AppConfig {
   const USE_POOL_IMPACT_SIM = envBool("USE_POOL_IMPACT_SIM", true);
   const ACTIVE_SLIPPAGE_MODE: SlipMode = USE_POOL_IMPACT_SIM ? "adaptive" : SLIPPAGE_MODE;
 
-  const USE_RPC_SIM = envBool("USE_RPC_SIM", true);
+  const USE_RPC_SIM = envBool("USE_RPC_SIM", false); // default OFF for real trades
   const USE_RAYDIUM_SWAP_SIM = envBool("USE_RAYDIUM_SWAP_SIM", false);
 
   const PHOENIX_SLIPPAGE_BPS = parseFloatEnv(process.env.PHOENIX_SLIPPAGE_BPS, Math.min(TRADE_THRESHOLD_BPS, MAX_SLIPPAGE_BPS));
@@ -325,13 +328,17 @@ export function loadConfig(): AppConfig {
   const USDC_ATA = process.env.USDC_ATA?.trim();
   const WSOL_ATA = process.env.WSOL_ATA?.trim();
 
-  // Accept PHOENIX_MARKET or PHOENIX_MARKET_ID (your .env.live uses the latter)
+  // Phoenix market id
   const PHOENIX_MARKET =
     process.env.PHOENIX_MARKET?.trim() ||
     process.env.PHOENIX_MARKET_ID?.trim() ||
     "";
 
   const MIN_SOL_BALANCE_LAMPORTS = parseIntEnv(process.env.MIN_SOL_BALANCE_LAMPORTS, 5_000_000);
+
+  // runtime controls
+  const ATOMIC_MODE = (process.env.ATOMIC_MODE as any) ?? "none";
+  const RUN_FOR_MINUTES = parseIntEnv(process.env.RUN_FOR_MINUTES, 30, 1, 720); // default 30 min
 
   return {
     AMMS_JSONL,
@@ -385,9 +392,11 @@ export function loadConfig(): AppConfig {
     PHOENIX_MARKET,
     MIN_SOL_BALANCE_LAMPORTS,
 
-    // Optional Phoenix “depth” knobs (just exposed for completeness)
     PHOENIX_DEPTH_ENABLED: parseBoolEnv(process.env.PHOENIX_DEPTH_ENABLED, false),
     PHOENIX_DEPTH_LEVELS: parseIntEnv(process.env.PHOENIX_DEPTH_LEVELS, 12, 1, 50),
     PHOENIX_DEPTH_EXTRA_BPS: parseFloatEnv(process.env.PHOENIX_DEPTH_EXTRA_BPS, 0.15),
+
+    ATOMIC_MODE: ATOMIC_MODE as AppConfig["ATOMIC_MODE"],
+    RUN_FOR_MINUTES,
   };
 }

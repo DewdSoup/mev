@@ -436,7 +436,6 @@ export async function buildRaydiumSwapIx(params: {
 // ───────────────────────────────────────────────────────────────────────────────
 // ★ On-chain fee sanity (best-effort). Returns resolved fee_bps.
 // ───────────────────────────────────────────────────────────────────────────────
-// util/raydium.ts
 export async function tryAssertRaydiumFeeBps(
   connection: Connection,
   poolId: string,
@@ -480,4 +479,3 @@ export async function tryAssertRaydiumFeeBps(
     return configuredFeeBps;
   }
 }
-
