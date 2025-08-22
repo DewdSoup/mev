@@ -1,12 +1,15 @@
 // services/arb-mm/src/main.ts
-// Boot: health + JSONL followers + EdgeJoiner (CPMM/adaptive) + optional RPC sim + live summary.
-// Env-only control: SHADOW_TRADING, LIVE_TRADING, USE_RPC_SIM, etc.
+// Live arbitrage runner (Raydium <-> Phoenix) with:
+// - Robust balance reads (env ATAs -> fallback to scan by mint)
+// - Clear terminal logs for start/end and deltas
+// - Executes only when joiner says EV>0 (no forced unprofitable sends)
+// - Direction lock via EXEC_ALLOWED_PATH (default BOTH so we don't miss)
+// - Atomic-preferred payload
+// - ML event JSONL + summary
 
 import fs from "fs";
 import path from "path";
 import { Connection, PublicKey } from "@solana/web3.js";
-
-// ORIGINAL logger (restored) — keeps your runtime.jsonl + tags
 import { logger } from "@mev/storage";
 
 import { loadConfig, RPC, maskUrl, stamp, resolveFeeBps } from "./config.js";
@@ -17,9 +20,7 @@ import { initAccounts } from "./accounts.js";
 import { LiveExecutor } from "./executor/live.js";
 import { initSessionRecorder } from "./session_recorder.js";
 import { asNumber, roundN, coalesceRound } from "./util/num.js";
-import { simulateRaydiumSwapFixedIn } from "./executor/sim.js";
 
-// 🔹 ML emitters (clean schema; optional via LOG_SIM_FIELDS)
 import {
   emitEdgeSnapshot,
   emitDecision,
@@ -28,13 +29,36 @@ import {
   emitRpcSample,
 } from "./ml_schema.js";
 
-// ★ Dynamic size optimizer
-import { optimizeSize, type PhoenixBook } from "./executor/size.js";
-// ★ Optional on-chain fee sanity
+import { type PhoenixBook } from "./executor/size.js";
 import { tryAssertRaydiumFeeBps } from "./util/raydium.js";
 
 // ────────────────────────────────────────────────────────────────────────────
-// JSONL follower (tail with watch+poll)
+// Helpers / constants
+// ────────────────────────────────────────────────────────────────────────────
+
+const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
+const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+
+function envNum(name: string, def?: number): number | undefined {
+  const v = process.env[name];
+  if (v == null || v === "") return def;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+
+function tryPubkey(s?: string | null): PublicKey | undefined {
+  if (!s) return undefined;
+  try { return new PublicKey(s.trim()); } catch { return undefined; }
+}
+
+function ensureDir(p: string) {
+  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+}
+
+function nowIso() { return new Date().toISOString(); }
+
+// ────────────────────────────────────────────────────────────────────────────
+// JSONL follower (tail)
 // ────────────────────────────────────────────────────────────────────────────
 
 type LineHandler = (obj: any) => void;
@@ -59,13 +83,9 @@ class JsonlFollower {
   }
 
   stop() {
-    try {
-      this.watcher?.close();
-    } catch {}
+    try { this.watcher?.close(); } catch {}
     if (this.poller) clearInterval(this.poller);
-    try {
-      if (this.fd !== null) fs.closeSync(this.fd);
-    } catch {}
+    try { if (this.fd !== null) fs.closeSync(this.fd); } catch {}
     this.watcher = null;
     this.poller = null;
     this.fd = null;
@@ -95,9 +115,7 @@ class JsonlFollower {
     try {
       this.watcher = fs.watch(this.file, (event) => {
         if (event === "rename") {
-          try {
-            if (this.fd !== null) fs.closeSync(this.fd);
-          } catch {}
+          try { if (this.fd !== null) fs.closeSync(this.fd); } catch {}
           this.openAtEOF().catch(() => {});
           return;
         }
@@ -113,7 +131,6 @@ class JsonlFollower {
     try {
       const stat = fs.fstatSync(this.fd);
       if (stat.size <= this.offset) return;
-
       const toRead = stat.size - this.offset;
       const buf = Buffer.allocUnsafe(toRead);
       const n = fs.readSync(this.fd, buf, 0, toRead, this.offset);
@@ -125,9 +142,7 @@ class JsonlFollower {
         const line = this.buffer.slice(0, idx).trim();
         this.buffer = this.buffer.slice(idx + 1);
         if (!line) continue;
-        try {
-          this.onLine(JSON.parse(line));
-        } catch {}
+        try { this.onLine(JSON.parse(line)); } catch {}
       }
     } catch (e) {
       logger.log("edge_follow_read_error", { file: this.file, err: String(e) });
@@ -147,9 +162,7 @@ async function startHealth(conn: Connection) {
       const s = samples[0];
       if (!s.numTransactions || !s.samplePeriodSecs) return 0;
       return s.numTransactions / s.samplePeriodSecs;
-    } catch {
-      return 0;
-    }
+    } catch { return 0; }
   }
 
   setInterval(async () => {
@@ -166,6 +179,7 @@ async function startHealth(conn: Connection) {
         version,
         httpHealth: { ok: true, body: "ok" },
       });
+      console.log(`HEALTH slot=${slot} tps=${roundN(tps,2)} version=${version["solana-core"]}`);
     } catch (e) {
       setChainTps(undefined);
       logger.log("arb health", {
@@ -179,7 +193,7 @@ async function startHealth(conn: Connection) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-/** live summary metrics */
+// Live summary + balances
 // ────────────────────────────────────────────────────────────────────────────
 
 const runStartedAt = new Date();
@@ -191,48 +205,59 @@ let worstEdgeNet = +Infinity;
 let cumSimPnLQuote = 0;
 let wroteSummary = false;
 
-// Optional RPC summary counters
 let rpcSamples = 0;
 let rpcMsP50 = 0;
 let rpcMsP95 = 0;
 let rpcBlocked = 0;
 
-// ── New: balance snapshots ─────────────────────────────────────────
 let START_BAL: { sol: number; wsol: number; usdc: number } | null = null;
 let END_BAL:   { sol: number; wsol: number; usdc: number } | null = null;
+
+// Robust mint-scanning with ATA hint
+async function sumMintBalance(
+  conn: Connection,
+  owner: PublicKey,
+  mint: PublicKey,
+  preferredAta?: PublicKey
+): Promise<number> {
+  if (preferredAta) {
+    try {
+      const r = await conn.getTokenAccountBalance(preferredAta, "confirmed");
+      const amt = Number(r?.value?.uiAmount ?? 0);
+      if (Number.isFinite(amt)) return amt;
+    } catch { /* fallthrough */ }
+  }
+  try {
+    const res = await conn.getParsedTokenAccountsByOwner(owner, { mint }, "confirmed");
+    let sum = 0;
+    for (const it of res.value) {
+      const parsed: any = (it.account.data as any)?.parsed;
+      const ui = Number(parsed?.info?.tokenAmount?.uiAmount ?? 0);
+      if (Number.isFinite(ui)) sum += ui;
+    }
+    return sum;
+  } catch {
+    return 0;
+  }
+}
 
 async function readBalances(
   conn: Connection,
   owner: PublicKey,
-  atas?: { wsol?: PublicKey; usdc?: PublicKey }
+  ataHints?: { wsol?: PublicKey; usdc?: PublicKey }
 ) {
   const [solLamports, wsol, usdc] = await Promise.all([
-    conn.getBalance(owner, "processed"),
-    atas?.wsol ? conn.getTokenAccountBalance(atas.wsol, "processed").then(r => Number(r.value?.uiAmount ?? 0)).catch(() => 0) : Promise.resolve(0),
-    atas?.usdc ? conn.getTokenAccountBalance(atas.usdc, "processed").then(r => Number(r.value?.uiAmount ?? 0)).catch(() => 0) : Promise.resolve(0),
+    conn.getBalance(owner, "confirmed").catch(() => 0),
+    sumMintBalance(conn, owner, WSOL_MINT, ataHints?.wsol),
+    sumMintBalance(conn, owner, USDC_MINT, ataHints?.usdc),
   ]);
   return { sol: solLamports / 1e9, wsol, usdc };
 }
 
-// Small helper: parse env ATA -> PublicKey
-function envAta(maybe: string | undefined): PublicKey | undefined {
-  try { return maybe ? new PublicKey(maybe) : undefined; } catch { return undefined; }
-}
-
-// ───────────────────────────────────────────────────────────────────
-
-function ensureDir(p: string) {
-  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
-}
-
 function recordDecision(wouldTrade: boolean, edgeNetBps: number, expectedPnl: number) {
   consideredCnt++;
-  if (wouldTrade) {
-    wouldTradeCnt++;
-    cumSimPnLQuote += expectedPnl;
-  } else {
-    wouldNotCnt++;
-  }
+  if (wouldTrade) { wouldTradeCnt++; cumSimPnLQuote += expectedPnl; }
+  else { wouldNotCnt++; }
   if (edgeNetBps > bestEdgeNet) bestEdgeNet = edgeNetBps;
   if (edgeNetBps < worstEdgeNet) worstEdgeNet = edgeNetBps;
 }
@@ -242,72 +267,64 @@ function ewma(prev: number, x: number, alpha = 0.1) {
   return Math.round(prev + (x - prev) * alpha);
 }
 
-function writeLiveSummarySync(CFG: ReturnType<typeof loadConfig>) {
+function writeLiveSummarySync(CFG: ReturnType<typeof loadConfig>, mlEventsFile?: string) {
   try {
     const LIVE_DIR = path.join(CFG.DATA_DIR, "live");
     ensureDir(LIVE_DIR);
-
+    const file = path.join(LIVE_DIR, `${stamp()}.summary.json`);
     const summary: any = {
+      file,
       started_at: runStartedAt.toISOString(),
-      stopped_at: new Date().toISOString(),
+      stopped_at: nowIso(),
       considered: consideredCnt,
       would_trade: wouldTradeCnt,
       would_not_trade: wouldNotCnt,
       pnl_sum: roundN(cumSimPnLQuote, 6) ?? 0,
       best_edge_bps: Number.isFinite(bestEdgeNet) ? (roundN(bestEdgeNet, 4) ?? 0) : 0,
       worst_edge_bps: Number.isFinite(worstEdgeNet) ? (roundN(worstEdgeNet, 4) ?? 0) : 0,
-      threshold_bps: CFG.TRADE_THRESHOLD_BPS,
-      slippage_bps: CFG.MAX_SLIPPAGE_BPS,
-      trade_size_base: CFG.TRADE_SIZE_BASE,
-      book_ttl_ms: CFG.BOOK_TTL_MS,
-      decision_dedupe_ms: CFG.DECISION_DEDUPE_MS,
-      decision_bucket_ms: CFG.DECISION_BUCKET_MS,
-      min_edge_delta_bps: CFG.DECISION_MIN_EDGE_DELTA_BPS,
-      allow_synth_trades: CFG.ALLOW_SYNTH_TRADES,
-
-      // New: wallet snapshots
+      threshold_bps: String(process.env.TRADE_THRESHOLD_BPS ?? CFG.TRADE_THRESHOLD_BPS),
+      slippage_bps: String(process.env.MAX_SLIPPAGE_BPS ?? CFG.MAX_SLIPPAGE_BPS),
+      trade_size_base: String(process.env.LIVE_SIZE_BASE ?? CFG.TRADE_SIZE_BASE),
+      book_ttl_ms: String(CFG.BOOK_TTL_MS),
+      decision_dedupe_ms: String(CFG.DECISION_DEDUPE_MS),
+      decision_bucket_ms: String(CFG.DECISION_BUCKET_MS),
+      min_edge_delta_bps: String(CFG.DECISION_MIN_EDGE_DELTA_BPS),
+      allow_synth_trades: String(CFG.ALLOW_SYNTH_TRADES),
       balances_start: START_BAL ?? undefined,
-      balances_end:   END_BAL   ?? undefined,
+      balances_end: END_BAL ?? undefined,
+      ml_events_file: mlEventsFile,
+      exec_guard: {
+        exec_min_abs_bps: envNum("TEST_FORCE_SEND_IF_ABS_EDGE_BPS"),
+        allowed_path: String(process.env.EXEC_ALLOWED_PATH ?? "both"),
+        atomic_preferred: true,
+      },
     };
-
-    if (rpcSamples > 0) {
-      summary.rpc = {
-        samples: rpcSamples,
-        p50_ms: rpcMsP50,
-        p95_ms: rpcMsP95,
-        blocked_due_to_deviation: rpcBlocked,
-        used_swap_sim: String(process.env.USE_RAYDIUM_SWAP_SIM ?? "false"),
-      };
-    }
-
-    const file = path.join(LIVE_DIR, `${stamp()}.summary.json`);
     fs.writeFileSync(file, JSON.stringify(summary, null, 2));
     wroteSummary = true;
-    logger.log("arb_live_summary_written", { file, ...summary });
+    logger.log("arb_live_summary_written", summary);
   } catch (e) {
     logger.log("arb_live_summary_write_error", { err: String(e) });
   }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// ★ Latest market state for sizing
+// Latest market state
 // ────────────────────────────────────────────────────────────────────────────
 let LAST_BOOK: PhoenixBook | null = null;
 let LAST_PHX_MID: number | null = null;
 let LAST_CPMM: { base: number; quote: number } | null = null;
 
 // ────────────────────────────────────────────────────────────────────────────
-/** main */
+// main()
 // ────────────────────────────────────────────────────────────────────────────
 
 async function main() {
   const CFG = loadConfig();
   logger.log("arb boot", { rpc: maskUrl(RPC) });
+  console.log(`BOOT rpc=${maskUrl(RPC)} live=${process.env.LIVE_TRADING} shadow=${process.env.SHADOW_TRADING}`);
 
   const conn = new Connection(RPC, { commitment: "processed" });
   startHealth(conn).catch(() => {});
-
-  // risk banner
   initRisk();
 
   const LIVE = String(process.env.LIVE_TRADING ?? "0") === "1";
@@ -318,37 +335,43 @@ async function main() {
   let liveExec: LiveExecutor | null = null;
   let accounts: Awaited<ReturnType<typeof initAccounts>> | null = null;
 
+  const envOwner = tryPubkey(process.env.WALLET_PUBKEY);
+  const envWsolAta = tryPubkey(process.env.WSOL_ATA);
+  const envUsdcAta = tryPubkey(process.env.USDC_ATA);
+
   if (LIVE && !SHADOW) {
     accounts = await initAccounts(conn);
-    await initSessionRecorder(conn, accounts.owner, CFG); // harmless additive
+    await initSessionRecorder(conn, (accounts as any).owner, CFG);
     liveExec = new LiveExecutor(conn, accounts, CFG);
     await liveExec.startPhoenix();
 
-    // New: capture starting balances (env ATAs preferred; fallback to accounts.atas if present at runtime)
+    const ownerPk = envOwner ?? ((accounts as any).owner as PublicKey);
+    const wsolAtaHint = envWsolAta ?? (accounts as any)?.atas?.wsol;
+    const usdcAtaHint = envUsdcAta ?? (accounts as any)?.atas?.usdc;
+
+    console.log(
+      `BAL_PREF owner=${ownerPk.toBase58()} wsolATA=${wsolAtaHint ? wsolAtaHint.toBase58() : "-"} usdcATA=${usdcAtaHint ? usdcAtaHint.toBase58() : "-"}`
+    );
+
     try {
-      const ENV_WSOL_ATA = envAta(process.env.WSOL_ATA);
-      const ENV_USDC_ATA = envAta(process.env.USDC_ATA);
-      const wsol = ENV_WSOL_ATA ?? ((accounts as any)?.atas?.wsol as PublicKey | undefined);
-      const usdc = ENV_USDC_ATA ?? ((accounts as any)?.atas?.usdc as PublicKey | undefined);
-      START_BAL = await readBalances(conn, accounts.owner, { wsol, usdc });
+      START_BAL = await readBalances(conn, ownerPk, { wsol: wsolAtaHint, usdc: usdcAtaHint });
       logger.log("balances_start", START_BAL);
-    } catch {}
+      console.log(`START  SOL=${START_BAL.sol}  WSOL=${START_BAL.wsol}  USDC=${START_BAL.usdc}`);
+    } catch (e) {
+      console.log("START BAL ERROR", e);
+    }
   } else {
-    logger.log("shadow_mode", {
-      note: "skip initAccounts + LiveExecutor + startPhoenix",
-      live: LIVE,
-      shadow: SHADOW,
-    });
+    logger.log("shadow_mode", { note: "skip live init", live: LIVE, shadow: SHADOW });
   }
 
-  // Resolve authoritative fees per venue (global default + per-id override)
-  const RAYDIUM_POOL = (process.env.RAYDIUM_POOL_ID ?? process.env.RAYDIUM_POOL_ID_SOL_USDC ?? "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2").trim();
-  const PHX_MARKET   = (CFG.PHOENIX_MARKET || process.env.PHOENIX_MARKET_ID || "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg").trim();
+  const RAYDIUM_POOL =
+    (process.env.RAYDIUM_POOL_ID ?? process.env.RAYDIUM_POOL_ID_SOL_USDC ?? "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2").trim();
+  const PHX_MARKET =
+    (CFG.PHOENIX_MARKET || process.env.PHOENIX_MARKET_ID || "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg").trim();
 
   let AMM_FEE_BPS = resolveFeeBps("AMM", RAYDIUM_POOL, CFG.AMM_TAKER_FEE_BPS);
   const PHX_FEE_BPS = resolveFeeBps("PHOENIX", PHX_MARKET, CFG.PHOENIX_TAKER_FEE_BPS);
 
-  // ★ best-effort: fetch on-chain fee and override if mismatch
   AMM_FEE_BPS = await tryAssertRaydiumFeeBps(conn, RAYDIUM_POOL, AMM_FEE_BPS);
 
   logger.log("fee_config", {
@@ -356,16 +379,8 @@ async function main() {
     phoenix_market: PHX_MARKET, phoenix_fee_bps: PHX_FEE_BPS
   });
 
-  logger.log("edge_paths", {
-    amms: CFG.AMMS_JSONL,
-    phoenix: CFG.PHOENIX_JSONL,
-    min_abs_bps: CFG.EDGE_MIN_ABS_BPS,
-  });
-
-  logger.log("edge_config", {
-    book_ttl_ms: CFG.BOOK_TTL_MS,
-    synth_width_bps: CFG.SYNTH_WIDTH_BPS,
-  });
+  logger.log("edge_paths", { amms: CFG.AMMS_JSONL, phoenix: CFG.PHOENIX_JSONL, min_abs_bps: CFG.EDGE_MIN_ABS_BPS });
+  logger.log("edge_config", { book_ttl_ms: CFG.BOOK_TTL_MS, synth_width_bps: CFG.SYNTH_WIDTH_BPS });
 
   logger.log("edge_decision_config", {
     trade_threshold_bps: CFG.TRADE_THRESHOLD_BPS,
@@ -390,139 +405,92 @@ async function main() {
     shadow_trading: SHADOW,
   });
 
-  // Build rpcSimFn only if we have a real payer (LIVE, non-shadow)
-  const rpcSimFn: RpcSimFn | undefined = (CFG.USE_RPC_SIM && accounts && LIVE && !SHADOW)
-    ? (async (input: { path: "AMM->PHX" | "PHX->AMM"; sizeBase: number; ammMid: number; }) => {
-        const baseIn = (input.path === "PHX->AMM");
-        const amountInAtoms = baseIn
-          ? BigInt(Math.round(input.sizeBase * 1e9))               // SOL atoms
-          : BigInt(Math.round(input.sizeBase * input.ammMid * 1e6)); // USDC atoms
-
-        const out = await simulateRaydiumSwapFixedIn(conn, {
-          user: (accounts as any).owner as PublicKey,
-          baseIn,
-          amountInBase: amountInAtoms,
-          slippageBps: Number(process.env.AMM_MINOUT_BASE_BPS ?? 50),
-        });
-
-        if ((out as any).mode !== "cpmm-sim-success") {
-          return {
-            rpc_sim_mode: (out as any).mode,
-            rpc_sim_ms: (out as any).rpc_sim_ms ?? 0,
-            rpc_sim_error: (out as any).reason,
-          };
-        }
-        return {
-          rpc_sim_ms: (out as any).rpc_sim_ms,
-          rpc_sim_mode: (out as any).mode,
-          rpc_units: (out as any).rpc_units
-        };
-      })
-    : undefined;
+  // RPC sim fn is OFF in live because USE_RPC_SIM=0
+  const rpcSimFn: RpcSimFn | undefined = undefined;
 
   const mkShadowSig = () =>
     `shadow_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e9).toString(36)}`;
 
-  // safe fallback to avoid `.toFixed` on undefined
   function fillPxForPath(
-    path: "PHX->AMM" | "AMM->PHX",
+    pathDir: "PHX->AMM" | "AMM->PHX",
     d: { rpc_eff_px?: number; buy_px: number; sell_px: number }
   ) {
     const rpc = asNumber(d.rpc_eff_px);
-    const sidePx = path === "PHX->AMM" ? asNumber(d.sell_px) : asNumber(d.buy_px);
+    const sidePx = pathDir === "PHX->AMM" ? asNumber(d.sell_px) : asNumber(d.buy_px);
     return coalesceRound(6, rpc, sidePx);
   }
 
-  // ★ decision hook now computes dynamic size using freshest book+reserves
+  // default BOTH so we don't miss directionally-biased edges
+  const ALLOWED = String(process.env.EXEC_ALLOWED_PATH ?? "both");
+
+  // ML events log (jsonl)
+  const LIVE_DIR = path.join(CFG.DATA_DIR, "live");
+  ensureDir(LIVE_DIR);
+  const ML_EVENTS_FILE = path.join(LIVE_DIR, `${stamp()}.events.jsonl`);
+  const emitMl = (obj: any) => {
+    try { fs.appendFileSync(ML_EVENTS_FILE, JSON.stringify(obj) + "\n"); } catch {}
+  };
+
+  // ──────────────────────────────────────────────────────────────────────
+  // EXECUTION LOGIC — only when joiner says EV>0 (no forced sends)
+  // ──────────────────────────────────────────────────────────────────────
   const onDecision: DecisionHook = (_wouldTrade, _edgeNetBps, _expectedPnl, d) => {
-    // 🔹 ML snapshot
-    if (LOG_ML && d) {
+    const edgeNetBps = Number(_edgeNetBps ?? 0);
+    const expPnl     = Number(_expectedPnl ?? 0);
+    // if joiner didn't include details, do nothing (type-safe)
+    if (!d) {
+      recordDecision(false, edgeNetBps, expPnl);
+      return;
+    }
+
+    // Direction lock
+    if (ALLOWED !== "both" && d.path && d.path !== ALLOWED) {
+      logger.log("skip_due_to_path", { have: d.path, allowed: ALLOWED });
+      recordDecision(false, edgeNetBps, expPnl);
+      return;
+    }
+
+    // ML snapshot
+    if (LOG_ML) {
       try {
         emitEdgeSnapshot({ ...d, trade_size_base: LIVE_SIZE_BASE });
         emitDecision(Boolean(_wouldTrade), _wouldTrade ? "edge_above_threshold" : undefined, d, _expectedPnl);
       } catch {}
+      emitMl({ ts: Date.now(), ev: "decision", d });
     }
 
-    // If we don't have fresh snapshots yet, just record and bail
-    if (!d || !LAST_BOOK || !LAST_CPMM || !LAST_PHX_MID) {
-      try { recordDecision(Boolean(_wouldTrade), Number(_edgeNetBps ?? 0), Number(_expectedPnl ?? 0)); } catch {}
-      return;
-    }
+    const threshold  = Number(CFG.TRADE_THRESHOLD_BPS ?? 0);
 
-    const maxPoolFrac = Number(process.env.SIZEOPT_MAX_POOL_FRAC ?? CFG.CPMM_MAX_POOL_TRADE_FRAC ?? 0.02);
-    const lowerBase   = Number(process.env.SIZEOPT_MIN_BASE ?? 0.0002);
-    const probes      = Number(process.env.SIZEOPT_PROBE_STEPS ?? 9);
+    // final gate: only trades that are already profitable in sim
+    const doExecute = Boolean(_wouldTrade) && expPnl > 0 && edgeNetBps >= threshold;
 
-    const opt = optimizeSize(
-      {
-        kind: d.path === "PHX->AMM" ? "PHX->AMM" : "AMM->PHX",
-        book: { ...LAST_BOOK, takerFeeBps: Number(CFG.PHOENIX_TAKER_FEE_BPS ?? 0) },
-        cpmm: { base: LAST_CPMM.base, quote: LAST_CPMM.quote, feeBps: Number(CFG.AMM_TAKER_FEE_BPS ?? 25) },
-        maxPoolFrac,
-        lowerBase,
-      },
-      probes
-    );
-
-    // Compute a mid without touching non-typed fields on `d`
-    const midPx =
-      (LAST_PHX_MID != null) ? LAST_PHX_MID :
-      (Number.isFinite(d.buy_px) && Number.isFinite(d.sell_px)) ? (d.buy_px + d.sell_px) / 2 :
-      NaN;
-
-    const dynNetBps = (opt.bestBase > 0 && Number.isFinite(midPx))
-      ? (opt.bestPnl / (opt.bestBase * (midPx as number))) * 10_000
-      : -Infinity;
-
-    const shouldExecute = opt.bestPnl > 0 && dynNetBps >= CFG.TRADE_THRESHOLD_BPS;
-
-    logger.log("dyn_size_eval", {
-      pair: "SOL/USDC",
-      path: d.path,
-      best_size_base: Number(roundN(opt.bestBase ?? 0, 9)),
-      expected_pnl_quote: Number(roundN(opt.bestPnl ?? 0, 6)),
-      dyn_net_bps: Number(roundN(dynNetBps ?? -Infinity, 4)),
-      threshold_bps: CFG.TRADE_THRESHOLD_BPS,
-      pool_frac_cap: maxPoolFrac,
-    });
-
-    // record counters with dynamic decision
-    try { recordDecision(shouldExecute, Number(dynNetBps ?? 0), Number(opt.bestPnl ?? 0)); } catch {}
-
-    // ── Optional: single forced micro send when |raw edge| ≥ threshold ──
-    let doExecute = shouldExecute;
-    const FORCE_ABS = Number(process.env.TEST_FORCE_SEND_IF_ABS_EDGE_BPS ?? NaN);
-    const FORCE_MAX = Number(process.env.TEST_MAX_SENDS ?? 0);
-    const forcedSoFar = (global as any).__forced_sends__ ?? 0;
-    const rawAbs = Math.abs(Number(_edgeNetBps ?? dynNetBps ?? 0)); // ← use hook arg; no reliance on d.absBps
-    if (
-      !doExecute &&
-      Number.isFinite(FORCE_ABS) &&
-      FORCE_MAX > forcedSoFar &&
-      rawAbs >= FORCE_ABS
-    ) {
-      doExecute = true;
-      (global as any).__forced_sends__ = forcedSoFar + 1;
-      logger.log("forced_send_triggered", { rawAbsBps: rawAbs, FORCE_ABS, forced_count: forcedSoFar + 1 });
-    }
-
+    // keep stats
+    recordDecision(doExecute, edgeNetBps, expPnl);
     if (!doExecute) return;
 
-    const execSize = opt.bestBase;
+    // size: use the configured live size (simple & predictable)
+    const execSize = LIVE_SIZE_BASE;
+    const notional = coalesceRound(6, execSize * ((d.buy_px + d.sell_px) / 2));
 
     const payload: any = {
-      path: d.path,
-      size_base: execSize,
+      path: d.path,                                   // "PHX->AMM" or "AMM->PHX"
+      size_base: execSize,                            // e.g. 0.02 SOL
       buy_px: d.buy_px,
       sell_px: d.sell_px,
-      notional_quote: coalesceRound(6, execSize * ((d.buy_px + d.sell_px) / 2)),
+      notional_quote: notional,
       phoenix: {
-        market: PHX_MARKET || CFG.PHOENIX_MARKET,
+        market: (CFG.PHOENIX_MARKET || process.env.PHOENIX_MARKET_ID || "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg").trim(),
         side: d.side as "buy" | "sell",
         limit_px: d.side === "buy" ? d.buy_px : d.sell_px,
       },
-      forced: doExecute && !shouldExecute ? true : undefined,
+      amm: { pool: (process.env.RAYDIUM_POOL_ID ?? "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2").trim() },
+      atomic: true,
     };
+
+    console.log(
+      `EXEC (EV>0) ${payload.path} base=${roundN(payload.size_base,6)} notional≈${roundN(notional,4)} ` +
+      `mid=${roundN(LAST_PHX_MID ?? 0,3)}`
+    );
 
     if (SHADOW) {
       const submitted = {
@@ -535,10 +503,10 @@ async function main() {
         tip_lamports: undefined as number | undefined,
         live: false,
         shadow: true,
-        forced: payload.forced ?? false,
       };
       logger.log("submitted_tx", submitted);
       if (LOG_ML) { try { emitSubmittedTx(submitted); } catch {} }
+      emitMl({ ts: Date.now(), ev: "submitted", submitted });
 
       const fp = fillPxForPath(payload.path as "PHX->AMM" | "AMM->PHX", {
         rpc_eff_px: d.rpc_eff_px,
@@ -554,10 +522,10 @@ async function main() {
         fill_px: fp,
         filled_base: payload.size_base,
         filled_quote: coalesceRound(6, payload.size_base * fp),
-        forced: payload.forced ?? false,
       };
       logger.log("landed", landed);
       if (LOG_ML) { try { emitLanded(landed); } catch {} }
+      emitMl({ ts: Date.now(), ev: "landed", landed });
       return;
     }
 
@@ -583,7 +551,7 @@ async function main() {
       waitLogMs: CFG.EDGE_WAIT_LOG_MS,
       thresholdBps: CFG.TRADE_THRESHOLD_BPS,
       flatSlippageBps: CFG.MAX_SLIPPAGE_BPS,
-      tradeSizeBase: CFG.TRADE_SIZE_BASE, // not used for execution now; still used by joiner for its own calc
+      tradeSizeBase: CFG.TRADE_SIZE_BASE,
       phoenixFeeBps: PHX_FEE_BPS,
       ammFeeBps: AMM_FEE_BPS,
       fixedTxCostQuote: CFG.FIXED_TX_COST_QUOTE,
@@ -605,7 +573,7 @@ async function main() {
     onRpcSample
   );
 
-  // Feed joiner from JSONL publishers + maintain latest snapshots for sizing
+  // Feed joiner from JSONL publishers and maintain local state
   const POLL_MS = Number(process.env.EDGE_FOLLOW_POLL_MS ?? 500) || 500;
 
   const ammsFollower = new JsonlFollower(
@@ -637,24 +605,19 @@ async function main() {
         LAST_PHX_MID = Number(obj?.px ?? obj?.phoenix_mid ?? obj?.mid ?? obj?.price ?? NaN);
         joiner.upsertPhoenix(obj);
       } else if (ev === "phoenix_l2" || ev === "phoenix_l2_empty") {
-        // Maintain both: joiner and our local book snapshot
         joiner.upsertPhoenix(obj);
         try {
           const bids = (obj?.levels_bids ?? []).map((l: any) => ({ px: Number(l.px), qtyBase: Number(l.qty ?? l.qtyBase ?? 0) }));
           const asks = (obj?.levels_asks ?? []).map((l: any) => ({ px: Number(l.px), qtyBase: Number(l.qty ?? l.qtyBase ?? 0) }));
           LAST_BOOK = { bids, asks, takerFeeBps: Number(process.env.PHOENIX_TAKER_FEE_BPS ?? 0) };
 
-          // best effort mid
-          if (Number.isFinite(obj?.phoenix_mid)) {
-            LAST_PHX_MID = Number(obj.phoenix_mid);
-          } else if (Number.isFinite(obj?.px)) {
-            LAST_PHX_MID = Number(obj.px);
-          } else if (Number.isFinite(obj?.best_bid) && Number.isFinite(obj?.best_ask)) {
+          if (Number.isFinite(obj?.phoenix_mid)) LAST_PHX_MID = Number(obj.phoenix_mid);
+          else if (Number.isFinite(obj?.px))     LAST_PHX_MID = Number(obj.px);
+          else if (Number.isFinite(obj?.best_bid) && Number.isFinite(obj?.best_ask)) {
             LAST_PHX_MID = (Number(obj.best_bid) + Number(obj.best_ask)) / 2;
           }
         } catch {}
       } else {
-        // Optionally harvest RPC timing
         try {
           const ms = Number(obj?.data?.rpc_sim_ms ?? obj?.rpc_sim_ms);
           if (Number.isFinite(ms)) {
@@ -673,43 +636,49 @@ async function main() {
 
   await Promise.all([ammsFollower.start(), phxFollower.start()]);
 
-  // Graceful shutdown + summary (async to capture ending balances)
+  // Graceful shutdown
   const shutdown = (signal: string) => {
     (async () => {
       try { ammsFollower.stop(); } catch {}
       try { phxFollower.stop(); } catch {}
       try {
-        // capture ending balances if live
         if (accounts) {
-          const ENV_WSOL_ATA = envAta(process.env.WSOL_ATA);
-          const ENV_USDC_ATA = envAta(process.env.USDC_ATA);
-          const wsol = ENV_WSOL_ATA ?? ((accounts as any)?.atas?.wsol as PublicKey | undefined);
-          const usdc = ENV_USDC_ATA ?? ((accounts as any)?.atas?.usdc as PublicKey | undefined);
-          END_BAL = await readBalances(conn, accounts.owner, { wsol, usdc });
+          const ownerPk = tryPubkey(process.env.WALLET_PUBKEY) ?? ((accounts as any).owner as PublicKey);
+          const wsolAtaHint = tryPubkey(process.env.WSOL_ATA) ?? (accounts as any)?.atas?.wsol;
+          const usdcAtaHint = tryPubkey(process.env.USDC_ATA) ?? (accounts as any)?.atas?.usdc;
+
+          END_BAL = await readBalances(conn, ownerPk, { wsol: wsolAtaHint, usdc: usdcAtaHint });
           logger.log("balances_end", END_BAL);
+          console.log(`END    SOL=${END_BAL.sol}  WSOL=${END_BAL.wsol}  USDC=${END_BAL.usdc}`);
+          const dsol  = roundN((END_BAL.sol  - (START_BAL?.sol  ?? 0)), 9);
+          const dwsol = roundN((END_BAL.wsol - (START_BAL?.wsol ?? 0)), 9);
+          const dusdc = roundN((END_BAL.usdc - (START_BAL?.usdc ?? 0)), 6);
+          console.log(`DELTA  dSOL=${dsol}  dWSOL=${dwsol}  dUSDC=${dusdc}`);
         }
-      } catch {}
-      if (!wroteSummary) writeLiveSummarySync(CFG);
+      } catch (e) {
+        console.log("END BAL ERROR", e);
+      }
+      if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
       logger.log("arb_shutdown", { ok: true, signal });
       process.exit(0);
     })().catch(() => {
-      if (!wroteSummary) writeLiveSummarySync(CFG);
+      if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
       process.exit(0);
     });
   };
 
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGINT",  () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("beforeExit", () => { if (!wroteSummary) writeLiveSummarySync(CFG); });
-  process.on("exit", () => { if (!wroteSummary) writeLiveSummarySync(CFG); });
+  process.on("beforeExit", () => { if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE); });
+  process.on("exit",       () => { if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE); });
   process.on("uncaughtException", (e) => {
     logger.log("arb_fatal", { error: String(e) });
-    if (!wroteSummary) writeLiveSummarySync(CFG);
+    if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
     process.exit(1);
   });
   process.on("unhandledRejection", (e) => {
     logger.log("arb_fatal", { error: String(e) });
-    if (!wroteSummary) writeLiveSummarySync(CFG);
+    if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
     process.exit(1);
   });
 }

@@ -1,309 +1,467 @@
-Phase 0 — Foundation Lock (CI, tests, reproducibility) (Do this first; no runtime change)
+Where we are (right now)
 
-Goal: Make correctness provable and repeatable.
+Live-capable SOL/USDC arb is running (Raydium CPMM ↔ Phoenix L2).
 
-Tasks
+Publishers:
 
-Deterministic environment
+packages/amms/src/reserves.ts streams Raydium vault balances → mid price.
 
-Add a minimal Dockerfile + devcontainer (Node LTS you pinned + build-essentials) and a “dry-run” make target that builds with native bigint-buffer only.
+packages/phoenix streams Phoenix mid & L2 (stable via getUiLadder).
 
-Gate postinstall to fail if the native path isn’t used (detect pure-JS fallback).
+Decision layer:
 
-CI
+EdgeJoiner computes edges (fees/slippage aware).
 
-GitHub Actions: matrix on Node 18/20; jobs = pnpm -r build, unit tests, typecheck, lint.
+Dynamic size optimizer (uses latest Phoenix book + Raydium reserves).
 
-Unit tests (CPMM & fees)
+Optional RPC swap sim (Raydium) to sanity-check price impact.
 
-Property tests for minOut: fee-less invariant (x·y), then fee/slippage application; BigInt/BN parity tests.
+Guards (dedupe, TTL, basic risk counters).
 
-Golden tests for venue fees (Raydium, Phoenix), tip math, and fixed cost accounting.
+Execution:
 
-Replay parity test
+LiveExecutor sends micro orders when criteria are met.
 
-Single “golden day” fixture; assert backtest == live decisions byte-for-byte (ignoring timestamps).
+Session summaries write start/end balances (SOL, wSOL, USDC) so you see net movement.
 
-Acceptance
+ML-friendly logs for decisions, RPC latency, submitted/landed fills.
 
-CI green on main; Docker build succeeds; tests > 90% lines for AMM math and fee/slippage/tip.
+You can already run micro live, observe, and tweak with env flags.
 
-Backtest parity: ≥ 99.9% identical decisions on the fixture day.
+Repository structure (kept simple & scalable)
+mev/
+├─ .env / .env.live / .env.shadow            # run profiles
+├─ package.json (workspace scripts)
+├─ tsconfig*.json
+├─ packages/
+│  ├─ amms/                                  # AMM adapters & publishers
+│  │  ├─ src/reserves.ts                     # Raydium CPMM reader (live)
+│  │  └─ src/adapters/*                      # (scaffold) orca/meteora/openbook
+│  ├─ phoenix/                               # Phoenix L2 publisher
+│  ├─ core/                                  # math, numerics, invariants
+│  ├─ risk/                                  # guardrails & policy
+│  ├─ storage/                               # logger & JSONL sinks
+│  └─ solana/                                # web3 helpers, builders
+├─ services/
+│  └─ arb-mm/
+│     ├─ src/main.ts                         # live runner (joiner, exec, summary)
+│     ├─ src/edge/*                          # EdgeJoiner logic
+│     ├─ src/executor/
+│     │  ├─ live.ts                          # spot execution (current)
+│     │  ├─ sim.ts                           # RPC sim helpers
+│     │  ├─ size.ts                          # dynamic size optimizer
+│     │  └─ flashloan/*                      # (new track) flash-loan executor
+│     ├─ src/ml_schema.ts                    # ML event emitters (snapshots, etc.)
+│     ├─ src/util/*                          # num utils, raydium helpers
+│     └─ data/sessions                       # runtime summaries & logs
+└─ configs/
+   ├─ markets.json                           # (optional) multi-market config
+   └─ params/YYYY-MM-DD.json                 # (later) optimizer outputs
 
-Abort guards
 
-If any pure-JS bigint is detected in CI, job fails.
+The flash-loan executor will live under services/arb-mm/src/executor/flashloan/ and stays flag-gated so it never interferes with spot execution.
 
-Phase 1 — Phoenix L2 (✅ done)
+Phased roadmap (flash-loan moved earlier)
 
-Keep as-is. Acceptance stays: 30+ mins stable, phoenix_source: "book" via getUiLadder.
+Each phase = Objective → Tasks → Deliverables → Acceptance/DoD.
+You can progress linearly and earn early with flash loans once the MVP guardrails pass.
 
-Phase 2 — Decision Layer (Simulation) (✅ MVP; tighten metrics)
+Phase A — One-Hour Micro Live Soak (you’re here)
 
-Goal: Decisions match realized outcomes within tight error bounds.
-
-Add acceptance metrics (no behavior change yet)
-
-Log predicted vs realized slippage error distribution for landed trades.
-
-Net EV calibration: median(|EV_pred – EV_real|) ≤ 2 bps; 95th ≤ 5 bps over 3 days (micro size).
-
-Abort guards
-
-If realized EV histogram skews negative for two consecutive sessions, auto-drop LIVE_TRADING to 0 and mark session red.
-
-Phase 3 — Replay / Backtest (✅ done; add invariants)
-
-Goal: Bit-exact reproducibility.
-
-Acceptance (tightened)
-
-Decision parity ≥ 99.9% for fixture day.
-
-Feature rows non-decreasing (no schema breaks) across 3 consecutive days.
-
-Phase 4 — Execution Prep (Simulators & Guards) (Days 1–4; flags OFF by default)
-
-Goal: Measure before moving size.
-
-Tasks
-
-CPMM price-impact simulator (existing)
-
-Emit amm_eff_px, amm_price_impact_bps for trade size; ensure unit-safe BigInt→BN conversions only at SDK boundary.
-
-RPC simulateTransaction (existing)
-
-Log sim_eff_px, sim_slippage_bps, compute_units, prioritization_fee.
-
-Risk scaffolding (read-only → blocking)
-
-Per-minute notional cap, per-path consecutive-fail cap, TPS throttle, kill-switch (read-only today, block tomorrow).
-
-Acceptance
-
-With flags ON, all additive fields present in live logs; backtest ignores them gracefully.
-
-CPMM vs RPC-sim slippage delta: median ≤ 1 bps, 95th ≤ 3 bps (micro size).
-
-Abort guards
-
-If RPC-sim fails > 5% in a session, auto-disable USE_RPC_SIM and mark session amber.
-
-Phase 5 — Micro Live Execution (Days 5–9; tiny size)
-
-Goal: Land small orders safely; prove EV calibration.
+Objective: Prove end-to-end sending + logging + balance snapshots with micro size.
 
 Tasks
 
-Preflight hardening: SOL/USDC balances + ATAs; refuse send on missing ATA or low SOL.
+Run pnpm live for ~1h with tiny size (LIVE_SIZE_BASE=0.001).
 
-Guards ON (blocking): notional cap/minute, consecutive-fail cap, error-burst kill-switch, TPS throttle.
+If you want to force a couple sends while staying tiny:
 
-Execution: Send only when (a) EV≥0 after all fees/slippage/tip, (b) sim (if enabled) passes, (c) guards pass.
+TEST_FORCE_SEND_IF_ABS_EDGE_BPS=0.40
 
-Acceptance
+TEST_MAX_SENDS=2
 
-≥ 3 landed trades with |slippage_pred – slippage_real| median ≤ 1 bps.
+Deliverables
 
-Zero guard violations; kill-switch manually tested (inject 3 synthetic errors).
+data/live/<ts>.summary.json with balances_start / balances_end.
 
-Session summary written; report shows realized P&L ≥ 0 with micro notional.
+JSONL logs for amms/phoenix/arb.
 
-Abort guards
+DoD
 
-Any session with 2+ land_error from the same cause → auto-pause.
+≥1 landed send (real or forced).
 
-Phase 6 — Latency & Reliability I (Core) (Days 10–12)
+No fatal errors; summary written.
 
-Goal: Cut decision→send critical path; eliminate stalls.
+Phase 0 — Foundation & Repro (no Docker required yet)
 
-Tasks
-
-RPC pool with health scoring: rotate providers; record p50/p95 latency and error rate; prefer lowest p95.
-
-Warm sockets: persistent Phoenix/AMM streams with exponential backoff and jitter; detect gaps.
-
-Tx pipeline: cache blockhash; pre-build compute-budget ixs; avoid unnecessary serialization; parallelize reserve fetch & tip calc.
-
-Acceptance
-
-p95 tick→decision < 80 ms, p95 decision→submit < 40 ms on target box.
-
-No feed gaps > 10s during a 12-hour run.
-
-Abort guards
-
-If p95 decision→submit exceeds 80 ms for > 30 min, auto-drop to shadow.
-
-Phase 7 — Jito & Inclusion Control (Days 13–14)
-
-Goal: Deterministic inclusion under load, with safe fallback.
+Objective: Correctness you can trust; predictable replays.
 
 Tasks
 
-Add Jito submit path with runtime fallback to RPC if bundle fails pre-slot.
+Unit tests: CPMM invariant (x*y fee-less), fee+slip application, tip/fixed-cost math.
 
-Log inclusion target vs actual slot; compute in-block hit rate.
+Golden tests: Raydium & Phoenix fees on known IDs.
 
-Tip policy staged: static → microLamports/compute-unit → dynamic bands (still rules-based; ML later).
+Replay parity: a “golden day” fixture; decision parity check.
 
-Acceptance
+Deliverables
 
-≥ 90% of live sends land within the targeted block window when Jito enabled.
+packages/core/__tests__/*, services/arb-mm/__tests__/*.
 
-No increase in land_error vs RPC baseline during a 6-hour A/B.
+pnpm test green; pnpm backtest supports --from/--to.
 
-Abort guards
+DoD
 
-If bundle rejection > 5% with no RPC fallback success, auto-disable Jito for session.
+90% line coverage on AMM math + fee/tip paths.
 
-Phase 8 — Market/AMM Expansion (Raydium → +2 venues) (Days 15–18)
+Fixture parity ≥ 99.9% decisions (ignore timestamps).
 
-Goal: Parallel, interchangeable venues without code sprawl.
+(Optional later: minimal Dockerfile + GitHub Actions matrix — not blocking early cashflow.)
 
-Tasks
+Phase 1 — Phoenix L2 Stability (✅ keep)
 
-Unify AMM adapter interface: price(), quoteFixedIn(), minOut(), feeBps(), buildSwapIx().
+Objective: Stable Phoenix mid/L2 with low jitter.
 
-Add Orca Whirlpools and Meteora adapters; keep Raydium as reference.
+DoD
 
-Config-driven enablement; per-pool fee/slippage overrides from a single JSON.
+30+ mins stable, phoenix_source="book" via getUiLadder; no gaps >10s.
 
-Acceptance
+Phase 2 — Decision Calibration & ML Metrics
 
-3+ markets live; single decision layer chooses the best path.
-
-Backtest filterable by symbol and venue.
-
-Abort guards
-
-Any adapter that can’t prove CPMM/curve math parity (unit tests) stays disabled.
-
-Phase 9 — Latency & Reliability II (Pre-signing, CPU, GC) (Days 19–20)
-
-Goal: Shave the last 10–20 ms.
+Objective: Decisions match realized outcomes; log calibration metrics.
 
 Tasks
 
-Pre-build & cache v0 message skeletons; only mutate ix data on send.
+Log pred vs realized slippage per landed trade.
 
-Node flags: tune GC pause/throughput; pin process to cores; disable CPU C-states on the box.
+Compute EV_pred vs EV_real and emit to ML logs.
 
-Fast path for “unchanged accounts” to skip rebuild.
+Deliverables
 
-Acceptance
+ML records: edge_snapshot, decision, submitted_tx, landed, rpc_sample.
 
-p95 decision→submit < 25 ms sustained for 6 hours.
+Tiny analysis script to compute median(|EV_pred – EV_real|).
 
-No increase in invalid-blockhash or signature-mismatch errors.
+DoD
 
-Phase 10 — Advanced Strategies (flag-gated; micro size) (Days 21–24)
+Over 3 micro days: median error ≤ 2 bps, p95 ≤ 5 bps.
 
-Goal: Add high-EV paths without destabilizing the core.
+Abort guard: two sessions with negative EV drift → auto set LIVE_TRADING=0.
 
-Tracks (independent flags)
+Phase 2.5 — Flash-Loan MVP (Shadow → Dry-Run → Micro Live)
 
-Same-pool backrun
+Objective: Enable capital-light arbitrage by borrowing intra-tx and repaying atomically.
 
-Detect inbound Raydium swaps (log or memcmp); build atomic bundle to capture price impact.
+Design (Solana-friendly, safe)
 
-Acceptance: ≥ 5 executed backruns with positive realized EV; no adverse selection spikes.
+Option A — True atomic (preferred):
+Use a protocol that supports flash loans (e.g., Kamino / marginfi / Solend if available and permissionless).
+This typically requires a flash-loan receiver program (your tiny on-chain program) that:
 
-Cross-venue backrun/arb
+receives the borrowed funds,
 
-Use AMM A price impact as signal for AMM B; ensure both legs’ minOut applied.
+executes your swap legs via CPI (Raydium/Orca/etc.),
 
-Acceptance: ≥ 10 executed cross-venue trades; median EV error ≤ 3 bps.
+repays the loan + fee in the same transaction,
 
-Flash-loan liquidations (Kamino/marginfi, etc.)
+enforces invariants (no under-repay, no negative balances).
 
-Separate executor with strict invariant checks; no interference with arb path.
-
-Acceptance: 1+ clean liquidation with full accounting logged.
-
-Abort guards
-
-Any strategy exceeding 2 consecutive net-neg sessions disables itself automatically.
-
-Phase 11 — ML & Optimizers (offline → shadow → live) (Days 25–28)
-
-Goal: Data-driven tuning without regressions.
+Option B — Bundle-atomic via Jito (backup):
+Encode borrow → swap(s) → repay as a single transaction if lender allows, or as a bundle if their interface supports it. Bundles aim for all-or-nothing inclusion; still treat as non-atomic fallback and guard carefully.
 
 Tasks
 
-Param optimizer (offline)
+Create flash-loan executor module (client side) + minimal receiver program (Anchor or raw Rust), gated by:
 
-Daily job: optimize threshold/slippage/size under turnover & variance constraints; write dated params JSON.
+ENABLE_FLASH_LOAN=1
 
-Shadow-apply
+FLASH_PROVIDER=kamino|marginfi|solend (as supported)
 
-Engine reads the file, computes “what would have happened,” but doesn’t change behavior.
+FLASH_MAX_NOTIONAL, FLASH_FAIL_CLOSE=true
 
-Bandit tip advisor (shadow)
+Add full pre-sim pipeline: pessimistic slip, compute budget estimation, repay check.
 
-Discrete tip bands conditioned on edge & mempool pressure; log tip_suggested vs tip_used.
+Shadow mode first: simulate full path; no sends.
 
-Acceptance
+Dry-run “real tx build” without broadcasting (log the full plan).
 
-3-day shadow A/B shows uplift in expected EV and inclusion% with no increase in land errors.
+Micro live after passing sims.
 
-Flip AUTO_APPLY_PARAMS=true only after shadow success.
+Deliverables
 
-Phase 12 — Observability & PnL (Days 29–30)
+services/arb-mm/src/executor/flashloan/* (client)
 
-Goal: See everything, quickly.
+programs/flash_receiver/* (tiny on-chain borrower; one entrypoint that takes encoded legs & repays)
+
+Unit tests: bad path (leg fail), fee spike, under-repay → must revert.
+
+DoD
+
+Shadow: pass full-path sim for ≥ 100 candidate ops with zero under-repay.
+
+Micro live: ≥ 1 clean, profitable flash-loan trade; logs show borrow → legs → repay with positive EV after all fees.
+
+Spot executor unaffected (isolated queue, rate limits).
+
+Why now? This lets you trade with minimal upfront capital, staying micro while we harden everything else.
+
+Phase 3 — Backtest Tightening
+
+Objective: Bit-exact reproducibility; schema stability.
+
+DoD
+
+Parity ≥ 99.9% on fixture day.
+
+Feature rows non-decreasing across 3 days (no schema breaks).
+
+Phase 4 — Simulators & Guards (Additive; default OFF)
+
+Objective: Measure thoroughly; enforce guardrails before size.
 
 Tasks
 
-Roll up JSONL → daily CSV/Parquet; quick scripts for histograms (latency, slippage, inclusion, EV vs PnL).
+CPMM impact simulator (already present) logs amm_eff_px, amm_price_impact_bps.
 
-Single dashboard: opportunities, inclusion %, EV calibration, realized PnL, latency, guard trips, error codes.
+RPC simulateTransaction logs sim_eff_px, sim_slippage_bps, compute_units, prioritization_fee.
 
-Alerts: feed stall, inclusion drop, negative drift, kill-switch trip.
+Risk scaffolding:
 
-Acceptance
+Per-minute notional caps,
 
-1 dashboard answers: Why didn’t we trade? Why did we lose? Where’s the latency?
+Consecutive-fail caps,
 
-On-call checklist for common reds with exact commands.
+Error-burst kill-switch,
 
-Phase 13 — Soak & Scale (size ramp) (7-day rolling)
+TPS throttle,
 
-Goal: Increase notional safely.
+(For flash loans) repay-invariant guard and provider health.
+
+Deliverables
+
+Extra fields in logs; backtest ignores gracefully.
+
+DoD
+
+CPMM vs RPC-sim slip delta: median ≤ 1 bps, p95 ≤ 3 bps (micro).
+
+Abort guard: RPC-sim fails > 5% → auto disable USE_RPC_SIM.
+
+Phase 5 — Micro Live (Spot + Flash) with Blocking Guards
+
+Objective: Land small orders safely using either wallet balance or flash-loan path.
 
 Tasks
 
-Ramp plan: 1× → 2× → 4× notional; advance only if (a) positive PnL 2 days running, (b) EV error within targets, (c) inclusion ≥ 85%.
+Preflight strict: SOL/USDC & ATAs; refuse send if low SOL or missing ATA.
 
-Daily post-mortem automation comparing summaries; drift checks.
+Guards ON (blocking): notional/min, consecutive fails, error bursts, TPS throttle.
 
-Acceptance
+Execution criteria:
 
-48-hour soak at 2× without reds; 7-day run with stable positive PnL.
+EV≥0 after all fees/slip/tip/flash-fee,
 
-Abort guards
+sim (if enabled) passes,
 
-Any day with net-neg PnL and degraded EV calibration → auto-halve size.
+guards pass,
 
-Global Standards (enforced every phase)
+for flash-path: repay-invariant proven in pre-sim.
 
-Native bigint paths only; CI blocks pure-JS fallback.
+Deliverables
 
-Unit-safe numerics end-to-end; conversions only at SDK boundary.
+Session summary includes guard stats (+ flash-loan stats: borrow fee, repay delta).
 
-No silent catches; every error carries reproduction context.
+DoD
 
-Apple-simple UX: one runner, clear flags, sensible defaults, exhaustive logs.
+≥ 3 landed trades (any mix of spot/flash-loan) with median |slippage_pred – slippage_real| ≤ 1 bps.
 
-Quick “Definition of Done” per objective
+Zero guard violations; manual kill-switch works.
 
-Correctness: CPMM + fees + slippage + fixed costs match realized within stated bps bands.
+Session P&L ≥ 0 with micro notional.
 
-Latency: Hard p95 budgets met before enabling larger size.
+Phase 6 — Latency & Reliability I (Core)
 
-Inclusion: Jito path improves hit rate with clean fallback.
+Objective: Cut decision→submit; avoid stalls.
 
-Scale: Multi-venue via one adapter interface; strategy flags isolate risk.
+Tasks
 
-Repro: Backtest parity ≥ 99.9%; CI green; Docker build clean.
+RPC pool w/ health scoring (p50/p95 latency, error rate).
+
+Warm, persistent Phoenix/AMM sockets w/ backoff+jitter; gap detection.
+
+TX pipeline: cached blockhash, prebuilt compute budget ixs, parallel reserve fetch & tip calc.
+
+DoD
+
+p95 tick→decision < 80 ms, p95 decision→submit < 40 ms.
+
+No feed gaps > 10 s during 12-hour run.
+
+Abort guard: >80 ms for >30 min → drop to shadow.
+
+Phase 7 — Inclusion Control (Jito)
+
+Objective: Deterministic inclusion with clean fallback.
+
+Tasks
+
+Jito submit path; fallback to RPC if bundle fails pre-slot.
+
+Log target vs actual slot; in-block hit rate.
+
+Tip policy staged: static → microlamports/CU → dynamic bands (rules first, ML later).
+
+DoD
+
+≥ 90% land in targeted block window when Jito enabled.
+
+No increase in land_error vs RPC baseline in 6-hour A/B.
+
+Abort guard: bundle rejection >5% w/o RPC success → disable Jito.
+
+Phase 8 — Venue Expansion (Adapters: Orca, Meteora, OpenBook)
+
+Objective: Parallel venues w/o code sprawl.
+
+Tasks
+
+Adapter interface (price(), quoteFixedIn(), minOut(), feeBps(), buildSwapIx()).
+
+Implement Orca Whirlpools, Meteora, OpenBook.
+
+Single JSON for per-pool overrides; config-driven enablement.
+
+Deliverables
+
+packages/amms/src/adapters/{raydium,orca,meteora,openbook}.ts
+
+Adapter unit tests for CPMM/curve math parity.
+
+DoD
+
+3+ markets live; one decision layer picks best path.
+
+Backtest filterable by symbol & venue.
+
+Any adapter failing parity → stays disabled.
+
+Phase 9 — Latency & Reliability II (Pre-signing, CPU, GC)
+
+Objective: Shave last 10–20 ms.
+
+Tasks
+
+Prebuild & cache v0 message skeletons; mutate ix data only.
+
+Tune Node GC (pause/throughput); pin to cores; host C-state tuning.
+
+Fast path for unchanged accounts to skip rebuild.
+
+DoD
+
+p95 decision→submit < 25 ms for 6 hours.
+
+No increase in invalid-blockhash or signature-mismatch.
+
+Phase 10 — Advanced Strategies (flag-gated micro)
+
+Objective: Add high-EV tracks safely.
+
+Tracks
+
+Same-pool backrun (Raydium): detect inbound swaps; atomic bundle to capture impact.
+DoD: ≥5 executed backruns, positive realized EV; no adverse selection spikes.
+
+Cross-venue backrun/arb: leverage price impact on A → act on B; enforce minOut on both legs.
+DoD: ≥10 executed trades; median EV error ≤ 3 bps.
+
+JIT-LP / fee farming (venue-dependent): temporary LP during bursts; controlled inventory.
+DoD: measurable fee capture with bounded inventory drift.
+
+Global Abort Guard: 2 net-neg sessions in a row → auto-disable that track.
+
+Phase 11 — ML & Optimizers (offline → shadow → live)
+
+Objective: Data-driven tuning with no regressions.
+
+Tasks
+
+Daily param optimizer (offline): threshold/slippage/size under turnover & variance constraints → write dated JSON.
+
+Shadow-apply: compute “what would have happened” without changing behavior.
+
+Bandit tip advisor (shadow): tip bands by edge & mempool pressure; log tip_suggested vs tip_used.
+
+Deliverables
+
+services/arb-mm/scripts/optimize_params.ts
+
+Params snapshots: configs/params/YYYY-MM-DD.json.
+
+DoD
+
+3-day shadow A/B shows uplift in expected EV & inclusion% w/o increased land errors.
+
+Then flip AUTO_APPLY_PARAMS=true.
+
+Phase 12 — Observability & PnL
+
+Objective: See everything quickly.
+
+Tasks
+
+Roll JSONL → daily CSV/Parquet; scripts for histograms (latency, slippage, inclusion, EV vs PnL).
+
+One dashboard: opportunities, inclusion %, EV calibration, realized PnL, latency, guard trips, error codes.
+
+Alerts: feed stall, inclusion drop, negative drift, kill-switch.
+
+DoD
+
+One dashboard answers: Why no trades? Why loss? Where’s latency?
+
+On-call checklist with exact commands.
+
+Phase 13 — Soak & Scale (rolling 7 days)
+
+Objective: Increase notional safely.
+
+Tasks
+
+Ramp: 1× → 2× → 4×; advance only if:
+
+Positive PnL 2 days in a row,
+
+EV error within targets,
+
+Inclusion ≥ 85%.
+
+Daily post-mortem automation; drift checks.
+
+DoD
+
+48-hour soak at 2× with no reds; 7-day run with stable positive PnL.
+
+Abort guard: any day with net-neg PnL and degraded EV calibration → auto-halve size.
+
+Production Definition of Done (money-on checklist)
+
+Repro/Correctness: tests ≥ 90% on math/fees/slippage/tips; replay parity ≥ 99.9%.
+
+Latency: p95 tick→decision < 80 ms; p95 decision→submit < 25–40 ms.
+
+Inclusion: Jito path improves hit rate; robust RPC fallback; in-block ≥ 90% in A/B.
+
+Calibration: 3-day live micro EV error median ≤ 2 bps, p95 ≤ 5 bps.
+
+Risk: guards ON; kill-switch verified; error-burst protection working.
+
+Observability: single dashboard + alerts; daily summaries & balance deltas.
+
+Scalability: multi-venue via adapters; strategies isolated via flags; config-driven enablement.
+
+ML: optimizer proven in shadow; then auto-applied.
+
+Flash-Loan: isolated executor with strict repay invariant; ≥1 clean profitable atomic sequence in live micro.
+
+Ops simplicity: “Apple-simple” commands (pnpm live, pnpm shadow, pnpm report:live:*).
