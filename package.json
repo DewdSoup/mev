@@ -41,9 +41,8 @@
     "dev:amms": "env FORCE_COLOR=1 pnpm -C packages/amms dev",
     "dev:arb": "env FORCE_COLOR=1 pnpm -C services/arb-mm dev",
     "//live": "──────────── One-button sessions (manual stop with Ctrl+C) ────────────",
-    "live": "dotenv -e .env.live -- bash -lc 'SHADOW_TRADING=${SHADOW_TRADING:-0} LIVE_TRADING=${LIVE_TRADING:-1} pnpm dev:all || true; pnpm report:live:live || true; pnpm -C services/arb-mm daily:if-needed || true'",
-    "live:jito": "dotenv -e .env.live -- bash -lc 'SHADOW_TRADING=${SHADOW_TRADING:-0} LIVE_TRADING=${LIVE_TRADING:-1} SUBMIT_MODE=jito pnpm dev:all || true; pnpm report:live:live || true; pnpm -C services/arb-mm daily:if-needed || true'",
-    "shadow": "dotenv -e .env.shadow -- bash -lc 'SHADOW_TRADING=${SHADOW_TRADING:-1} LIVE_TRADING=${LIVE_TRADING:-0} pnpm dev:all || true; pnpm report:live:shadow || true; pnpm -C services/arb-mm daily:if-needed || true'",
+    "live": "dotenv -e .env.live -- bash -lc 'set -euo pipefail; TS=$(date -u +%Y-%m-%dT%H%M%SZ); DATA_ROOT=\"$PWD/services/arb-mm/data\"; mkdir -p \"$DATA_ROOT\"/features \"$DATA_ROOT\"/live \"$DATA_ROOT\"/ml \"$DATA_ROOT\"/params \"$DATA_ROOT\"/replay \"$DATA_ROOT\"/reports/live \"$DATA_ROOT\"/sessions; export ARB_DATA_DIR=\"$DATA_ROOT\" ARB_REPORTS_DIR=\"$DATA_ROOT/reports\" ARB_REPORTS_LIVE_DIR=\"$DATA_ROOT/reports/live\" ARB_LIVE_DIR=\"$DATA_ROOT/live\" ARB_FEATURES_DIR=\"$DATA_ROOT/features\" ARB_PARAMS_DIR=\"$DATA_ROOT/params\" ARB_REPLAY_DIR=\"$DATA_ROOT/replay\" ARB_ML_DIR=\"$DATA_ROOT/ml\"; RUNTIME_LOG=\"$DATA_ROOT/reports/live/${TS}.runtime.log\"; echo \"[live] logging to $RUNTIME_LOG\"; SHADOW_TRADING=${SHADOW_TRADING:-0} LIVE_TRADING=${LIVE_TRADING:-1} stdbuf -oL -eL pnpm dev:all 2>&1 | tee -a \"$RUNTIME_LOG\"; EXIT=$?; pnpm report:live:live || true; pnpm -C services/arb-mm daily:if-needed || true; exit $EXIT'",
+    "live:jito": "dotenv -e .env.live -- bash -lc 'set -euo pipefail; TS=$(date -u +%Y-%m-%dT%H%M%SZ); DATA_ROOT=\"$PWD/services/arb-mm/data\"; mkdir -p \"$DATA_ROOT\"/features \"$DATA_ROOT\"/live \"$DATA_ROOT\"/ml \"$DATA_ROOT\"/params \"$DATA_ROOT\"/replay \"$DATA_ROOT\"/reports/live \"$DATA_ROOT\"/sessions; export ARB_DATA_DIR=\"$DATA_ROOT\" ARB_REPORTS_DIR=\"$DATA_ROOT/reports\" ARB_REPORTS_LIVE_DIR=\"$DATA_ROOT/reports/live\" ARB_LIVE_DIR=\"$DATA_ROOT/live\" ARB_FEATURES_DIR=\"$DATA_ROOT/features\" ARB_PARAMS_DIR=\"$DATA_ROOT/params\" ARB_REPLAY_DIR=\"$DATA_ROOT/replay\" ARB_ML_DIR=\"$DATA_ROOT/ml\"; RUNTIME_LOG=\"$DATA_ROOT/reports/live/${TS}.runtime.log\"; echo \"[live:jito] logging to $RUNTIME_LOG\"; SHADOW_TRADING=${SHADOW_TRADING:-0} LIVE_TRADING=${LIVE_TRADING:-1} SUBMIT_MODE=jito stdbuf -oL -eL pnpm dev:all 2>&1 | tee -a \"$RUNTIME_LOG\"; EXIT=$?; pnpm report:live:live || true; pnpm -C services/arb-mm daily:if-needed || true; exit $EXIT'",
     "//prod": "──────────── Prod-style runners ────────────",
     "start:all": "dotenv -e .env -- env FORCE_COLOR=1 concurrently -k --raw -n PHOENIX,AMMS,ARB -c auto \"bash -lc 'pnpm -C packages/phoenix start || true'\" \"bash -lc 'pnpm -C packages/amms start || true'\" \"bash -lc 'pnpm -C services/arb-mm start || true'\"",
     "start:phoenix": "dotenv -e .env -- env FORCE_COLOR=1 pnpm -C packages/phoenix start",
@@ -77,7 +76,7 @@
     "//bootstrap": "──────────── Environment bootstrap (Corepack + PNPM) ────────────",
     "bootstrap": "bash -lc 'set -e; corepack enable >/dev/null 2>&1 || true; corepack prepare pnpm@10.15.0 --activate'",
     "//native": "──────────── Force native bigint-buffer rebuild ────────────",
-    "rebuild:bigint": "bash -lc 'set -e; export npm_config_build_from_source=1; MOD=\"node_modules/.pnpm/bigint-buffer@1.1.5/node_modules/bigint-buffer\"; if [ -d \"$MOD\" ]; then echo \"[rebuild:bigint] Rebuilding bigint-buffer native addon\"; cd \"$MOD\" && pnpm dlx node-gyp configure build; else echo \"[rebuild:bigint] bigint-buffer not found; skipping\"; fi'",
+    "rebuild:bigint": "bash -lc 'set -e; export npm_config_build_from_source=1; MOD=\"node_modules/.pnpm/bigint-buffer@1.1.5/node_modules/bigint-buffer\"; if ( -d \"$MOD\" ]; then echo \"[rebuild:bigint] Rebuilding bigint-buffer native addon\"; cd \"$MOD\" && pnpm dlx node-gyp configure build; else echo \"[rebuild:bigint] bigint-buffer not found; skipping\"; fi'",
     "postinstall": "bash -lc 'set -e; export npm_config_build_from_source=1; MOD=\"node_modules/.pnpm/bigint-buffer@1.1.5/node_modules/bigint-buffer\"; if [ -d \"$MOD\" ]; then echo \"[postinstall] Rebuilding bigint-buffer native addon\"; cd \"$MOD\" && pnpm dlx node-gyp configure build; else echo \"[postinstall] bigint-buffer not found; skipping\"; fi'"
   },
   "simple-git-hooks": {
@@ -96,6 +95,7 @@
     "@solana/spl-token": "^0.4.13",
     "@solana/web3.js": "^1.98.4",
     "bn.js": "^5.2.2",
+    "dotenv": "^17.2.1",
     "node-fetch": "^3.3.2",
     "stream-chain": "^3.4.0",
     "stream-json": "^1.9.1"

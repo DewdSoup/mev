@@ -9,36 +9,34 @@ import { Connection, PublicKey, clusterApiUrl } from "@solana/web3.js";
 // @ts-ignore
 import { Liquidity, MAINNET_PROGRAM_ID } from "@raydium-io/raydium-sdk";
 
-function env(k: string, d?: string) {
+function envs(k: string, d: string): string {
   const v = process.env[k];
   return v && v.length ? v : d;
 }
 
 async function main() {
-  const RPC_URL = env("RPC_URL", clusterApiUrl("mainnet-beta"));
+  const RPC_URL = envs("RPC_URL", clusterApiUrl("mainnet-beta"));
   const POOL_ID = new PublicKey(
-    env("RAYDIUM_POOL_ID", "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2")
+    envs("RAYDIUM_POOL_ID", "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2")
   );
 
   const connection = new Connection(RPC_URL, "confirmed");
 
-  // Older SDKs: use a legacy helper; we fallback across known names.
+  // Older SDKs: feature-detect helpers and fall back.
   const liq: any = Liquidity;
 
   let poolKeys: any | null = null;
   if (typeof liq.fetchPoolKeys === "function") {
     poolKeys = await liq.fetchPoolKeys({ connection, id: POOL_ID });
-  } else if (typeof liq.getAssociatedPoolKeysV4 === "function") {
-    // This path needs many params; we avoid it if fetchPoolKeys exists.
-    throw new Error(
-      "Your SDK lacks fetchPoolKeys(). Please update SDK or provide a JSON of pool keys."
-    );
+  } else if (typeof liq.fetchAllPoolKeys === "function") {
+    const all = (await liq.fetchAllPoolKeys(connection)) as any[];
+    poolKeys = all.find((p) => (p?.id as PublicKey)?.equals?.(POOL_ID)) ?? null;
   } else {
     throw new Error("No compatible Liquidity pool-keys function found.");
   }
 
   if (!poolKeys) {
-    throw new Error("Failed to fetch pool keys");
+    throw new Error(`Failed to fetch pool keys for ${POOL_ID.toBase58()}`);
   }
 
   const outDir = path.resolve(process.cwd(), "configs");

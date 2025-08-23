@@ -8,24 +8,31 @@ import {
 } from "@solana/web3.js";
 import { buildRaydiumCpmmSwapIx } from "./executor/buildRaydiumCpmmIx.js";
 
+const WSOL_MINT = new PublicKey(process.env.WSOL_MINT!);
+const USDC_MINT = new PublicKey(process.env.USDC_MINT!);
+const RAYDIUM_POOL_ID = new PublicKey(process.env.RAYDIUM_POOL_ID!);
+
 export type SimIn = {
   user: PublicKey;
-  baseIn: boolean;           // true SOL->USDC, false USDC->SOL
+  baseIn: boolean;           // true: SOL->USDC, false: USDC->SOL
   amountInAtoms: bigint;     // atoms of *input* mint
-  slippageBps: number;
+  slippageBps: number;       // used to shape minOut if you want, we’ll keep 1 atom for sim
 };
 
-export async function simRaydiumFixedInTx(
-  conn: Connection,
-  p: SimIn
-) {
-  const build = await buildRaydiumCpmmSwapIx({
-    user: p.user,
-    baseIn: p.baseIn,
-    amountInBase: p.amountInAtoms,
-    slippageBps: p.slippageBps,
+export async function simRaydiumFixedInTx(conn: Connection, p: SimIn) {
+  const inMint = p.baseIn ? WSOL_MINT : USDC_MINT;
+  const outMint = p.baseIn ? USDC_MINT : WSOL_MINT;
+
+  // For simulation we don’t want minOut to block the path; use 1 atom.
+  const ixs = await buildRaydiumCpmmSwapIx({
+    connection: conn,
+    owner: p.user,
+    poolId: RAYDIUM_POOL_ID,
+    inMint,
+    outMint,
+    amountIn: p.amountInAtoms,
+    amountOutMin: 1n,
   });
-  if (!build.ok) return { ok: false as const, reason: build.reason };
 
   const { blockhash } = await conn.getLatestBlockhash("processed");
   const msg = new TransactionMessage({
@@ -33,7 +40,7 @@ export async function simRaydiumFixedInTx(
     recentBlockhash: blockhash,
     instructions: [
       ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
-      ...build.ixs,
+      ...ixs,
     ],
   }).compileToV0Message();
 
@@ -58,7 +65,6 @@ export async function simRaydiumFixedInTx(
 
 // Normalize whatever main.ts passes into a SimIn
 function normalizeInput(input: any): SimIn {
-  // If input already looks like SimIn, return it
   if (input && input.user && typeof input.baseIn === "boolean" && input.amountInAtoms != null) {
     return {
       user: input.user as PublicKey,
@@ -67,32 +73,18 @@ function normalizeInput(input: any): SimIn {
       slippageBps: Number(input.slippageBps ?? 50),
     };
   }
-
-  // Else, derive from edge/exec-style payload
   const user: PublicKey = input?.user ?? input?.payer ?? input?.owner;
   const path: string = input?.path ?? "";
-  const baseIn = path === "PHX->AMM"; // baseIn true => SOL input
-  const px = input?.sell_px ?? input?.buy_px ?? input?.phoenix?.limit_px ?? 0;
-
-  // amountInAtoms is atoms of *input* mint
+  const baseIn = path === "PHX->AMM";
+  const px = Number(input?.sell_px ?? input?.buy_px ?? input?.phoenix?.limit_px ?? 0);
   const size_base = Number(input?.size_base ?? 0);
   const amountInAtoms = baseIn
     ? BigInt(Math.round(size_base * 1e9))       // SOL atoms
     : BigInt(Math.round(size_base * px * 1e6)); // USDC atoms
-
-  return {
-    user,
-    baseIn,
-    amountInAtoms,
-    slippageBps: Number(input?.slippageBps ?? 50),
-  };
+  return { user, baseIn, amountInAtoms, slippageBps: Number(input?.slippageBps ?? 50) };
 }
 
-/**
- * Back-compat factory used by src/main.ts.
- * - Accepts (conn) or (conn, opts) to satisfy "Expected 1 arg" sites.
- * - Returns a callable (input)=>Promise<...>, with a .simRaydiumFixedInTx method too.
- */
+/** Back-compat factory used by main.ts. */
 export function makeRpcSim(conn: Connection, _opts?: any) {
   const fn = (input: any) => simRaydiumFixedInTx(conn, normalizeInput(input));
   (fn as any).simRaydiumFixedInTx = (p: SimIn) => simRaydiumFixedInTx(conn, p);

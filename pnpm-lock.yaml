@@ -29,6 +29,9 @@ importers:
       bn.js:
         specifier: ^5.2.2
         version: 5.2.2
+      dotenv:
+        specifier: ^17.2.1
+        version: 17.2.1
       node-fetch:
         specifier: ^3.3.2
         version: 3.3.2

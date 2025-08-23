@@ -28,7 +28,7 @@ function ensureOut(ts: number) {
   if (day === curDay && out) return;
   try {
     if (out) out.end();
-  } catch {}
+  } catch { }
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const file = path.join(OUT_DIR, `events-${day}.jsonl`);
   out = fs.createWriteStream(file, { flags: "a" });
@@ -54,21 +54,21 @@ const INTERESTING = new Set([
 let pos = 0;
 let buf = "";
 
-function flatten(x: any, pfx = "", out: any = {}) {
+function flatten(x: any, pfx = "", outObj: any = {}) {
   if (x && typeof x === "object" && !Array.isArray(x)) {
     for (const [k, v] of Object.entries(x)) {
       const nk = pfx ? `${pfx}_${k}` : k;
-      flatten(v, nk, out);
+      flatten(v, nk, outObj);
     }
   } else {
-    out[pfx || "value"] = x;
+    outObj[pfx || "value"] = x;
   }
-  return out;
+  return outObj;
 }
 
 function processChunk(chunk: string) {
   buf += chunk;
-  for (;;) {
+  for (; ;) {
     const i = buf.indexOf("\n");
     if (i < 0) break;
     const line = buf.slice(0, i).trim();
@@ -99,8 +99,14 @@ function tick() {
     const st = fs.statSync(SRC);
     if (st.size < pos) pos = 0; // rotated
     if (st.size > pos) {
-      const rs = fs.createReadStream(SRC, { start: pos, end: st.size, encoding: "utf8" });
-      rs.on("data", processChunk);
+      const rs = fs.createReadStream(SRC, {
+        start: pos,
+        end: st.size,
+        encoding: "utf8",
+      });
+      rs.on("data", (chunk: string | Buffer) =>
+        processChunk(typeof chunk === "string" ? chunk : chunk.toString("utf8"))
+      );
       rs.on("end", () => {
         pos = st.size;
         setTimeout(tick, 250);

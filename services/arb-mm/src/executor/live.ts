@@ -1,375 +1,151 @@
-// services/arb-mm/src/executor/live.ts
-// Live executor with guards, optional sim gate, and ATOMIC two-leg PHX+Raydium wiring (single v0 tx).
-// NOTE: amountInAtoms is atoms of the *input* mint: SOL(9) if baseIn, USDC(6) if !baseIn.
-
 import {
   Connection,
   ComputeBudgetProgram,
   VersionedTransaction,
   TransactionMessage,
   PublicKey,
+  SystemProgram,
+  TransactionInstruction,
+  Keypair,
+  SendOptions,
+  Commitment,
 } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { logger } from "../ml_logger.js";
-import { AccountsCtx } from "../accounts.js";
-import {
-  guardCheck,
-  noteConsecutiveResult,
-  noteError,
-  killSwitchActive,
-} from "../risk.js";
-import { buildRaydiumCpmmSwapIx } from "./buildRaydiumCpmmIx.js";
-import { preflight } from "./preflight.js";
-import { emitMl } from "../feature_sink.js";
-import { loadConfig, type AppConfig } from "../config.js";
-import { computeTipLamports as computeDynTip } from "./dynamic_tip.js";
-import { simulateRaydiumSwapFixedIn } from "./sim.js";
+import { buildRaydiumSwapIx } from "../util/raydium.js";
 import { buildPhoenixSwapIxs } from "../util/phoenix.js";
 
-export type ExecPath = "PHX->AMM" | "AMM->PHX";
+const WSOL_MINT = new PublicKey(process.env.WSOL_MINT!);
+const USDC_MINT = new PublicKey(process.env.USDC_MINT!);
 
-export type ExecPayload = {
-  path: ExecPath;
-  size_base: number; // base units (SOL) for sizing
-  buy_px?: number;   // quote/base
-  sell_px?: number;  // quote/base
-  notional_quote: number;
-  phoenix: {
-    market: string;
-    side: "buy" | "sell";
-    limit_px: number;
-  };
-};
+const SLIPPAGE_BPS = Number(process.env.MAX_SLIPPAGE_BPS || "50"); // fallback 50 bps
+const ATOMIC_MODE = process.env.ATOMIC_MODE || "single_tx";
+const DEFAULT_CU_LIMIT = Number(process.env.SUBMIT_CU_LIMIT || "800000");
+const DEFAULT_TIP_LAMPORTS = Number(process.env.SUBMIT_TIP_LAMPORTS || "0");
+const CONFIRM_LEVEL: Commitment =
+  (process.env.TX_CONFIRM_LEVEL as Commitment) || "confirmed";
 
-function envBool(k: string, d = false) {
-  const v = String(process.env[k] ?? (d ? "1" : "0")).toLowerCase();
-  return v === "1" || v === "true" || v === "yes";
+function uiToAtoms(ui: number, decimals: number): bigint {
+  return BigInt(Math.floor(ui * 10 ** decimals));
 }
 
-const USE_RAYDIUM_SWAP_SIM = envBool("USE_RAYDIUM_SWAP_SIM", false);
+export type AtomicPath = "PHX->AMM" | "AMM->PHX";
 
 export class LiveExecutor {
-  private live = envBool("LIVE_TRADING", false);
-  private cuLimit = Number(process.env.SUBMIT_CU_LIMIT ?? 400_000);
-  private submitMode = String(process.env.SUBMIT_MODE ?? "rpc");
-  private useRpcSim = envBool("USE_RPC_SIM", false);
-  private phxReady = true;
-  private cfg: AppConfig;
-
-  constructor(private conn: Connection, private a: AccountsCtx, cfg?: AppConfig) {
-    this.cfg = cfg ?? loadConfig();
-  }
+  constructor(
+    private conn: Connection,
+    private payer: Keypair,
+    private sendOpts: SendOptions = { skipPreflight: false, preflightCommitment: "processed" }
+  ) { }
 
   async startPhoenix(): Promise<void> {
-    this.phxReady = true;
-    logger.log("phoenix_exec_ready", { single_leg: false, atomic_ready: true });
+    /* no-op for compatibility */
   }
 
-  private resolvePayerPk(): PublicKey {
-    const anyA: any = this.a as any;
-    return anyA.signer?.publicKey || anyA.wallet?.publicKey || this.a.owner;
-  }
-
-  private async signTx(tx: VersionedTransaction) {
-    const anyA: any = this.a as any;
+  async maybeExecute(payload: any): Promise<void> {
     try {
-      if (typeof anyA.sign === "function") return void (await anyA.sign(tx));
-      if (anyA.signer?.secretKey) return void tx.sign([anyA.signer]);
-      if (anyA.wallet?.signTransaction) {
-        const signed = await anyA.wallet.signTransaction(tx);
-        tx.signatures = signed.signatures;
-      }
-    } catch (e) {
-      logger.log("sign_warn", { error: String(e) });
-    }
-  }
+      const path = (payload?.path as AtomicPath) || "PHX->AMM";
+      const sizeBase = Number(payload?.size_base ?? payload?.trade_size_base ?? 0);
+      const phoenix = payload?.phoenix || {};
+      const market = new PublicKey(phoenix.market);
 
-  private computeBudgetIxs(units: number) {
-    const estUnits = Math.max(50_000, units | 0);
-    const lamports = computeDynTip(this.cfg, estUnits);
-    const microLamports =
-      lamports > 0 ? Math.floor((lamports * 1_000_000) / estUnits) : 0;
-
-    const ixs = [ComputeBudgetProgram.setComputeUnitLimit({ units: estUnits })];
-    if (microLamports > 0) {
-      ixs.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports }));
-    }
-
-    logger.log("tip_calc", {
-      tip_mode: this.cfg.TIP_MODE,
-      cu_limit: estUnits,
-      tip_lamports: lamports || undefined,
-      micro_lamports_per_cu: microLamports || undefined,
-    });
-
-    return { ixs, lamports };
-  }
-
-  async maybeExecute(exec: ExecPayload) {
-    const ATOMIC_MODE = String(process.env.ATOMIC_MODE ?? "none").toLowerCase();
-
-    if (killSwitchActive())
-      return void logger.log("guard_violation", { type: "kill_switch_active" });
-
-    // Guard checks
-    const g = guardCheck({
-      pathId: exec.path,
-      notionalQuote: exec.notional_quote,
-      currentTps: undefined,
-    });
-    if (!g.ok)
-      return void logger.log("guard_violation", {
-        type: g.reason,
-        value: g.value,
-        limit: g.limit,
-      });
-
-    const payerPk = this.resolvePayerPk();
-
-    // Preflight: balances & ATAs
-    try {
-      const pf = await preflight(this.conn, this.cfg, payerPk);
-      if (!pf.ok) {
-        logger.log("needs_funding", {
-          reasons: pf.reasons,
-          lamports: pf.lamports,
-          usdcAta: pf.usdcAta?.toBase58(),
-          wsolAta: pf.wsolAta?.toBase58(),
-        });
-        return;
-      }
-      logger.log("preflight_ok", {
-        lamports: pf.lamports,
-        usdcAta: pf.usdcAta?.toBase58(),
-        wsolAta: pf.wsolAta?.toBase58(),
-      });
-    } catch (e) {
-      logger.log("preflight_error", { error: String(e) });
-      return;
-    }
-
-    // Amount-in atoms for Raydium leg (input mint units)
-    const baseInForAmm = exec.path === "PHX->AMM"; // sell base to AMM; buy on PHX first
-    const px = exec.sell_px ?? exec.buy_px ?? exec.phoenix.limit_px ?? 0;
-    const amountInAtomsForAmm = baseInForAmm
-      ? BigInt(Math.round(exec.size_base * 1e9)) // BASE atoms
-      : BigInt(Math.round(exec.size_base * px * 1e6)); // QUOTE atoms
-
-    // ── RPC sim gate (SOFT) — Raydium leg only ──
-    if (this.useRpcSim && USE_RAYDIUM_SWAP_SIM) {
-      try {
-        const sim = await simulateRaydiumSwapFixedIn(this.conn, {
-          user: payerPk,
-          baseIn: baseInForAmm,
-          amountInBase: amountInAtomsForAmm,
-          slippageBps: 50,
-        });
-        const mode = (sim as any)?.mode ?? "unknown";
-        const ok = String(mode).endsWith("success");
-        logger.log("rpc_sim", {
-          ok,
-          mode,
-          rpc_units: (sim as any)?.rpc_units,
-          rpc_sim_ms: (sim as any)?.rpc_sim_ms,
-          logs_tail: (sim as any)?.logs_tail,
-          path: exec.path,
-          size_base: exec.size_base,
-        });
-        if (!ok) return; // soft block
-      } catch (e) {
-        logger.log("rpc_sim", {
-          ok: false,
-          mode: "cpmm-sim-error",
-          reason: String((e as any)?.message ?? e),
-          path: exec.path,
-          size_base: exec.size_base,
-        });
-        return; // soft block
-      }
-    }
-
-    // Build legs
-    let tx: VersionedTransaction | undefined;
-
-    try {
-      // Always build Raydium leg
-      const ray = await buildRaydiumCpmmSwapIx({
-        user: payerPk,
-        baseIn: baseInForAmm,
-        amountInBase: amountInAtomsForAmm,
-        slippageBps: 50,
-      });
-      if (!ray.ok) {
-        noteError();
-        logger.log("submit_error", { where: "raydium_build", error: ray.reason });
-        emitMl("error", { where: "raydium_build", error: ray.reason });
-        return;
-      }
-
-      // Optionally build Phoenix leg for atomic mode
-      const phxIxs: any[] = [];
-      if (ATOMIC_MODE === "single_tx") {
-        const side = exec.phoenix.side === "buy" ? "bid" : "ask";
-        // inAmount: quote if bid (USDC), base if ask (SOL)
-        const phxSlipBps = Number(this.cfg.PHOENIX_SLIPPAGE_BPS ?? 0);
-        const inAmount =
-          side === "bid"
-            ? exec.size_base * exec.phoenix.limit_px * (1 + phxSlipBps / 10_000)
-            : exec.size_base;
-
-        const phx = await buildPhoenixSwapIxs({
-          connection: this.conn,
-          market: exec.phoenix.market,
-          trader: payerPk,
-          side: side as "bid" | "ask",
-          inAmount,
-        });
-        if (!phx.ok) {
-          noteError();
-          logger.log("submit_error", { where: "phoenix_build", error: phx.reason });
-          emitMl("error", { where: "phoenix_build", error: phx.reason });
+      // 1) Build Phoenix leg if missing
+      let phxIxs: TransactionInstruction[] = Array.isArray(payload?.phxIxs) ? payload.phxIxs : [];
+      if (!phxIxs.length) {
+        try {
+          const limitPx = Number(phoenix.limit_px ?? phoenix.limitPx ?? (payload?.sell_px ?? payload?.buy_px));
+          const built: any = await buildPhoenixSwapIxs({
+            connection: this.conn,
+            owner: this.payer.publicKey,
+            market,
+            side: phoenix.side,            // "buy" or "sell"
+            sizeBase: sizeBase,
+            limitPx: limitPx,
+            slippageBps: Number(process.env.PHOENIX_SLIPPAGE_BPS ?? "3"),
+          } as any);
+          phxIxs = built?.ixs ?? built ?? [];
+        } catch (e: any) {
+          logger.log("submit_error", { where: "phoenix_build", error: String(e?.message ?? e) });
           return;
         }
-        phxIxs.push(...phx.ixs);
       }
 
-      const { blockhash } = await this.conn.getLatestBlockhash("processed");
-      const { ixs: budgetIxs, lamports: tipLamports } = this.computeBudgetIxs(this.cuLimit);
+      // 2) Build Raydium leg (we compute minOut on-chain; no eff px required)
+      const baseIn =
+        path === "PHX->AMM"
+          ? true   // buy on PHX → sell BASE on AMM
+          : false; // buy BASE on AMM → sell on PHX
 
-      // Instruction order for atomic execution:
-      //  PHX->AMM : [CU] + PHX (buy base)  → Raydium (sell base for quote)
-      //  AMM->PHX : [CU] + Raydium (buy base) → PHX (sell base for quote)
-      const ixs =
-        ATOMIC_MODE === "single_tx"
-          ? (exec.path === "PHX->AMM"
-              ? [...budgetIxs, ...phxIxs, ...ray.ixs]
-              : [...budgetIxs, ...ray.ixs, ...phxIxs])
-          : [...budgetIxs, ...ray.ixs];
+      let amountInAtoms: bigint;
+      if (baseIn) {
+        amountInAtoms = uiToAtoms(sizeBase, 9); // BASE in
+      } else {
+        // QUOTE in — estimate from limit/side; minOut protects us
+        const px = Number(phoenix.limit_px ?? phoenix.limitPx ?? payload?.buy_px ?? payload?.sell_px ?? 0);
+        const quoteInUi = Math.max(0, sizeBase * (px || 0));
+        amountInAtoms = uiToAtoms(quoteInUi, 6);
+      }
 
-      const skipPreflight = this.useRpcSim && USE_RAYDIUM_SWAP_SIM;
-
-      logger.log("submitted_tx", {
-        path: exec.path,
-        atomic_mode: ATOMIC_MODE,
-        size_base: exec.size_base,
-        buy_px: exec.buy_px,
-        sell_px: exec.sell_px,
-        ix_count: ixs.length,
-        cu_limit: this.cuLimit,
-        tip_lamports: tipLamports || 0,
-        live: this.live,
-        mode: this.submitMode,
-        skip_preflight: skipPreflight,
+      const ray = await buildRaydiumSwapIx({
+        user: this.payer.publicKey,
+        baseIn,
+        amountInBase: amountInAtoms,
+        slippageBps: SLIPPAGE_BPS,
       });
-      emitMl("submit", {
-        path: exec.path,
-        atomic_mode: ATOMIC_MODE,
-        size_base: exec.size_base,
-        buy_px: exec.buy_px,
-        sell_px: exec.sell_px,
-        notional_quote: exec.notional_quote,
-        cu_limit: this.cuLimit,
-        submit_mode: this.submitMode,
-      });
+      if (!ray.ok) {
+        logger.log("submit_error", { where: "raydium_build", error: ray.reason });
+        return;
+      }
+      const rayIxs = ray.ixs;
 
+      // 3) Pre-instructions
+      const preIxs: (TransactionInstruction | undefined)[] = [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: Number(process.env.SUBMIT_CU_LIMIT ?? DEFAULT_CU_LIMIT) }),
+        DEFAULT_TIP_LAMPORTS > 0
+          ? SystemProgram.transfer({ fromPubkey: this.payer.publicKey, toPubkey: this.payer.publicKey, lamports: DEFAULT_TIP_LAMPORTS })
+          : undefined,
+      ];
+
+      const ordered: (TransactionInstruction | undefined)[] =
+        path === "PHX->AMM"
+          ? [...preIxs, ...phxIxs, ...rayIxs]
+          : [...preIxs, ...rayIxs, ...phxIxs];
+
+      const ixs = ordered.filter(Boolean) as TransactionInstruction[];
+      const latest = await this.conn.getLatestBlockhash("finalized");
       const msg = new TransactionMessage({
-        payerKey: payerPk,
-        recentBlockhash: blockhash,
+        payerKey: this.payer.publicKey,
+        recentBlockhash: latest.blockhash,
         instructions: ixs,
       }).compileToV0Message();
 
-      tx = new VersionedTransaction(msg);
-      await this.signTx(tx);
+      const tx = new VersionedTransaction(msg);
+      tx.sign([this.payer]); // ensure the transaction is signed
 
-      let sig: string | null = null;
+      logger.log("tx_built", {
+        path,
+        trade_size_base: sizeBase,
+        atomic_mode: ATOMIC_MODE,
+        cu_limit: Number(process.env.SUBMIT_CU_LIMIT ?? DEFAULT_CU_LIMIT),
+        tip_lamports: DEFAULT_TIP_LAMPORTS,
+      });
 
-      if (this.submitMode.toLowerCase() === "jito") {
-        try {
-          const { sendViaJito } = await import("../submit/jito.js");
-          const res = await sendViaJito([tx], payerPk);
-          if (res?.ok) {
-            sig = res.signature ?? null;
-            logger.log("jito_bundle_ok", {
-              bundle: res.bundleId,
-              signature: sig || undefined,
-            });
-          } else {
-            logger.log("jito_bundle_fallback_rpc", { error: res?.error || "unknown" });
-          }
-        } catch (e) {
-          logger.log("jito_unavailable", { error: String(e) });
-        }
-      }
+      const sig = await this.conn.sendTransaction(tx, this.sendOpts);
+      logger.log("submitted_tx", { signature: sig, path, atomic_mode: ATOMIC_MODE });
 
-      if (!sig)
-        sig = await this.conn.sendTransaction(tx, {
-          skipPreflight,
-          maxRetries: 3,
-        });
-
-      const t0 = Date.now();
-      const confCtx = await this.conn.getLatestBlockhash("processed");
       const conf = await this.conn.confirmTransaction(
-        { signature: sig!, ...confCtx },
-        "processed"
+        { signature: sig, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight },
+        CONFIRM_LEVEL
       );
-      const confMs = Date.now() - t0;
-
-      if (conf?.value?.err) {
-        noteConsecutiveResult(exec.path, false);
-        noteError();
-        logger.log("land_error", { sig, err: JSON.stringify(conf.value.err) });
-        emitMl("error", { where: "land", sig, err: conf.value.err });
-      } else {
-        let unitsConsumed: number | undefined;
-        let feeLamports: number | undefined;
-        try {
-          const txd = await this.conn.getTransaction(sig!, {
-            commitment: "confirmed",
-            maxSupportedTransactionVersion: 0,
-          });
-          unitsConsumed = (txd?.meta as any)?.computeUnitsConsumed ?? undefined;
-          feeLamports = txd?.meta?.fee ?? undefined;
-        } catch {}
-
-        noteConsecutiveResult(exec.path, true);
-        logger.log("landed", {
-          sig,
-          slot: await this.conn.getSlot("processed"),
-          conf_ms: confMs,
-          fill_px: exec.phoenix.limit_px,
-          filled_base: exec.size_base,
-          filled_quote: Number((exec.size_base * (exec.sell_px ?? exec.buy_px ?? 0)).toFixed(6)),
-          compute_units: unitsConsumed,
-          fee_lamports: feeLamports,
-          tip_lamports: tipLamports || 0,
-        });
-        emitMl("fill", {
-          sig,
-          path: exec.path,
-          atomic_mode: ATOMIC_MODE,
-          conf_ms: confMs,
-          compute_units: unitsConsumed,
-          fee_lamports: feeLamports,
-          tip_lamports: tipLamports || 0,
-          size_base: exec.size_base,
-          notional_quote: exec.notional_quote,
-        });
-      }
+      const ok = !conf?.value?.err;
+      logger.log("landed", {
+        signature: sig,
+        status: ok ? "ok" : "err",
+        err: conf?.value?.err || null,
+        commitment: CONFIRM_LEVEL,
+      });
     } catch (e: any) {
-      noteConsecutiveResult(exec.path, false);
-      noteError();
-      let logs: string[] | undefined = e?.logs || e?.data?.logs || e?.value?.logs;
-      if (!logs && tx) {
-        try {
-          const sim = await this.conn.simulateTransaction(tx, {
-            replaceRecentBlockhash: true,
-            sigVerify: true,
-          });
-          logs = sim?.value?.logs ?? undefined;
-        } catch {}
-      }
-      logger.log("land_error", { error: String(e?.message ?? e), logs });
-      emitMl("error", { where: "send", error: String(e?.message ?? e), logs });
+      logger.log("submit_error", { where: "maybe_execute", error: String(e?.message ?? e) });
     }
   }
 }

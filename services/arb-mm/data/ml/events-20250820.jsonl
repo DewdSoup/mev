@@ -1,9 +1,0 @@
-{"ts":1755659528778,"kind":"submit","path":"PHX->AMM","size_base":0.001,"buy_px":180.681553,"sell_px":180.812412,"notional_quote":0.180747,"cu_limit":400000,"submit_mode":"rpc"}
-{"ts":1755659529137,"kind":"error","where":"send","error":"Simulation failed. \nMessage: Transaction signature verification failure. \n\nCatch the `SendTransactionError` and call `getLogs()` on it for full details."}
-{"ts":1755659530116,"kind":"submit","path":"PHX->AMM","size_base":0.001,"buy_px":180.746168,"sell_px":180.812412,"notional_quote":0.180779,"cu_limit":400000,"submit_mode":"rpc"}
-{"ts":1755659530435,"kind":"error","where":"send","error":"Simulation failed. \nMessage: Transaction signature verification failure. \n\nCatch the `SendTransactionError` and call `getLogs()` on it for full details."}
-{"ts":1755661026977,"kind":"submit","path":"AMM->PHX","size_base":0.001,"buy_px":180.956727,"sell_px":181.179969,"notional_quote":0.181068,"cu_limit":600000,"submit_mode":"rpc"}
-{"ts":1755661027262,"kind":"error","where":"send","error":"Simulation failed. \nMessage: Transaction signature verification failure. \n\nCatch the `SendTransactionError` and call `getLogs()` on it for full details."}
-{"ts":1755672320846,"kind":"error","where":"raydium_build","error":"raydium_swap_build_error: Missing configs/raydium.pool.json. Create it before running live."}
-{"ts":1755675456613,"kind":"error","where":"raydium_build","error":"raydium_swap_ix_build_failed: raydium_swap_build_error: Missing configs/raydium.pool.json. Create it before running live."}
-{"ts":1755675460661,"kind":"error","where":"raydium_build","error":"raydium_swap_ix_build_failed: raydium_swap_build_error: Missing configs/raydium.pool.json. Create it before running live."}

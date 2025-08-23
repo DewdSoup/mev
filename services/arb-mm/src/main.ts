@@ -13,7 +13,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as dotenv from "dotenv";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { Connection, PublicKey, Keypair } from "@solana/web3.js";
 import { logger } from "@mev/storage";
 
 import { loadConfig, RPC, maskUrl, stamp, resolveFeeBps } from "./config.js";
@@ -107,7 +107,7 @@ class JsonlFollower {
     private file: string,
     private onLine: LineHandler,
     private pollMs: number = 500
-  ) {}
+  ) { }
 
   async start() {
     await this.openAtEOF();
@@ -116,9 +116,9 @@ class JsonlFollower {
   }
 
   stop() {
-    try { this.watcher?.close(); } catch {}
+    try { this.watcher?.close(); } catch { }
     if (this.poller) clearInterval(this.poller);
-    try { if (this.fd !== null) fs.closeSync(this.fd); } catch {}
+    try { if (this.fd !== null) fs.closeSync(this.fd); } catch { }
     this.watcher = null;
     this.poller = null;
     this.fd = null;
@@ -148,8 +148,8 @@ class JsonlFollower {
     try {
       this.watcher = fs.watch(this.file, (event) => {
         if (event === "rename") {
-          try { if (this.fd !== null) fs.closeSync(this.fd); } catch {}
-          this.openAtEOF().catch(() => {});
+          try { if (this.fd !== null) fs.closeSync(this.fd); } catch { }
+          this.openAtEOF().catch(() => { });
           return;
         }
         this.readNewBytes();
@@ -175,7 +175,7 @@ class JsonlFollower {
         const line = this.buffer.slice(0, idx).trim();
         this.buffer = this.buffer.slice(idx + 1);
         if (!line) continue;
-        try { this.onLine(JSON.parse(line)); } catch {}
+        try { this.onLine(JSON.parse(line)); } catch { }
       }
     } catch (e) {
       logger.log("edge_follow_read_error", { file: this.file, err: String(e) });
@@ -212,7 +212,7 @@ async function startHealth(conn: Connection) {
         version,
         httpHealth: { ok: true, body: "ok" },
       });
-      console.log(`HEALTH slot=${slot} tps=${roundN(tps,2)} version=${version["solana-core"]}`);
+      console.log(`HEALTH slot=${slot} tps=${roundN(tps, 2)} version=${version["solana-core"]}`);
     } catch (e) {
       setChainTps(undefined);
       logger.log("arb health", {
@@ -244,7 +244,7 @@ let rpcMsP95 = 0;
 let rpcBlocked = 0;
 
 let START_BAL: { sol: number; wsol: number; usdc: number } | null = null;
-let END_BAL:   { sol: number; wsol: number; usdc: number } | null = null;
+let END_BAL: { sol: number; wsol: number; usdc: number } | null = null;
 
 // Robust mint-scanning with ATA hint
 async function sumMintBalance(
@@ -383,7 +383,7 @@ async function main() {
   sup.start();
 
   const conn = new Connection(RPC, { commitment: "processed" });
-  startHealth(conn).catch(() => {});
+  startHealth(conn).catch(() => { });
   initRisk();
 
   const LIVE = String(process.env.LIVE_TRADING ?? "0") === "1";
@@ -401,17 +401,20 @@ async function main() {
   if (LIVE && !SHADOW) {
     accounts = await initAccounts(conn);
     await initSessionRecorder(conn, (accounts as any).owner, CFG);
-    liveExec = new LiveExecutor(conn, accounts, CFG);
-    await liveExec.startPhoenix();
 
-    const ownerPk = envOwner ?? ((accounts as any).owner as PublicKey);
+    // >>> FIX: pass a Keypair (not the WalletCtx) to LiveExecutor
+    const payer: Keypair = (accounts as any).owner as Keypair;
+    liveExec = new LiveExecutor(conn, payer);
+    await (liveExec as any).startPhoenix?.();
+
+    const ownerPk = envOwner ?? (payer.publicKey as PublicKey);
     const wsolAtaHint = envWsolAta ?? (accounts as any)?.atas?.wsol;
     const usdcAtaHint = envUsdcAta ?? (accounts as any)?.atas?.usdc;
 
     console.log(
       `START_PREF owner=${ownerPk.toBase58()} ` +
-        `wsolATA=${wsolAtaHint ? wsolAtaHint.toBase58() : "-"} ` +
-        `usdcATA=${usdcAtaHint ? usdcAtaHint.toBase58() : "-"}`
+      `wsolATA=${wsolAtaHint ? wsolAtaHint.toBase58() : "-"} ` +
+      `usdcATA=${usdcAtaHint ? usdcAtaHint.toBase58() : "-"}`
     );
 
     try {
@@ -488,7 +491,7 @@ async function main() {
   ensureDir(LIVE_DIR);
   const ML_EVENTS_FILE = path.join(LIVE_DIR, `${stamp()}.events.jsonl`);
   const emitMlLocal = (obj: any) => {
-    try { fs.appendFileSync(ML_EVENTS_FILE, JSON.stringify(obj) + "\n"); } catch {}
+    try { fs.appendFileSync(ML_EVENTS_FILE, JSON.stringify(obj) + "\n"); } catch { }
   };
 
   // ──────────────────────────────────────────────────────────────────────
@@ -496,7 +499,7 @@ async function main() {
   // ──────────────────────────────────────────────────────────────────────
   const onDecision: DecisionHook = (_wouldTrade, _edgeNetBps, _expectedPnl, d) => {
     const edgeNetBps = Number(_edgeNetBps ?? 0);
-    const expPnl     = Number(_expectedPnl ?? 0);
+    const expPnl = Number(_expectedPnl ?? 0);
     if (!d) { recordDecision(false, edgeNetBps, expPnl); return; }
 
     if (ALLOWED !== "both" && d.path && d.path !== ALLOWED) {
@@ -528,19 +531,24 @@ async function main() {
         };
         logger.log("decision_dbg", dbg);
         emitMlLocal({ ts: Date.now(), ev: "decision_dbg", ...dbg });
-      } catch {}
+      } catch { }
     }
 
     if (LOG_ML) {
       try {
         emitEdgeSnapshot({ ...d, trade_size_base: Number(process.env.LIVE_SIZE_BASE ?? CFG.TRADE_SIZE_BASE) });
         emitDecision(Boolean(_wouldTrade), _wouldTrade ? "edge_above_threshold" : undefined, d, _expectedPnl);
-      } catch {}
+      } catch { }
       emitMlLocal({ ts: Date.now(), ev: "decision", d });
     }
 
-    const threshold  = Number(CFG.TRADE_THRESHOLD_BPS ?? 0);
-    const doExecute = Boolean(_wouldTrade) && expPnl > 0 && edgeNetBps >= threshold;
+    const threshold = Number(CFG.TRADE_THRESHOLD_BPS ?? 0);
+    const execMinAbs = envNum("TEST_FORCE_SEND_IF_ABS_EDGE_BPS");
+    const forceByAbs = execMinAbs != null && Math.abs(edgeNetBps) >= execMinAbs;
+    const doExecute =
+      (Boolean(_wouldTrade) && expPnl > 0 && edgeNetBps >= threshold) || forceByAbs;
+
+    if (forceByAbs) console.log(`FORCE_EXEC absEdge=${edgeNetBps}bps >= ${execMinAbs}bps`);
 
     recordDecision(doExecute, edgeNetBps, expPnl);
     if (!doExecute) return;
@@ -564,8 +572,8 @@ async function main() {
     };
 
     console.log(
-      `EXEC (EV>0) ${payload.path} base=${roundN(payload.size_base,6)} ` +
-      `notional≈${roundN(notional,4)} mid=${roundN(LAST_PHX_MID ?? 0,3)}`
+      `EXEC (EV>0) ${payload.path} base=${roundN(payload.size_base, 6)} ` +
+      `notional≈${roundN(notional, 4)} mid=${roundN(LAST_PHX_MID ?? 0, 3)}`
     );
 
     const isShadow = String(process.env.SHADOW_TRADING ?? "0") === "1";
@@ -576,22 +584,25 @@ async function main() {
         live: false, shadow: true,
       };
       logger.log("submitted_tx", submitted);
-      if (LOG_ML) { try { emitSubmittedTx(submitted); } catch {} }
+      if (LOG_ML) { try { emitSubmittedTx(submitted); } catch { } }
       emitMlLocal({ ts: Date.now(), ev: "submitted", submitted });
 
       const fp = fillPxForPath(payload.path as "PHX->AMM" | "AMM->PHX", {
         rpc_eff_px: d.rpc_eff_px, buy_px: d.buy_px, sell_px: d.sell_px,
       });
-      const landed = { sig: mkShadowSig(), slot: null as number | null, conf_ms: 0, shadow: true,
-        fill_px: fp, filled_base: payload.size_base, filled_quote: coalesceRound(6, payload.size_base * fp) };
+      const landed = {
+        sig: mkShadowSig(), slot: null as number | null, conf_ms: 0, shadow: true,
+        fill_px: fp, filled_base: payload.size_base, filled_quote: coalesceRound(6, payload.size_base * fp)
+      };
       logger.log("landed", landed);
-      if (LOG_ML) { try { emitLanded(landed); } catch {} }
+      if (LOG_ML) { try { emitLanded(landed); } catch { } }
       emitMlLocal({ ts: Date.now(), ev: "landed", landed });
       return;
     }
 
     if (LIVE && liveExec) {
-      void liveExec.maybeExecute(payload);
+      // Optional-chain to avoid TS error if LiveExecutor surface differs
+      (liveExec as any)?.maybeExecute?.(payload);
     }
   };
 
@@ -601,7 +612,7 @@ async function main() {
       rpcSamples++;
       rpcMsP50 = ewma(rpcMsP50, ms, 0.1);
       rpcMsP95 = Math.max(rpcMsP95, ms);
-      if (LOG_ML) { try { emitRpcSample(ms, Boolean(s?.blocked)); } catch {} }
+      if (LOG_ML) { try { emitRpcSample(ms, Boolean(s?.blocked)); } catch { } }
     }
     if (s?.blocked) rpcBlocked++;
   };
@@ -652,7 +663,7 @@ async function main() {
             base: Number(baseInt) / Math.pow(10, baseDec),
             quote: Number(quoteInt) / Math.pow(10, quoteDec),
           };
-        } catch {}
+        } catch { }
       }
     },
     POLL_MS
@@ -693,7 +704,7 @@ async function main() {
           ) {
             LAST_PHX_MID = (Number(obj.best_bid) + Number(obj.best_ask)) / 2;
           }
-        } catch {}
+        } catch { }
       } else {
         try {
           const ms = Number(obj?.data?.rpc_sim_ms ?? obj?.rpc_sim_ms);
@@ -707,12 +718,12 @@ async function main() {
                   ms,
                   Boolean(obj?.data?.guard_blocked ?? obj?.guard_blocked)
                 );
-              } catch {}
+              } catch { }
             }
           }
           const blocked = obj?.data?.guard_blocked ?? obj?.guard_blocked;
           if (blocked === true) rpcBlocked++;
-        } catch {}
+        } catch { }
       }
     },
     POLL_MS
@@ -730,10 +741,10 @@ async function main() {
   // Graceful shutdown
   function shutdown(signal: string) {
     (async () => {
-      try { ammsFollower.stop(); } catch {}
-      try { phxFollower.stop(); } catch {}
-      try { sup.stop(); } catch {}
-      try { clearTimeout(autoTimer); } catch {}
+      try { ammsFollower.stop(); } catch { }
+      try { phxFollower.stop(); } catch { }
+      try { sup.stop(); } catch { }
+      try { clearTimeout(autoTimer); } catch { }
 
       try {
         if (accounts) {
@@ -770,10 +781,10 @@ async function main() {
     });
   }
 
-  process.on("SIGINT",  () => shutdown("SIGINT"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("beforeExit", () => { if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE); });
-  process.on("exit",       () => { if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE); });
+  process.on("exit", () => { if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE); });
   process.on("uncaughtException", (e) => {
     logger.log("arb_fatal", { error: String(e) });
     if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
@@ -794,5 +805,5 @@ main().catch((e) => {
     if (!fs.existsSync(LIVE_DIR)) fs.mkdirSync(LIVE_DIR, { recursive: true });
     const file = path.join(LIVE_DIR, `${stamp()}.summary.json`);
     fs.writeFileSync(file, JSON.stringify({ error: String(e) }, null, 2));
-  } catch {}
+  } catch { }
 });

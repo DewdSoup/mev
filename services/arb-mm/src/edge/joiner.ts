@@ -17,8 +17,8 @@ function nnum(x: any): number | undefined {
 function round(n: any, p = 6): number {
   const num =
     typeof n === "bigint" ? Number(n) :
-    typeof n === "string" ? Number(n) :
-    Number(n);
+      typeof n === "string" ? Number(n) :
+        Number(n);
   return Number.isFinite(num) ? Number(num.toFixed(p)) : Number.NaN;
 }
 
@@ -55,7 +55,7 @@ export interface JoinerParams {
   flatSlippageBps: number;
   tradeSizeBase: number;
   phoenixFeeBps: number;
-  ammFeeBps: number;
+  ammFeeBps: number;          // NOTE: EV will NOT subtract this when using CPMM eff px
   fixedTxCostQuote: number;
 }
 
@@ -91,8 +91,6 @@ export type DecisionHook = (
 
 export type RpcSampleHook = (sample: { ms: number; blocked: boolean }) => void;
 
-// NOTE: rpc_eff_px / rpc_price_impact_bps are optional — callers may
-// return timing-only objects and skip price gating.
 export type RpcSimFn = (input: {
   path: "AMM->PHX" | "PHX->AMM";
   sizeBase: number;
@@ -101,22 +99,21 @@ export type RpcSimFn = (input: {
   ammFeeBps: number;
 }) => Promise<
   | {
-      rpc_eff_px?: number;
-      rpc_price_impact_bps?: number;
-      rpc_sim_ms: number;
-      rpc_sim_mode: string;
-      rpc_sim_error?: string;
-      rpc_qty_out?: number;
-      rpc_units?: number;
-      prioritization_fee?: number;
-    }
+    rpc_eff_px?: number;
+    rpc_price_impact_bps?: number;
+    rpc_sim_ms: number;
+    rpc_sim_mode: string;
+    rpc_sim_error?: string;
+    rpc_qty_out?: number;
+    rpc_units?: number;
+    prioritization_fee?: number;
+  }
   | undefined
 >;
 
 export class EdgeJoiner {
   private amms?: Mid;
   private phxMid?: Mid;
-  // Extended book: include depth arrays when provided by the feed
   private phxBook: (PhoenixBook & {
     ts: number;
     book_method?: string;
@@ -140,7 +137,7 @@ export class EdgeJoiner {
     private onDecision: DecisionHook,
     private rpcSim?: RpcSimFn,
     private onRpcSample?: RpcSampleHook
-  ) {}
+  ) { }
 
   upsertAmms(raw: any) {
     const obj = raw?.data ?? raw;
@@ -159,7 +156,7 @@ export class EdgeJoiner {
           this.reserves = { base, quote, baseDecimals, quoteDecimals, ts: Date.now() };
         }
       }
-    } catch {}
+    } catch { }
     void this.maybeReport();
   }
 
@@ -307,22 +304,25 @@ export class EdgeJoiner {
     await this.decideAndLog(ammPx, bid, ask, (book as any).book_method, edgeForFeature);
   }
 
+  // CPMM buy: wantBase, input is USDC. Price per SOL returned (USDC/SOL), incl fee.
   private cpmmBuyQuotePerBase(xBase: number, yQuote: number, wantBase: number, feeBps: number) {
     if (!(xBase > 0 && yQuote > 0) || !(wantBase > 0)) return;
-    const fee = Math.max(0, feeBps) / 10_000;
+    const fee = Math.max(0, feeBps) / 10_000;     // input-side
     if (wantBase >= xBase * (1 - 1e-9)) return;
-    const dqPrime = (wantBase * yQuote) / (xBase - wantBase);
+    const dqPrime = (wantBase * yQuote) / (xBase - wantBase); // quote out (fee applied on input side → need gross in)
     const dq = dqPrime / (1 - fee);
     if (!Number.isFinite(dq)) return;
-    return dq / wantBase;
+    return dq / wantBase; // USDC per SOL
   }
+
+  // CPMM sell: sellBase, output is USDC. Price per SOL returned (USDC/SOL), incl fee.
   private cpmmSellQuotePerBase(xBase: number, yQuote: number, sellBase: number, feeBps: number) {
     if (!(xBase > 0 && yQuote > 0) || !(sellBase > 0)) return;
-    const fee = Math.max(0, feeBps) / 10_000;
+    const fee = Math.max(0, feeBps) / 10_000;     // input-side
     const dbPrime = sellBase * (1 - fee);
     const dy = (yQuote * dbPrime) / (xBase + dbPrime);
     if (!Number.isFinite(dy)) return;
-    return dy / sellBase;
+    return dy / sellBase; // USDC per SOL
   }
 
   private shouldEmit(path: "AMM->PHX" | "PHX->AMM", side: "buy" | "sell", edgeNetBps: number): boolean {
@@ -338,14 +338,14 @@ export class EdgeJoiner {
       return false;
     }
     this.lastDecisionAtMs = now;
-       this.lastPath = path;
+    this.lastPath = path;
     this.lastSide = side;
     this.lastEdgeNetBps = edgeNetBps;
     return true;
   }
 
   // Depth-walk Phoenix book to our size (optional, env-driven)
-  private walkPhoenix(side: "buy"|"sell", sizeBase: number, feeBps: number) {
+  private walkPhoenix(side: "buy" | "sell", sizeBase: number, feeBps: number) {
     const B = this.getFreshBook();
     if (!B) return undefined;
     const ladder: DepthSide[] | undefined = side === "sell" ? (B as any).levels_bids : (B as any).levels_asks;
@@ -383,13 +383,12 @@ export class EdgeJoiner {
     edgeForFeature?: any
   ) {
     const flatSlip = this.P.flatSlippageBps / 10_000;
-
     const spreadBps = ((phxAsk / phxBid) - 1) * 10_000;
     const phxSlipBpsUsed = Math.max(this.C.phoenixSlippageBps, spreadBps * 0.5) + this.C.dynamicSlippageExtraBps;
     const phxSlip = phxSlipBpsUsed / 10_000;
 
     const phxFee = this.P.phoenixFeeBps / 10_000;
-    const ammFee = this.P.ammFeeBps / 10_000;
+    const ammFee = this.P.ammFeeBps / 10_000; // NOTE: EV does not subtract AMM fee separately when using CPMM eff px
     const sizeBase = this.P.tradeSizeBase;
 
     const buyFlat = (px: number, fee: number, slip: number) => px * (1 + slip) * (1 + fee);
@@ -401,6 +400,7 @@ export class EdgeJoiner {
       const { base, quote } = this.reserves;
       const maxDb = base * this.C.cpmmMaxPoolTradeFrac;
       if (sizeBase > 0 && sizeBase <= maxDb) {
+        // CPMM sims include AMM input fee already
         ammBuyPxSim = this.cpmmBuyQuotePerBase(base, quote, sizeBase, this.P.ammFeeBps);
         ammSellPxSim = this.cpmmSellQuotePerBase(base, quote, sizeBase, this.P.ammFeeBps);
         if (ammBuyPxSim != null) ammBuyPxSim *= (1 + this.C.dynamicSlippageExtraBps / 10_000);
@@ -408,31 +408,35 @@ export class EdgeJoiner {
       }
     }
 
-    // Depth-aware Phoenix (if enabled and depth present)
+    // Depth-aware Phoenix (optional)
     const phxDepthOn = String(process.env.PHOENIX_DEPTH_ENABLED ?? "0").toLowerCase() === "1" || String(process.env.PHOENIX_DEPTH_ENABLED ?? "").toLowerCase() === "true";
     const phxSellEffDepth = phxDepthOn ? this.walkPhoenix("sell", sizeBase, this.P.phoenixFeeBps) : undefined;
-    const phxBuyEffDepth  = phxDepthOn ? this.walkPhoenix("buy",  sizeBase, this.P.phoenixFeeBps) : undefined;
+    const phxBuyEffDepth = phxDepthOn ? this.walkPhoenix("buy", sizeBase, this.P.phoenixFeeBps) : undefined;
 
-    const buyA_flat = buyFlat(ammMid, ammFee, flatSlip);
-    const sellA = phxSellEffDepth ?? sellFlat(phxBid, phxFee, phxSlip);
+    // Path A: AMM -> PHX (buy on AMM, sell on PHX)
+    const buyA_flat = buyFlat(ammMid, ammFee, flatSlip); // conservative fallback (flat)
     const buyA_used =
       this.C.activeSlippageMode === "flat" || ammBuyPxSim == null
         ? buyA_flat
         : this.C.activeSlippageMode === "amm_cpmm"
-        ? ammBuyPxSim
-        : Math.max(buyA_flat, ammBuyPxSim);
+          ? ammBuyPxSim
+          : Math.max(buyA_flat, ammBuyPxSim);
+    const sellA = phxSellEffDepth ?? sellFlat(phxBid, phxFee, phxSlip);
+
     const bpsNetA = (sellA / buyA_used - 1) * 10_000;
     const pnlNetA = (sellA - buyA_used) * sizeBase - this.P.fixedTxCostQuote;
     const bpsGrossA = (phxBid / ammMid - 1) * 10_000;
 
+    // Path B: PHX -> AMM (buy on PHX, sell on AMM)
     const buyB = phxBuyEffDepth ?? buyFlat(phxAsk, phxFee, phxSlip);
-    const sellB_flat = sellFlat(ammMid, ammFee, flatSlip);
+    const sellB_flat = sellFlat(ammMid, ammFee, flatSlip); // conservative fallback
     const sellB_used =
       this.C.activeSlippageMode === "flat" || ammSellPxSim == null
         ? sellB_flat
         : this.C.activeSlippageMode === "amm_cpmm"
-        ? ammSellPxSim
-        : Math.min(sellB_flat, ammSellPxSim);
+          ? ammSellPxSim
+          : Math.min(sellB_flat, ammSellPxSim);
+
     const bpsNetB = (sellB_used / buyB - 1) * 10_000;
     const pnlNetB = (sellB_used - buyB) * sizeBase - this.P.fixedTxCostQuote;
     const bpsGrossB = (ammMid / phxAsk - 1) * 10_000;
@@ -457,6 +461,7 @@ export class EdgeJoiner {
       sell_px: round(best.sellPx),
       edge_bps_net: round(best.edgeBpsNet, 4),
       expected_pnl: round(best.expectedPnl, 6),
+      // For transparency only; EV does NOT subtract AMM fee again when using CPMM eff px
       fees_bps: { phoenix: this.P.phoenixFeeBps, amm: this.P.ammFeeBps },
       fixed_tx_cost_quote: round(this.P.fixedTxCostQuote, 6),
     };
@@ -480,7 +485,7 @@ export class EdgeJoiner {
     base.amm_eff_px = round(ammEffPx);
     base.amm_price_impact_bps = round((ammEffPx / ammMid - 1) * 10_000, 4);
 
-    // ── Optional RPC sim (only attach fields when they are real numbers)
+    // Optional RPC sim
     if (this.C.useRpcSim && this.rpcSim && this.reserves) {
       try {
         const out = await this.rpcSim({
