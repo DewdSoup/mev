@@ -4,6 +4,7 @@
 
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import BN from "bn.js";
 import {
   Connection,
@@ -22,10 +23,15 @@ import {
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
 // ───────────────────────────────────────────────────────────────────────────────
+// ESM-safe dirname (avoid CJS-only globals)
+const __filename = fileURLToPath(import.meta.url);
+const __here = path.dirname(__filename);
+
+// ───────────────────────────────────────────────────────────────────────────────
 // Env-driven constants (safe defaults; .env overrides)
 export const CPMM_PROGRAM_ID = new PublicKey(
   process.env.RAYDIUM_CPMM_PROGRAM_ID ??
-    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+  "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 );
 export const SOL_MINT = new PublicKey(
   process.env.SOL_MINT ?? "So11111111111111111111111111111111111111112"
@@ -35,7 +41,7 @@ export const USDC_MINT = new PublicKey(
 );
 export const DEFAULT_SOL_USDC_POOL = new PublicKey(
   process.env.RAYDIUM_POOL_ID ??
-    "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+  "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
 );
 
 // Optional flags (default OFF)
@@ -44,18 +50,33 @@ const LOG_TOKEN_CTOR = (process.env.LOG_RAYDIUM_TOKEN_CTOR ?? "0") === "1";
 const LOG_SWAP_BUILD = (process.env.LOG_RAYDIUM_SWAP_BUILD ?? "0") === "1";
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Pool JSON discovery
+// Pool JSON discovery (mirror AMMs adapter precedence)
+function getenv(k: string) {
+  const v = process.env[k];
+  return typeof v === "string" && v.trim() ? v.trim() : undefined;
+}
+
 function findPoolJsonPath(): string {
-  const envPath = process.env.RAYDIUM_POOL_JSON_PATH?.trim();
-  if (envPath && fs.existsSync(envPath)) return path.resolve(envPath);
+  // 1) Env precedence
+  const envs = [
+    getenv("RAYDIUM_POOL_JSON_PATH"),
+    getenv("RAYDIUM_POOL_KEYS_JSON"),
+    getenv("RAYDIUM_POOLS_FILE"),
+  ];
+  for (const e of envs) {
+    if (e && fs.existsSync(e)) return path.resolve(e);
+  }
+
+  // 2) On-disk candidates (repo-relative)
   const candidates = [
     path.resolve(process.cwd(), "configs", "raydium.pool.json"),
     path.resolve(process.cwd(), "..", "configs", "raydium.pool.json"),
     path.resolve(process.cwd(), "..", "..", "configs", "raydium.pool.json"),
-    path.resolve(__dirname, "..", "..", "configs", "raydium.pool.json"),
-    path.resolve(__dirname, "..", "..", "..", "configs", "raydium.pool.json"),
+    path.resolve(__here, "..", "..", "configs", "raydium.pool.json"),
+    path.resolve(__here, "..", "..", "..", "configs", "raydium.pool.json"),
   ];
   for (const p of candidates) if (fs.existsSync(p)) return p;
+
   return "";
 }
 const POOL_JSON_PATH = findPoolJsonPath();
@@ -88,7 +109,7 @@ function readPoolJson(): DiskPoolKeys {
   if (!POOL_JSON_PATH) {
     throw new Error(
       "raydium_swap_build_error: Missing configs/raydium.pool.json. " +
-        "Set RAYDIUM_POOL_JSON_PATH in .env or place the file in repo root configs/."
+      "Set RAYDIUM_POOL_JSON_PATH in .env or place the file in repo root configs/."
     );
   }
   const raw = fs.readFileSync(POOL_JSON_PATH, "utf8");
@@ -148,7 +169,9 @@ function toPoolKeys(d: DiskPoolKeys): LiquidityPoolKeys {
     withdrawQueue: new PublicKey(d.withdrawQueue),
     lpVault: new PublicKey(d.lpVault),
 
-    ...(d.marketAuthority ? { marketAuthority: new PublicKey(d.marketAuthority) } : {}),
+    ...(d.marketAuthority
+      ? { marketAuthority: new PublicKey(d.marketAuthority) }
+      : {}),
   } as unknown as LiquidityPoolKeys;
   return out;
 }
@@ -176,7 +199,10 @@ async function fetchUserTokenAccounts(conn: Connection, owner: PublicKey) {
 }
 
 // Fetch token decimals (fast path for SOL/USDC; fallback to parsed mint)
-async function resolveMintDecimals(conn: Connection, mint: PublicKey): Promise<number> {
+async function resolveMintDecimals(
+  conn: Connection,
+  mint: PublicKey
+): Promise<number> {
   if (mint.equals(SOL_MINT)) return 9;
   if (mint.equals(USDC_MINT)) return 6;
   try {
@@ -247,10 +273,18 @@ async function computeMinOutBn(opts: {
   usedSlipBps: number;
 }> {
   const { conn, pool, baseIn, amountIn, slippageBps } = opts;
-  const feeBpsEnv = Number.parseFloat(process.env.RAYDIUM_TRADE_FEE_BPS ?? "25");
-  const dynamicExtra = Number.parseFloat(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? "0");
-  const bufferBps = Number.parseFloat(process.env.RAYDIUM_MINOUT_BUFFER_BPS ?? "0");
-  const baseSlip = Number.isFinite(slippageBps) ? slippageBps : Number(process.env.AMM_MINOUT_BASE_BPS ?? 50);
+  const feeBpsEnv = Number.parseFloat(
+    process.env.RAYDIUM_TRADE_FEE_BPS ?? "25"
+  );
+  const dynamicExtra = Number.parseFloat(
+    process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? "0"
+  );
+  const bufferBps = Number.parseFloat(
+    process.env.RAYDIUM_MINOUT_BUFFER_BPS ?? "0"
+  );
+  const baseSlip = Number.isFinite(slippageBps)
+    ? slippageBps
+    : Number(process.env.AMM_MINOUT_BASE_BPS ?? 50);
   const usedSlip = Math.max(0, baseSlip + dynamicExtra + bufferBps);
 
   const { base, quote } = await getVaultReserves(conn, pool);
@@ -275,18 +309,29 @@ async function computeMinOutBn(opts: {
     });
   }
 
-  return { expectedOut, minOut, usedFeeBps: feeBpsEnv, usedSlipBps: usedSlip };
+  return {
+    expectedOut,
+    minOut,
+    usedFeeBps: feeBpsEnv,
+    usedSlipBps: usedSlip,
+  };
 }
 
 // Build Percent from bps as integer ppm (handles 50.25 bps safely)
 function percentFromBpsFloat(bps: number): Percent {
-  const numeratorPpm = Math.round(bps * 100); // e.g. 50.25 bps => 5025
-  return new Percent(numeratorPpm.toString(), "1000000");
+  const numeratorPpm = Math.round(bps * 100); // 50.25 bps => 5025 ppm
+  return new Percent(numeratorPpm, 1_000_000); // numerator, denominator
 }
 
 // Use the **diagnosed** Token constructor: (programId, mint, decimals, symbol?, name?)
 function makeSdkToken(mint: PublicKey, decimals: number, symbol: string): Token {
-  const tok = new (Token as any)(TOKEN_PROGRAM_ID, mint, decimals, symbol, symbol);
+  const tok = new (Token as any)(
+    TOKEN_PROGRAM_ID,
+    mint,
+    decimals,
+    symbol,
+    symbol
+  );
   if (LOG_TOKEN_CTOR) {
     // eslint-disable-next-line no-console
     console.log("raydium_token_ctor_variant", {
@@ -308,14 +353,23 @@ export type CpmmIxBuildResult =
 // Tries multiple argument shapes for makeSwapInstructionSimple to support CPMM/CLMM variants.
 async function tryBuildSwapIxCompat(argsBase: any) {
   const tries: Array<{ label: string; patch: Record<string, any> }> = [
-    // CPMM-style
-    { label: "amountOutMin+slippage", patch: { amountOutMin: argsBase._minOutTA, slippage: argsBase._slipPercent } },
-    { label: "amountOutMin only",     patch: { amountOutMin: argsBase._minOutTA } },
-    // CLMM-style
-    { label: "otherAmountThreshold+slippage", patch: { otherAmountThreshold: argsBase._minOutTA, slippage: argsBase._slipPercent } },
-    { label: "otherAmountThreshold only",     patch: { otherAmountThreshold: argsBase._minOutTA } },
-    // Belt-and-suspenders
-    { label: "both+slippage", patch: { amountOutMin: argsBase._minOutTA, otherAmountThreshold: argsBase._minOutTA, slippage: argsBase._slipPercent } },
+    // ✅ Canonical for Liquidity CPMM (prevents .isZero on undefined)
+    { label: "amountOut (canonical)", patch: { amountOut: argsBase._minOutTA } },
+    { label: "amountOut + slippage", patch: { amountOut: argsBase._minOutTA, slippage: argsBase._slipPercent } },
+
+    // 🧰 Legacy / alt signatures some SDK builds recognize
+    { label: "amountOutMin (legacy)", patch: { amountOutMin: argsBase._minOutTA } },
+    { label: "otherAmountThreshold (CLMM-ish)", patch: { otherAmountThreshold: argsBase._minOutTA } },
+
+    // Belt-and-suspenders in case the lib inspects more than one field
+    {
+      label: "amountOut + all thresholds",
+      patch: {
+        amountOut: argsBase._minOutTA,
+        amountOutMin: argsBase._minOutTA,
+        otherAmountThreshold: argsBase._minOutTA,
+      },
+    },
   ];
 
   let lastErr: unknown;
@@ -340,7 +394,10 @@ async function tryBuildSwapIxCompat(argsBase: any) {
       if (ixs.length) {
         if (LOG_SWAP_BUILD) {
           // eslint-disable-next-line no-console
-          console.log("raydium_swap_build_variant", { used: t.label, ixs: ixs.length });
+          console.log("raydium_swap_build_variant", {
+            used: t.label,
+            ixs: ixs.length,
+          });
         }
         return { ok: true as const, ixs };
       }
@@ -360,19 +417,25 @@ async function tryBuildSwapIxCompat(argsBase: any) {
       }
     }
   }
-  return { ok: false as const, reason: `raydium_swap_ix_build_failed: ${String((lastErr as any)?.message ?? lastErr)}` };
+  return {
+    ok: false as const,
+    reason: `raydium_swap_ix_build_failed: ${String((lastErr as any)?.message ?? lastErr)
+      }`,
+  };
 }
 
 export async function buildRaydiumSwapIx(params: {
   user: PublicKey;
-  baseIn: boolean;         // true => input is base mint (SOL in SOL/USDC)
-  amountInBase: bigint;    // atoms of INPUT mint
-  slippageBps: number;     // may be fractional (e.g., 50.25)
+  baseIn: boolean; // true => input is base mint (SOL in SOL/USDC)
+  amountInBase: bigint; // atoms of INPUT mint
+  slippageBps: number; // may be fractional (e.g., 50.25)
 }): Promise<CpmmIxBuildResult> {
   try {
     const disk = readPoolJson();
     const envAmm =
-      (process.env.RAYDIUM_POOL_ID ?? process.env.RAYDIUM_POOL_ID_SOL_USDC ?? "").trim();
+      (process.env.RAYDIUM_POOL_ID ??
+        process.env.RAYDIUM_POOL_ID_SOL_USDC ??
+        "").trim();
     if (envAmm && envAmm !== disk.id) {
       return {
         ok: false,
@@ -392,10 +455,10 @@ export async function buildRaydiumSwapIx(params: {
       resolveMintDecimals(conn, poolKeys.quoteMint),
     ]);
 
-    const baseToken  = makeSdkToken(poolKeys.baseMint,  baseDecimals,  "BASE");
+    const baseToken = makeSdkToken(poolKeys.baseMint, baseDecimals, "BASE");
     const quoteToken = makeSdkToken(poolKeys.quoteMint, quoteDecimals, "QUOTE");
 
-    const tokenIn  = params.baseIn ? baseToken : quoteToken;
+    const tokenIn = params.baseIn ? baseToken : quoteToken;
     const tokenOut = params.baseIn ? quoteToken : baseToken;
 
     const { minOut, usedSlipBps } = await computeMinOutBn({
@@ -408,13 +471,27 @@ export async function buildRaydiumSwapIx(params: {
 
     // TokenAmount (raw atom units)
     const amountInTA = new TokenAmount(tokenIn, amountIn.toString(), true);
-    const minOutTA   = new TokenAmount(tokenOut, minOut.toString(), true);
+    const minOutTA = new TokenAmount(tokenOut, minOut.toString(), true);
     const slipPercent = percentFromBpsFloat(usedSlipBps);
+
+    if (LOG_SWAP_BUILD) {
+      // eslint-disable-next-line no-console
+      console.log("raydium_args_debug", {
+        amountIn: amountIn.toString(),
+        minOut: minOut.toString(),
+        tokenIn: (tokenIn as any)?.mint?.toBase58?.(),
+        tokenOut: (tokenOut as any)?.mint?.toBase58?.(),
+      });
+    }
 
     const baseArgs = {
       connection: conn,
       poolKeys,
-      userKeys: { tokenAccounts: tokenAccounts as any, owner: params.user, payer: params.user },
+      userKeys: {
+        tokenAccounts: tokenAccounts as any,
+        owner: params.user,
+        payer: params.user,
+      },
       fixedSide: "in",
       amountIn: amountInTA,
       tokenIn,
@@ -448,7 +525,10 @@ export async function tryAssertRaydiumFeeBps(
     // use the same disk json as the swap builder
     const disk = readPoolJson();
     if (disk.id !== poolId) {
-      console.warn("[raydium_fee_check] poolId mismatch env/json", { env: poolId, json: disk.id });
+      console.warn("[raydium_fee_check] poolId mismatch env/json", {
+        env: poolId,
+        json: disk.id,
+      });
     }
     const poolKeys = toPoolKeys(disk); // full keys with programId, vaults, etc.
 
@@ -456,16 +536,29 @@ export async function tryAssertRaydiumFeeBps(
     const s: any = (info as any)?.state ?? (info as any) ?? {};
     let onchainBps: number | null = null;
 
-    if (typeof s.tradeFeeRate === "number") onchainBps = Math.round(s.tradeFeeRate * 10_000);
-    else if (typeof s.swapFeeRate === "number") onchainBps = Math.round(s.swapFeeRate * 10_000);
+    if (typeof s.tradeFeeRate === "number")
+      onchainBps = Math.round(s.tradeFeeRate * 10_000);
+    else if (typeof s.swapFeeRate === "number")
+      onchainBps = Math.round(s.swapFeeRate * 10_000);
     else if (typeof s.feeRate === "number") onchainBps = Math.round(s.feeRate);
-    else if (typeof s.swapFeeNumerator === "number" && typeof s.swapFeeDenominator === "number" && s.swapFeeDenominator > 0) {
-      onchainBps = Math.round((s.swapFeeNumerator / s.swapFeeDenominator) * 10_000);
+    else if (
+      typeof s.swapFeeNumerator === "number" &&
+      typeof s.swapFeeDenominator === "number" &&
+      s.swapFeeDenominator > 0
+    ) {
+      onchainBps = Math.round(
+        (s.swapFeeNumerator / s.swapFeeDenominator) * 10_000
+      );
     }
 
     if (onchainBps != null && Number.isFinite(onchainBps)) {
       if (onchainBps !== configuredFeeBps) {
-        console.warn("[raydium_fee_mismatch] overriding", configuredFeeBps, "→", onchainBps);
+        console.warn(
+          "[raydium_fee_mismatch] overriding",
+          configuredFeeBps,
+          "→",
+          onchainBps
+        );
         return onchainBps;
       }
       console.info("[raydium_fee_ok]", onchainBps);
@@ -475,7 +568,11 @@ export async function tryAssertRaydiumFeeBps(
     console.warn("[raydium_fee_unknown] keeping configured fee", configuredFeeBps);
     return configuredFeeBps;
   } catch (e) {
-    console.warn("[raydium_fee_check_failed] keeping configured fee", configuredFeeBps, String(e));
+    console.warn(
+      "[raydium_fee_check_failed] keeping configured fee",
+      configuredFeeBps,
+      String(e)
+    );
     return configuredFeeBps;
   }
 }

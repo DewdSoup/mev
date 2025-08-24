@@ -45,6 +45,7 @@ import {
 } from "./executor/size.js";
 import { tryAssertRaydiumFeeBps } from "./util/raydium.js";
 import { PublisherSupervisor } from "./publishers/supervisor.js";
+import { prewarmPhoenix } from "./util/phoenix.js"; // warm cache on boot
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -402,7 +403,7 @@ async function main() {
     accounts = await initAccounts(conn);
     await initSessionRecorder(conn, (accounts as any).owner, CFG);
 
-    // >>> FIX: pass a Keypair (not the WalletCtx) to LiveExecutor
+    // pass a Keypair (payer) into the executor so we always have a real PublicKey for Phoenix
     const payer: Keypair = (accounts as any).owner as Keypair;
     liveExec = new LiveExecutor(conn, payer);
     await (liveExec as any).startPhoenix?.();
@@ -432,6 +433,13 @@ async function main() {
     (process.env.RAYDIUM_POOL_ID ?? process.env.RAYDIUM_POOL_ID_SOL_USDC ?? "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2").trim();
   const PHX_MARKET =
     (CFG.PHOENIX_MARKET || process.env.PHOENIX_MARKET_ID || "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg").trim();
+
+  // warm Phoenix caches so the first instruction build is also fast
+  try {
+    await prewarmPhoenix(conn, [PHX_MARKET]);
+  } catch (e) {
+    logger.log("phoenix_prewarm_error", { error: String(e) });
+  }
 
   let AMM_FEE_BPS = resolveFeeBps("AMM", RAYDIUM_POOL, CFG.AMM_TAKER_FEE_BPS);
   const PHX_FEE_BPS = resolveFeeBps("PHOENIX", PHX_MARKET, CFG.PHOENIX_TAKER_FEE_BPS);
@@ -633,7 +641,7 @@ async function main() {
       activeSlippageMode: "adaptive",
       phoenixSlippageBps: Number(process.env.PHOENIX_SLIPPAGE_BPS ?? 3),
       cpmmMaxPoolTradeFrac: Number(process.env.CPMM_MAX_POOL_TRADE_FRAC ?? 0.05),
-      dynamicSlippageExtraBps: Number(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? 0.25),
+      dynamicSlippageExtraBps: Number(process.env.DYNAMIC_SLIPPAGE_BPS ?? 0.25),
       logSimFields: String(process.env.LOG_SIM_FIELDS ?? "1") === "1",
       enforceDedupe: true,
       decisionBucketMs: Number(process.env.DECISION_BUCKET_MS ?? 200),

@@ -1,0 +1,2 @@
+{"ts":1755941329382,"session_id":"sess_2025-08-23T092849381Z","name":"session_start","data":{"pid":482744,"cwd":"/home/dudesoup/code/mev/services/arb-mm","env_digest":{"LIVE_TRADING":true,"SHADOW_TRADING":false,"USE_RPC_SIM":false}}}
+{"ts":1755941330318,"session_id":"sess_2025-08-23T092849381Z","name":"session_end","data":{"exit_code":0,"stats":{"considered":0,"would_trade":0,"would_not_trade":0,"submitted_tx":0,"landed":0,"land_error":0,"tip_lamports_sum":0},"counts_by_path":{}}}
