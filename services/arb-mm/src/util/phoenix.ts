@@ -44,7 +44,26 @@ async function loadPhoenixModule(): Promise<PhoenixModule> {
 async function getPhoenixClient(conn: Connection): Promise<PhoenixClient> {
   if (_phoenixClient) return _phoenixClient;
   const Phoenix = await loadPhoenixModule();
-  // Different SDK versions expose slightly different signatures; the common one is Client.create(connection)
+  // Look up the first non-empty market ID
+  const envMarket =
+    process.env.PHOENIX_MARKET?.trim() ||
+    process.env.PHOENIX_MARKET_ID?.trim() ||
+    "";
+  if (envMarket) {
+    if (Phoenix?.Client?.createWithMarketAddresses) {
+      try {
+        _phoenixClient = await Phoenix.Client.createWithMarketAddresses(conn, [new PK(envMarket)]);
+        return _phoenixClient;
+      } catch { /* fall through */ }
+    }
+    if (Phoenix?.Client?.createWithoutConfig) {
+      try {
+        _phoenixClient = await Phoenix.Client.createWithoutConfig(conn, [new PK(envMarket)]);
+        return _phoenixClient;
+      } catch { /* fall through */ }
+    }
+  }
+  // Fallback to default create() methods
   if (Phoenix?.Client?.create) {
     _phoenixClient = await Phoenix.Client.create(conn);
   } else if (Phoenix?.default?.Client?.create) {
@@ -72,9 +91,7 @@ async function ensureMarketState(client: PhoenixClient, market: string | PublicK
   if (!state && typeof client?.getMarketState === "function") {
     try {
       state = await client.getMarketState(new PK(id));
-    } catch {
-      /* ignore */
-    }
+    } catch { /* ignore */ }
   }
 
   // Fallback: some expose getMarket() returning { state }
@@ -82,9 +99,26 @@ async function ensureMarketState(client: PhoenixClient, market: string | PublicK
     try {
       const m = await client.getMarket(new PK(id));
       state = m?.state ?? m ?? null;
-    } catch {
-      /* ignore */
-    }
+    } catch { /* ignore */ }
+  }
+
+  // If still missing, attempt to add the market manually.  This helps when
+  // the client wasn't constructed with the market pre-loaded.
+  if (!state && typeof (client as any)?.addMarket === "function") {
+    try {
+      await (client as any).addMarket(id);
+      if (client?.marketStates?.get) {
+        state = client.marketStates.get(id) ?? null;
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Last resort: call refreshMarket if available
+  if (!state && typeof client?.refreshMarket === "function") {
+    try {
+      const maybeState = await client.refreshMarket(new PK(id), false);
+      state = maybeState ?? null;
+    } catch { /* ignore */ }
   }
 
   if (!state) {
@@ -124,10 +158,12 @@ export async function buildPhoenixSwapIxs(params: {
   const { connection, owner, market, side, sizeBase, limitPx, slippageBps } = params;
   const marketId = asKey(market);
 
-
   // Accept either a PublicKey (with .toBuffer) or an object with publicKey.toBuffer
   const hasDirectToBuffer = owner && typeof (owner as any).toBuffer === "function";
-  const hasNestedToBuffer = owner && (owner as any)?.publicKey && typeof (owner as any).publicKey.toBuffer === "function";
+  const hasNestedToBuffer =
+    owner &&
+    (owner as any)?.publicKey &&
+    typeof (owner as any).publicKey.toBuffer === "function";
   if (!hasDirectToBuffer && !hasNestedToBuffer) {
     const reason = "owner_public_key_missing";
     logger.log("phoenix_build_error", { reason });
@@ -148,7 +184,7 @@ export async function buildPhoenixSwapIxs(params: {
     const state = await ensureMarketState(client, market);
 
     // Side mapping: selling BASE => place an Ask; buying BASE => place a Bid
-    const sideEnum = (side === "sell") ? Phoenix.Side.Ask : Phoenix.Side.Bid;
+    const sideEnum = side === "sell" ? Phoenix.Side.Ask : Phoenix.Side.Bid;
 
     // Try each helper in order; catch errors and fall back
     let tx: any | null = null;
@@ -160,7 +196,10 @@ export async function buildPhoenixSwapIxs(params: {
           trader: owner,
         });
       } catch (e) {
-        logger.log("phoenix_build_method_error", { method: "market.getSwapTransaction", error: (e as any)?.message ?? String(e) });
+        logger.log("phoenix_build_method_error", {
+          method: "market.getSwapTransaction",
+          error: (e as any)?.message ?? String(e),
+        });
         tx = null;
       }
     }
@@ -172,7 +211,10 @@ export async function buildPhoenixSwapIxs(params: {
           trader: owner,
         });
       } catch (e) {
-        logger.log("phoenix_build_method_error", { method: "client.getSwapTransaction", error: (e as any)?.message ?? String(e) });
+        logger.log("phoenix_build_method_error", {
+          method: "client.getSwapTransaction",
+          error: (e as any)?.message ?? String(e),
+        });
         tx = null;
       }
     }
@@ -184,14 +226,21 @@ export async function buildPhoenixSwapIxs(params: {
           inAmount: sizeBase,
           trader: owner,
         });
-        const ixs = Array.isArray(res) ? res :
-          res?.ixs ? res.ixs :
-            res?.instructions ? res.instructions : [];
+        const ixs = Array.isArray(res)
+          ? res
+          : res?.ixs
+            ? res.ixs
+            : res?.instructions
+              ? res.instructions
+              : [];
         if (ixs.length > 0) {
           tx = { instructions: ixs };
         }
       } catch (e) {
-        logger.log("phoenix_build_method_error", { method: "client.getSwapIxs", error: (e as any)?.message ?? String(e) });
+        logger.log("phoenix_build_method_error", {
+          method: "client.getSwapIxs",
+          error: (e as any)?.message ?? String(e),
+        });
         tx = null;
       }
     }
@@ -204,18 +253,33 @@ export async function buildPhoenixSwapIxs(params: {
         });
         tx = { instructions: [ix] };
       } catch (e) {
-        logger.log("phoenix_build_method_error", { method: "market.createSwapInstruction", error: (e as any)?.message ?? String(e) });
+        logger.log("phoenix_build_method_error", {
+          method: "market.createSwapInstruction",
+          error: (e as any)?.message ?? String(e),
+        });
         tx = null;
       }
     }
     if (!tx) {
-      const debug = { haveLots: !!state?.ticksPerBaseLot, haveTicks: !!state?.ticksPerBaseUnit, metaSummary: summarizeState(state) };
-      logger.log("phoenix_build_result_shape", { type: "object", hasIxsField: false, isArray: false, keys: ["ok", "reason", "debug"] });
-      return { ixs: [], reason: "phoenix_swap_helper_unavailable_in_sdk", debug };
+      const debug = {
+        haveLots: !!state?.ticksPerBaseLot,
+        haveTicks: !!state?.ticksPerBaseUnit,
+        metaSummary: summarizeState(state),
+      };
+      logger.log("phoenix_build_result_shape", {
+        type: "object",
+        hasIxsField: false,
+        isArray: false,
+        keys: ["ok", "reason", "debug"],
+      });
+      return {
+        ixs: [],
+        reason: "phoenix_swap_helper_unavailable_in_sdk",
+        debug,
+      };
     }
 
-    const ixs: TransactionInstruction[] =
-      (tx?.instructions ?? tx?.ixs ?? []).filter(Boolean);
+    const ixs: TransactionInstruction[] = (tx?.instructions ?? tx?.ixs ?? []).filter(Boolean);
 
     logger.log("phoenix_build_result_shape", {
       type: "object",

@@ -12,8 +12,13 @@ import fs from "fs";
 import path from "path";
 import * as dotenv from "dotenv";
 import { Connection, PublicKey, clusterApiUrl } from "@solana/web3.js";
-import { Client, type MarketState } from "@ellipsis-labs/phoenix-sdk";
+// NOTE: In phoenix-sdk v1.0.x the package does not export Client/MarketState
+// as named exports.  Import the entire module and use dynamic resolution.
+import * as PhoenixSDK from "@ellipsis-labs/phoenix-sdk";
 import { logger } from "@mev/storage";
+
+// Fallback typings so TypeScript will compile even if the SDK type exports change.
+type MarketState = any;
 
 // ── Load .env from repo root ────────────────────────────────────────────────
 function loadRootEnv() {
@@ -92,16 +97,24 @@ function loadMarketsConfig(): MarketCfg[] | null {
       if (!fs.existsSync(p)) continue;
       const arr = JSON.parse(fs.readFileSync(p, "utf8")) as MarketCfg[];
       if (Array.isArray(arr) && arr.length) return arr;
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }
   return null;
 }
 
 // ── SDK Client helpers ──────────────────────────────────────────────────────
-async function makeClient(conn: Connection): Promise<Client> {
-  const anyClient = Client as any;
-  if (typeof anyClient.create === "function") return await anyClient.create(conn);
-  return new anyClient(conn) as Client;
+async function makeClient(conn: Connection): Promise<any> {
+  // Dynamically resolve the Client constructor on the Phoenix SDK.  The SDK
+  // exports differ across versions: some expose `Client` on the module
+  // itself, others nest it under `default`.  We pick whichever exists.
+  const mod: any = PhoenixSDK;
+  const ctor: any = mod?.Client ?? mod?.default?.Client;
+  if (ctor?.create) {
+    return await ctor.create(conn);
+  }
+  return new ctor(conn);
 }
 
 type MaybeBbo = {
@@ -180,7 +193,7 @@ async function trySdkL2(client: any, marketStr: string, marketPk: PublicKey): Pr
       const bestBid = bids[0]?.px;
       const bestAsk = asks[0]?.px;
       if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getL2:str", bids, asks };
-    } catch {}
+    } catch { }
     try {
       const l2p = await maybeAwait((client as any).getL2(marketPk, L2_FETCH_DEPTH));
       const bids = mapDepthSide(l2p?.bids, PUBLISH_DEPTH);
@@ -200,7 +213,7 @@ async function trySdkL2(client: any, marketStr: string, marketPk: PublicKey): Pr
       const bestBid = typeof bboS?.bestBid === "number" ? bboS.bestBid : extractPx(bboS?.bestBid);
       const bestAsk = typeof bboS?.bestAsk === "number" ? bboS.bestAsk : extractPx(bboS?.bestAsk);
       if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getBbo:str" };
-    } catch {}
+    } catch { }
     try {
       const bboP = await maybeAwait((client as any).getBbo(marketPk));
       const bestBid = typeof bboP?.bestBid === "number" ? bboP.bestBid : extractPx(bboP?.bestBid);
@@ -214,16 +227,22 @@ async function trySdkL2(client: any, marketStr: string, marketPk: PublicKey): Pr
   // 3) refreshMarket and inspect OB (depth capable)
   try {
     let ms: MarketState | undefined;
-    try { ms = await maybeAwait((client as any).refreshMarket(marketStr, false)); } catch {}
-    if (!ms) { try { ms = await maybeAwait((client as any).refreshMarket(marketPk, false)); } catch {} }
+    try {
+      ms = await maybeAwait((client as any).refreshMarket(marketStr, false));
+    } catch { }
+    if (!ms) {
+      try {
+        ms = await maybeAwait((client as any).refreshMarket(marketPk, false));
+      } catch { }
+    }
     if (ms) {
       const ob: any = (ms as any)?.orderBook ?? (ms as any)?.book ?? undefined;
       const bidsRaw: any[] =
-        (Array.isArray(ob?.bids) ? ob.bids :
-        Array.isArray(ob?.book?.bids) ? ob.book.bids : []) as any[];
+        Array.isArray(ob?.bids) ? ob.bids :
+          Array.isArray(ob?.book?.bids) ? ob.book.bids : [];
       const asksRaw: any[] =
-        (Array.isArray(ob?.asks) ? ob.asks :
-        Array.isArray(ob?.book?.asks) ? ob.book.asks : []) as any[];
+        Array.isArray(ob?.asks) ? ob.asks :
+          Array.isArray(ob?.book?.asks) ? ob.book.asks : [];
       const bids = mapDepthSide(bidsRaw, PUBLISH_DEPTH);
       const asks = mapDepthSide(asksRaw, PUBLISH_DEPTH);
       const bestBid = bids[0]?.px;
@@ -256,16 +275,28 @@ async function tryAttachWs(
         const bid = Array.isArray(l2?.bids) && l2.bids[0] ? extractPx(l2.bids[0]) : undefined;
         const ask = Array.isArray(l2?.asks) && l2.asks[0] ? extractPx(l2.asks[0]) : undefined;
         if (bid || ask) setWs({ bid, ask });
-      } catch {}
+      } catch { }
     };
 
     try {
-      try { await f.call(client, marketStr, L2_FETCH_DEPTH, cb); } catch {}
-      try { await f.call(client, marketStr, cb, L2_FETCH_DEPTH); } catch {}
-      try { await f.call(client, marketStr, cb); } catch {}
-      try { await f.call(client, marketPk, L2_FETCH_DEPTH, cb); } catch {}
-      try { await f.call(client, marketPk, cb, L2_FETCH_DEPTH); } catch {}
-      try { await f.call(client, marketPk, cb); } catch {}
+      try {
+        await f.call(client, marketStr, L2_FETCH_DEPTH, cb);
+      } catch { }
+      try {
+        await f.call(client, marketStr, cb, L2_FETCH_DEPTH);
+      } catch { }
+      try {
+        await f.call(client, marketStr, cb);
+      } catch { }
+      try {
+        await f.call(client, marketPk, L2_FETCH_DEPTH, cb);
+      } catch { }
+      try {
+        await f.call(client, marketPk, cb, L2_FETCH_DEPTH);
+      } catch { }
+      try {
+        await f.call(client, marketPk, cb);
+      } catch { }
       logger.log("phoenix_ws_attach_attempted", { method: fn, market: marketStr });
     } catch (e) {
       logger.log("phoenix_warn", { stage: "ws_attach", method: fn, err: String(e), market: marketStr });
@@ -363,15 +394,25 @@ async function runMarket(client: any, symbol: string, marketStr: string, pythId?
   // One-time “loaded”
   try {
     let ms: MarketState | undefined;
-    try { ms = await (client as any).refreshMarket?.(marketStr, false); } catch {}
-    if (!ms) { try { ms = await (client as any).refreshMarket?.(marketPk, false); } catch {} }
+    try {
+      ms = await (client as any).refreshMarket?.(marketStr, false);
+    } catch { }
+    if (!ms) {
+      try {
+        ms = await (client as any).refreshMarket?.(marketPk, false);
+      } catch { }
+    }
     const ob: any = (ms as any)?.orderBook ?? (ms as any)?.book ?? undefined;
     const hasBids =
-      !!((Array.isArray(ob?.bids) && ob.bids.length > 0) ||
-        (Array.isArray(ob?.book?.bids) && ob.book.bids.length > 0));
+      !!(
+        (Array.isArray(ob?.bids) && ob.bids.length > 0) ||
+        (Array.isArray(ob?.book?.bids) && ob.book.bids.length > 0)
+      );
     const hasAsks =
-      !!((Array.isArray(ob?.asks) && ob.asks.length > 0) ||
-        (Array.isArray(ob?.book?.asks) && ob.book.asks.length > 0));
+      !!(
+        (Array.isArray(ob?.asks) && ob.asks.length > 0) ||
+        (Array.isArray(ob?.book?.asks) && ob.book.asks.length > 0)
+      );
     logger.log("phoenix_loaded", { id: marketStr, name: symbol, hasBids, hasAsks });
   } catch (err) {
     logger.log("phoenix_error", { stage: "refresh_market", market: symbol, err: String(err) });
@@ -379,11 +420,13 @@ async function runMarket(client: any, symbol: string, marketStr: string, pythId?
 
   // Try to attach WS (best-effort)
   let wsBbo: { bid?: number; ask?: number } | null = null;
-  tryAttachWs(client, marketStr, marketPk, (bbo) => { wsBbo = bbo; }).catch(() => {});
+  tryAttachWs(client, marketStr, marketPk, (bbo) => {
+    wsBbo = bbo;
+  }).catch(() => { });
 
   const tick = async () => {
     // WS snapshot
-    if (wsBbo && (typeof wsBbo.bid === "number" && typeof wsBbo.ask === "number")) {
+    if (wsBbo && typeof wsBbo.bid === "number" && typeof wsBbo.ask === "number") {
       const bid = wsBbo.bid!;
       const ask = wsBbo.ask!;
       publishL2(symbol, marketStr, bid, ask, { source: "sdk:ws-l2" });
@@ -452,15 +495,20 @@ async function main() {
     client = await makeClient(conn);
   } catch (e) {
     logger.log("phoenix_error", { stage: "client_create", err: String(e) });
-    setInterval(() => {}, 1 << 30);
+    setInterval(() => { }, 1 << 30);
     return;
   }
 
   // ENV-FIRST single market
   const envMarket = (process.env.PHOENIX_MARKET ?? "").trim();
   if (envMarket) {
-    await runMarket(client, "SOL/USDC", envMarket, (process.env.PYTH_PRICE_ID_SOL_USDC ?? "").trim() || undefined);
-    setInterval(() => {}, 1 << 30);
+    await runMarket(
+      client,
+      "SOL/USDC",
+      envMarket,
+      (process.env.PYTH_PRICE_ID_SOL_USDC ?? "").trim() || undefined
+    );
+    setInterval(() => { }, 1 << 30);
     return;
   }
 
@@ -468,21 +516,33 @@ async function main() {
   const cfg = loadMarketsConfig();
   if (cfg && cfg.length) {
     const markets = cfg
-      .filter(m => m.phoenix?.market)
-      .map(m => ({ symbol: m.symbol, market: m.phoenix!.market, pyth: m.pyth_price_id }));
+      .filter((m) => m.phoenix?.market)
+      .map((m) => ({
+        symbol: m.symbol,
+        market: m.phoenix!.market,
+        pyth: m.pyth_price_id,
+      }));
 
     if (markets.length) {
-      for (const m of markets) runMarket(client, m.symbol, m.market, m.pyth).catch((e) => logger.log("phoenix_fatal_market", { symbol: m.symbol, err: String(e) }));
-      setInterval(() => {}, 1 << 30);
+      for (const m of markets)
+        runMarket(client, m.symbol, m.market, m.pyth).catch((e) =>
+          logger.log("phoenix_fatal_market", { symbol: m.symbol, err: String(e) })
+        );
+      setInterval(() => { }, 1 << 30);
       return;
     }
   }
 
   // Default single market (SOL/USDC)
-  await runMarket(client, "SOL/USDC", "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg", (process.env.PYTH_PRICE_ID_SOL_USDC ?? "").trim() || undefined);
+  await runMarket(
+    client,
+    "SOL/USDC",
+    "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg",
+    (process.env.PYTH_PRICE_ID_SOL_USDC ?? "").trim() || undefined
+  );
 
   // keep alive
-  setInterval(() => {}, 1 << 30);
+  setInterval(() => { }, 1 << 30);
 }
 
 main().catch((e) => logger.log("phoenix_fatal", { err: String(e) }));

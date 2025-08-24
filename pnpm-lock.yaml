@@ -11,9 +11,6 @@ importers:
 
   .:
     dependencies:
-      '@ellipsis-labs/phoenix-sdk':
-        specifier: ^2.0.3
-        version: 2.0.3(@solana/web3.js@1.98.4(bufferutil@4.0.9)(typescript@5.9.2)(utf-8-validate@5.0.10))(bufferutil@4.0.9)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.2)(utf-8-validate@5.0.10)
       '@jup-ag/phoenix-sdk':
         specifier: ^1.4.4
         version: 1.4.4(@solana/web3.js@1.98.4(bufferutil@4.0.9)(typescript@5.9.2)(utf-8-validate@5.0.10))(bufferutil@4.0.9)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.2)(utf-8-validate@5.0.10)
@@ -159,8 +156,8 @@ importers:
   packages/phoenix:
     dependencies:
       '@ellipsis-labs/phoenix-sdk':
-        specifier: ^2.0.3
-        version: 2.0.3(@solana/web3.js@1.98.4(bufferutil@4.0.9)(typescript@5.9.2)(utf-8-validate@5.0.10))(bufferutil@4.0.9)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.2)(utf-8-validate@5.0.10)
+        specifier: 1.0.5
+        version: 1.0.5(@solana/web3.js@1.98.4(bufferutil@4.0.9)(typescript@5.9.2)(utf-8-validate@5.0.10))(bufferutil@4.0.9)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.2)(utf-8-validate@5.0.10)
       '@mev/storage':
         specifier: workspace:*
         version: link:../storage
@@ -222,6 +219,9 @@ importers:
 
   services/arb-mm:
     dependencies:
+      '@ellipsis-labs/phoenix-sdk':
+        specifier: 1.0.5
+        version: 1.0.5(@solana/web3.js@1.98.4(bufferutil@4.0.9)(typescript@5.9.2)(utf-8-validate@5.0.10))(bufferutil@4.0.9)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.2)(utf-8-validate@5.0.10)
       '@mev/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -267,8 +267,8 @@ packages:
     resolution: {integrity: sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw==}
     engines: {node: '>=12'}
 
-  '@ellipsis-labs/phoenix-sdk@2.0.3':
-    resolution: {integrity: sha512-XjVApyLAYFeJwbYUySTb2n1oKOjNpih6de6jWj5mYiUjXIqK0rFvf0plXHrxpTF5YfUP/rnJ11yrVbvgOKKhGw==}
+  '@ellipsis-labs/phoenix-sdk@1.0.5':
+    resolution: {integrity: sha512-LI+HbkJQdkatzN86V2JsNtpGbcjm6clYF//f2cAzWjFIrLjJY6Ej15w4mYBfLaTyvTKSVhzN9wgjBAfaLgQD4w==}
 
   '@esbuild/aix-ppc64@0.25.8':
     resolution: {integrity: sha512-urAvrUedIqEiFR3FYSLTWQgLu5tb+m0qZw0NBEasUeo6wuqatkMDaRT+1uABiGXEu5vqgPd7FGE1BhsAIy9QVA==}
@@ -2611,9 +2611,6 @@ packages:
   zod@4.0.17:
     resolution: {integrity: sha512-1PHjlYRevNxxdy2JZ8JcNAw7rX8V9P1AKkP+x/xZfxB0K5FYfuV+Ug6P/6NVSR2jHQ+FzDDoDHS04nYUsOIyLQ==}
 
-  zstddec@0.0.2:
-    resolution: {integrity: sha512-DCo0oxvcvOTGP/f5FA6tz2Z6wF+FIcEApSTu0zV5sQgn9hoT5lZ9YRAKUraxt9oP7l4e8TnNdi8IZTCX6WCkwA==}
-
 snapshots:
 
   '@babel/runtime@7.28.2': {}
@@ -2626,16 +2623,16 @@ snapshots:
     dependencies:
       '@jridgewell/trace-mapping': 0.3.9
 
-  '@ellipsis-labs/phoenix-sdk@2.0.3(@solana/web3.js@1.98.4(bufferutil@4.0.9)(typescript@5.9.2)(utf-8-validate@5.0.10))(bufferutil@4.0.9)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.2)(utf-8-validate@5.0.10)':
+  '@ellipsis-labs/phoenix-sdk@1.0.5(@solana/web3.js@1.98.4(bufferutil@4.0.9)(typescript@5.9.2)(utf-8-validate@5.0.10))(bufferutil@4.0.9)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.2)(utf-8-validate@5.0.10)':
     dependencies:
       '@metaplex-foundation/beet': 0.7.2
       '@metaplex-foundation/rustbin': 0.3.5
       '@metaplex-foundation/solita': 0.12.2(bufferutil@4.0.9)(typescript@5.9.2)(utf-8-validate@5.0.10)
       '@solana/spl-token': 0.3.11(@solana/web3.js@1.98.4(bufferutil@4.0.9)(typescript@5.9.2)(utf-8-validate@5.0.10))(bufferutil@4.0.9)(fastestsmallesttextencoderdecoder@1.0.22)(typescript@5.9.2)(utf-8-validate@5.0.10)
+      '@types/node': 18.19.122
       bn.js: 5.2.2
       borsh: 0.7.0
       bs58: 5.0.0
-      zstddec: 0.0.2
     transitivePeerDependencies:
       - '@solana/web3.js'
       - bufferutil
@@ -5268,5 +5265,3 @@ snapshots:
   yocto-queue@0.1.0: {}
 
   zod@4.0.17: {}
-
-  zstddec@0.0.2: {}
