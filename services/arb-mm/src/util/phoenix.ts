@@ -124,6 +124,16 @@ export async function buildPhoenixSwapIxs(params: {
   const { connection, owner, market, side, sizeBase, limitPx, slippageBps } = params;
   const marketId = asKey(market);
 
+
+  // Accept either a PublicKey (with .toBuffer) or an object with publicKey.toBuffer
+  const hasDirectToBuffer = owner && typeof (owner as any).toBuffer === "function";
+  const hasNestedToBuffer = owner && (owner as any)?.publicKey && typeof (owner as any).publicKey.toBuffer === "function";
+  if (!hasDirectToBuffer && !hasNestedToBuffer) {
+    const reason = "owner_public_key_missing";
+    logger.log("phoenix_build_error", { reason });
+    return { ixs: [], reason };
+  }
+
   logger.log("phoenix_build_params", {
     market: marketId,
     side,
@@ -131,13 +141,6 @@ export async function buildPhoenixSwapIxs(params: {
     limitPx,
     slippageBps,
   });
-
-  // runtime guard to avoid "toBuffer of undefined" when caller passes a bad owner
-  if (!owner || typeof (owner as any).toBuffer !== "function") {
-    const reason = "owner_public_key_missing";
-    logger.log("phoenix_build_error", { reason });
-    return { ixs: [], reason };
-  }
 
   try {
     const Phoenix = await loadPhoenixModule();
@@ -147,31 +150,65 @@ export async function buildPhoenixSwapIxs(params: {
     // Side mapping: selling BASE => place an Ask; buying BASE => place a Bid
     const sideEnum = (side === "sell") ? Phoenix.Side.Ask : Phoenix.Side.Bid;
 
-    // Prefer the most modern helper if available
+    // Try each helper in order; catch errors and fall back
     let tx: any | null = null;
-
     if (typeof state?.getSwapTransaction === "function") {
-      // Modern pattern: marketState.getSwapTransaction({ side, inAmount, trader })
-      tx = await state.getSwapTransaction({
-        side: sideEnum,
-        inAmount: sizeBase,
-        trader: owner, // must be a PublicKey
-      });
-    } else if (typeof client?.getSwapTransaction === "function") {
-      // Alternate pattern: client.getSwapTransaction(marketPk, {...})
-      tx = await client.getSwapTransaction(
-        new PK(marketId),
-        { side: sideEnum, inAmount: sizeBase, trader: owner }
-      );
-    } else if (typeof state?.createSwapInstruction === "function") {
-      // Legacy pattern: a single Instruction creator
-      const ix = await state.createSwapInstruction({
-        side: sideEnum,
-        inAmount: sizeBase,
-        trader: owner,
-      });
-      tx = { instructions: [ix] };
-    } else {
+      try {
+        tx = await state.getSwapTransaction({
+          side: sideEnum,
+          inAmount: sizeBase,
+          trader: owner,
+        });
+      } catch (e) {
+        logger.log("phoenix_build_method_error", { method: "market.getSwapTransaction", error: (e as any)?.message ?? String(e) });
+        tx = null;
+      }
+    }
+    if (!tx && typeof client?.getSwapTransaction === "function") {
+      try {
+        tx = await client.getSwapTransaction(new PK(marketId), {
+          side: sideEnum,
+          inAmount: sizeBase,
+          trader: owner,
+        });
+      } catch (e) {
+        logger.log("phoenix_build_method_error", { method: "client.getSwapTransaction", error: (e as any)?.message ?? String(e) });
+        tx = null;
+      }
+    }
+    if (!tx && typeof (client as any)?.getSwapIxs === "function") {
+      try {
+        const res = await (client as any).getSwapIxs.call(client, {
+          market: new PK(marketId),
+          side: sideEnum,
+          inAmount: sizeBase,
+          trader: owner,
+        });
+        const ixs = Array.isArray(res) ? res :
+          res?.ixs ? res.ixs :
+            res?.instructions ? res.instructions : [];
+        if (ixs.length > 0) {
+          tx = { instructions: ixs };
+        }
+      } catch (e) {
+        logger.log("phoenix_build_method_error", { method: "client.getSwapIxs", error: (e as any)?.message ?? String(e) });
+        tx = null;
+      }
+    }
+    if (!tx && typeof state?.createSwapInstruction === "function") {
+      try {
+        const ix = await state.createSwapInstruction({
+          side: sideEnum,
+          inAmount: sizeBase,
+          trader: owner,
+        });
+        tx = { instructions: [ix] };
+      } catch (e) {
+        logger.log("phoenix_build_method_error", { method: "market.createSwapInstruction", error: (e as any)?.message ?? String(e) });
+        tx = null;
+      }
+    }
+    if (!tx) {
       const debug = { haveLots: !!state?.ticksPerBaseLot, haveTicks: !!state?.ticksPerBaseUnit, metaSummary: summarizeState(state) };
       logger.log("phoenix_build_result_shape", { type: "object", hasIxsField: false, isArray: false, keys: ["ok", "reason", "debug"] });
       return { ixs: [], reason: "phoenix_swap_helper_unavailable_in_sdk", debug };

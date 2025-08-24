@@ -123,36 +123,23 @@ export class LiveExecutor {
             keys: built && typeof built === "object" ? Object.keys(built) : null,
           });
 
-          // after:  const built = await buildPhoenixSwapIxs({...});
-          const keys = built && typeof built === "object" ? Object.keys(built as any) : [];
-          logger.log("phoenix_build_result_shape", {
-            type: typeof built,
-            hasIxsField: (built as any)?.ixs != null,
-            isArray: Array.isArray(built),
-            keys,
-          });
-
-          if (!(built as any)?.ok) {
-            const reason = (built as any)?.reason ?? "unknown";
+          // Parse instructions from whatever shape the helper returns.
+          const parsed = extractIxsFromPhoenixBuild(built);
+          phxIxs = parsed.ixs;
+          if (!phxIxs.length) {
+            const reason = (built as any)?.reason ?? parsed.reason ?? "phoenix_build_returned_no_instructions";
             let hint = "";
             if (reason === "below_min_base_lot") {
               const min = (built as any)?.debug?.metaSummary?.baseUnitsPerLot;
               hint = `size below Phoenix min lot. min_base_size=${min}`;
-            } else if (reason === "no_method_match") {
+            } else if (reason === "no_method_match" || reason === "phoenix_swap_helper_unavailable_in_sdk") {
               hint = "SDK method mismatch (ticks/lots vs ui units). Check phoenix_sdk_pick log for methods.";
             }
-            logger.log("submit_error", { where: "phoenix_build", error: reason, debug: (built as any)?.debug, hint });
-            return;
-          }
-
-          const parsed = extractIxsFromPhoenixBuild(built);
-          phxIxs = parsed.ixs;
-          if (!phxIxs.length) {
-            const reason = parsed.reason ?? "phoenix_build_returned_no_instructions";
             logger.log("submit_error", {
               where: "phoenix_build",
               error: reason,
-              debug: phxParams,
+              debug: (built as any)?.debug ?? phxParams,
+              hint,
             });
             return;
           }

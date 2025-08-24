@@ -23,6 +23,17 @@ export type PhoenixIxBuildResult =
   | { ok: false; reason: string };
 
 export async function buildPhoenixSwapIxs(p: PhoenixSwapIxParams): Promise<PhoenixIxBuildResult> {
+  // Ensure we have a valid trader PublicKey before calling the SDK.  If the caller
+  // passes an undefined or string value, fall back to the WALLET_PUBKEY env var.
+  if (!p.trader || typeof (p.trader as any).toBuffer !== "function") {
+    const fallback = process.env.WALLET_PUBKEY;
+    if (fallback) {
+      p.trader = new PublicKey(fallback);
+    } else {
+      return { ok: false, reason: "owner_public_key_missing" };
+    }
+  }
+
   try {
     const client = await (Phoenix as any).Client.create(p.connection);
 
@@ -73,8 +84,8 @@ export async function buildPhoenixSwapIxs(p: PhoenixSwapIxParams): Promise<Phoen
       // Accept common shapes: array, {ixs}, {instructions}
       const ixs: TransactionInstruction[] =
         (Array.isArray(res) ? res :
-         res?.ixs ? res.ixs :
-         res?.instructions ? res.instructions : []) as TransactionInstruction[];
+          res?.ixs ? res.ixs :
+            res?.instructions ? res.instructions : []) as TransactionInstruction[];
       if (ixs.length > 0) return { ok: true, ixs };
     }
 
@@ -88,8 +99,8 @@ export async function buildPhoenixSwapIxs(p: PhoenixSwapIxParams): Promise<Phoen
       });
       const ixs: TransactionInstruction[] =
         (Array.isArray(res) ? res :
-         res?.ixs ? res.ixs :
-         res?.instructions ? res.instructions : []) as TransactionInstruction[];
+          res?.ixs ? res.ixs :
+            res?.instructions ? res.instructions : []) as TransactionInstruction[];
       if (ixs.length > 0) return { ok: true, ixs };
     }
 

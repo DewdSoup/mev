@@ -40,7 +40,7 @@ function loadRootEnv() {
         dotenv.config({ path: p });
         return;
       }
-    } catch {}
+    } catch { }
   }
 
   // fallback to default resolution if nothing found
@@ -167,8 +167,8 @@ function loadLatestParamsSync(PARAMS_DIR: string): { file?: string; params: Dail
     const best = raw?.best ?? {};
     const params: DailyParams = {
       TRADE_THRESHOLD_BPS: typeof best.TRADE_THRESHOLD_BPS === "number" ? best.TRADE_THRESHOLD_BPS : undefined,
-      MAX_SLIPPAGE_BPS:   typeof best.MAX_SLIPPAGE_BPS   === "number" ? best.MAX_SLIPPAGE_BPS   : undefined,
-      TRADE_SIZE_BASE:    typeof best.TRADE_SIZE_BASE    === "number" ? best.TRADE_SIZE_BASE    : undefined,
+      MAX_SLIPPAGE_BPS: typeof best.MAX_SLIPPAGE_BPS === "number" ? best.MAX_SLIPPAGE_BPS : undefined,
+      TRADE_SIZE_BASE: typeof best.TRADE_SIZE_BASE === "number" ? best.TRADE_SIZE_BASE : undefined,
     };
     return { file: latest, params };
   } catch {
@@ -256,7 +256,8 @@ export function loadConfig(): AppConfig {
   const BOOK_TTL_MS = parseMsEnv(process.env.PHOENIX_BOOK_TTL_MS ?? process.env.BOOK_TTL_MS, 500, 100, 60000);
   const SYNTH_WIDTH_BPS = parseFloatEnv(process.env.PHOENIX_SYNTH_WIDTH_BPS, 8);
 
-  const DATA_ENV = process.env.DATA_DIR?.trim();
+  const DATA_ENV_RAW = process.env.DATA_DIR ?? process.env.ARB_DATA_DIR;
+  const DATA_ENV = DATA_ENV_RAW?.trim();
   const DATA_DIR = DATA_ENV
     ? (path.isAbsolute(DATA_ENV) ? DATA_ENV : path.resolve(SVC_ROOT, DATA_ENV))
     : path.resolve(SVC_ROOT, "data");
@@ -268,8 +269,8 @@ export function loadConfig(): AppConfig {
   const DEF_TRADE_SIZE_BASE = 0.1;
 
   const ENV_THRESHOLD = parseFloatEnv(process.env.TRADE_THRESHOLD_BPS, DEF_TRADE_THRESHOLD_BPS);
-  const ENV_MAX_SLIP  = parseFloatEnv(process.env.MAX_SLIPPAGE_BPS, DEF_MAX_SLIPPAGE_BPS);
-  const ENV_SIZE      = parseFloatEnv(process.env.TRADE_SIZE_BASE, DEF_TRADE_SIZE_BASE);
+  const ENV_MAX_SLIP = parseFloatEnv(process.env.MAX_SLIPPAGE_BPS, DEF_MAX_SLIPPAGE_BPS);
+  const ENV_SIZE = parseFloatEnv(process.env.TRADE_SIZE_BASE, DEF_TRADE_SIZE_BASE);
 
   let PARAM_FILE: string | undefined;
   let P_THRESHOLD: number | undefined;
@@ -284,12 +285,12 @@ export function loadConfig(): AppConfig {
   }
 
   const TRADE_THRESHOLD_BPS = P_THRESHOLD ?? ENV_THRESHOLD ?? DEF_TRADE_THRESHOLD_BPS;
-  const MAX_SLIPPAGE_BPS    = P_MAX_SLIP  ?? ENV_MAX_SLIP  ?? DEF_MAX_SLIPPAGE_BPS;
-  const TRADE_SIZE_BASE     = P_SIZE      ?? ENV_SIZE      ?? DEF_TRADE_SIZE_BASE;
+  const MAX_SLIPPAGE_BPS = P_MAX_SLIP ?? ENV_MAX_SLIP ?? DEF_MAX_SLIPPAGE_BPS;
+  const TRADE_SIZE_BASE = P_SIZE ?? ENV_SIZE ?? DEF_TRADE_SIZE_BASE;
 
   const PHOENIX_TAKER_FEE_BPS = parseFloatEnv(process.env.PHOENIX_TAKER_FEE_BPS, 0);
-  const AMM_TAKER_FEE_BPS     = parseFloatEnv(process.env.AMM_TAKER_FEE_BPS, 0);
-  const FIXED_TX_COST_QUOTE   = parseFloatEnv(process.env.FIXED_TX_COST_QUOTE, 0);
+  const AMM_TAKER_FEE_BPS = parseFloatEnv(process.env.AMM_TAKER_FEE_BPS, 0);
+  const FIXED_TX_COST_QUOTE = parseFloatEnv(process.env.FIXED_TX_COST_QUOTE, 0);
 
   const DECISION_DEDUPE_MS = parseMsEnv(process.env.DECISION_DEDUPE_MS, 1000, 0, 600000);
   const DECISION_BUCKET_MS = parseMsEnv(process.env.DECISION_BUCKET_MS, 250, 0, 600000);
