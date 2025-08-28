@@ -4,12 +4,23 @@
     "composite": true,
     "rootDir": "src",
     "outDir": "dist",
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src"],
+  "include": [
+    "src",
+    "../../types/**/*.d.ts"
+  ],
   "references": [
-    { "path": "../core" },
-    { "path": "../risk" },
-    { "path": "../storage" }
+    {
+      "path": "../core"
+    },
+    {
+      "path": "../risk"
+    },
+    {
+      "path": "../storage"
+    }
   ]
 }

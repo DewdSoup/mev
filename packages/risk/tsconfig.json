@@ -14,8 +14,13 @@
     "skipLibCheck": true,
     "stripInternal": true
   },
-  "include": ["src"],
+  "include": [
+    "src",
+    "../../types/**/*.d.ts"
+  ],
   "references": [
-    { "path": "../core" }
+    {
+      "path": "../core"
+    }
   ]
 }

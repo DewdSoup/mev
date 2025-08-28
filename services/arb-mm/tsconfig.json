@@ -4,7 +4,12 @@
     "rootDir": "src",
     "outDir": "dist",
     "composite": true,
-    "types": ["node"],
+    "types": [
+      "node"
+    ],
+    "typeRoots": [
+      "../../node_modules/@types"
+    ],
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "moduleResolution": "Bundler"
@@ -15,11 +20,23 @@
     "types/**/*.d.ts"
   ],
   "references": [
-    { "path": "../../packages/core" },
-    { "path": "../../packages/risk" },
-    { "path": "../../packages/storage" },
-    { "path": "../../packages/amms" },
-    { "path": "../../packages/phoenix" },
-    { "path": "../../packages/solana" }
+    {
+      "path": "../../packages/core"
+    },
+    {
+      "path": "../../packages/risk"
+    },
+    {
+      "path": "../../packages/storage"
+    },
+    {
+      "path": "../../packages/amms"
+    },
+    {
+      "path": "../../packages/phoenix"
+    },
+    {
+      "path": "../../packages/solana"
+    }
   ]
 }

@@ -13,10 +13,19 @@
     "composite": true,
     "outDir": "dist",
     "rootDir": "src",
-    "types": ["node"],
+    "types": [
+      "node"
+    ],
+    "typeRoots": [
+      "./node_modules/@types"
+    ],
     "paths": {
-      "@mev/solana": ["./packages/solana/src"],
-      "@mev/solana/*": ["./packages/solana/src/*"]
+      "@mev/solana": [
+        "./packages/solana/src"
+      ],
+      "@mev/solana/*": [
+        "./packages/solana/src/*"
+      ]
     }
   }
 }

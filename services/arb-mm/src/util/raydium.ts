@@ -1,6 +1,6 @@
 // services/arb-mm/src/util/raydium.ts
 // Raydium CPMM live swap builder using on-disk full pool keys (configs/raydium.pool.json).
-// Runtime is .env-only. Hardened for Raydium SDK variants.
+// Runtime is .env-only. Hardened for Raydium SDK variants + on-chain fallback.
 
 import fs from "fs";
 import path from "path";
@@ -19,16 +19,17 @@ import {
   Percent,
   Token,
   TokenAmount,
+  LIQUIDITY_STATE_LAYOUT_V4,
 } from "@raydium-io/raydium-sdk";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
 // ───────────────────────────────────────────────────────────────────────────────
-// ESM-safe dirname (avoid CJS-only globals)
+// ESM-safe dirname
 const __filename = fileURLToPath(import.meta.url);
 const __here = path.dirname(__filename);
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Env-driven constants (safe defaults; .env overrides)
+// Env-driven constants
 export const CPMM_PROGRAM_ID = new PublicKey(
   process.env.RAYDIUM_CPMM_PROGRAM_ID ??
   "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
@@ -50,7 +51,7 @@ const LOG_TOKEN_CTOR = (process.env.LOG_RAYDIUM_TOKEN_CTOR ?? "0") === "1";
 const LOG_SWAP_BUILD = (process.env.LOG_RAYDIUM_SWAP_BUILD ?? "0") === "1";
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Pool JSON discovery (mirror AMMs adapter precedence)
+// Pool JSON discovery
 function getenv(k: string) {
   const v = process.env[k];
   return typeof v === "string" && v.trim() ? v.trim() : undefined;
@@ -177,7 +178,48 @@ function toPoolKeys(d: DiskPoolKeys): LiquidityPoolKeys {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// RPC
+// On-chain fallback: decode the AMM state and build full pool keys (V4)
+// ───────────────────────────────────────────────────────────────────────────────
+async function derivePoolKeysFromOnchain(
+  conn: Connection,
+  ammId: PublicKey
+): Promise<LiquidityPoolKeys> {
+  const info = await conn.getAccountInfo(ammId, "processed");
+  if (!info) throw new Error(`raydium_onchain_decode_failed: AMM not found ${ammId.toBase58()}`);
+
+  // Note: state layout returns Buffers; cast through PublicKey.
+  const s: any = LIQUIDITY_STATE_LAYOUT_V4.decode(info.data);
+
+  const out: any = {
+    id: ammId,
+    version: 4,
+    programId: info.owner, // owner is the AMM program id
+    baseMint: new PublicKey(s.baseMint),
+    quoteMint: new PublicKey(s.quoteMint),
+    lpMint: new PublicKey(s.lpMint ?? s.baseMint), // satisfy type if lpMint absent
+    authority: new PublicKey(s.authority),
+    openOrders: new PublicKey(s.openOrders),
+    targetOrders: new PublicKey(s.targetOrders),
+    baseVault: new PublicKey(s.baseVault),
+    quoteVault: new PublicKey(s.quoteVault),
+
+    marketProgramId: new PublicKey(s.marketProgramId),
+    marketId: new PublicKey(s.marketId),
+    marketBids: new PublicKey(s.marketBids),
+    marketAsks: new PublicKey(s.marketAsks),
+    marketEventQueue: new PublicKey(s.marketEventQueue),
+    marketBaseVault: new PublicKey(s.marketBaseVault),
+    marketQuoteVault: new PublicKey(s.marketQuoteVault),
+
+    withdrawQueue: new PublicKey(s.withdrawQueue),
+    lpVault: new PublicKey(s.lpVault),
+  };
+
+  return out as LiquidityPoolKeys;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// RPC helpers
 function resolveRpc(): string {
   const fromEnv = process.env.RPC_URL?.trim() || process.env.RPC_PRIMARY?.trim();
   if (fromEnv) return fromEnv;
@@ -218,7 +260,7 @@ async function resolveMintDecimals(
 
 // ───────────────────────────────────────────────────────────────────────────────
 // CPMM math & minOut
-const BPS = 10_000n;
+const BPS = 10_000;
 
 async function getVaultReserves(
   conn: Connection,
@@ -237,9 +279,8 @@ async function getVaultReserves(
 }
 
 function applyBpsDown(x: BN, bps: number): BN {
-  const b = BigInt(Math.max(0, Math.min(10_000, Math.ceil(bps))));
-  const xb = x.mul(new BN(Number(BPS - b)));
-  return xb.div(new BN(Number(BPS)));
+  const b = Math.max(0, Math.min(10_000, Math.ceil(bps)));
+  return x.mul(new BN(BPS - b)).div(new BN(BPS));
 }
 
 function cpmmExpectedOut({
@@ -355,11 +396,17 @@ async function tryBuildSwapIxCompat(argsBase: any) {
   const tries: Array<{ label: string; patch: Record<string, any> }> = [
     // ✅ Canonical for Liquidity CPMM (prevents .isZero on undefined)
     { label: "amountOut (canonical)", patch: { amountOut: argsBase._minOutTA } },
-    { label: "amountOut + slippage", patch: { amountOut: argsBase._minOutTA, slippage: argsBase._slipPercent } },
+    {
+      label: "amountOut + slippage",
+      patch: { amountOut: argsBase._minOutTA, slippage: argsBase._slipPercent },
+    },
 
     // 🧰 Legacy / alt signatures some SDK builds recognize
     { label: "amountOutMin (legacy)", patch: { amountOutMin: argsBase._minOutTA } },
-    { label: "otherAmountThreshold (CLMM-ish)", patch: { otherAmountThreshold: argsBase._minOutTA } },
+    {
+      label: "otherAmountThreshold (CLMM-ish)",
+      patch: { otherAmountThreshold: argsBase._minOutTA },
+    },
 
     // Belt-and-suspenders in case the lib inspects more than one field
     {
@@ -431,21 +478,31 @@ export async function buildRaydiumSwapIx(params: {
   slippageBps: number; // may be fractional (e.g., 50.25)
 }): Promise<CpmmIxBuildResult> {
   try {
-    const disk = readPoolJson();
-    const envAmm =
-      (process.env.RAYDIUM_POOL_ID ??
-        process.env.RAYDIUM_POOL_ID_SOL_USDC ??
-        "").trim();
-    if (envAmm && envAmm !== disk.id) {
-      return {
-        ok: false,
-        reason: `raydium_swap_build_error: pool id mismatch (env=${envAmm} json=${disk.id})`,
-      };
-    }
-    const poolKeys = toPoolKeys(disk);
-
     const rpc = resolveRpc();
     const conn = new Connection(rpc, { commitment: "processed" });
+
+    const envAmmStr = (
+      process.env.RAYDIUM_POOL_ID ??
+      process.env.RAYDIUM_POOL_ID_SOL_USDC ??
+      DEFAULT_SOL_USDC_POOL.toBase58()
+    ).trim();
+    const ammId = new PublicKey(envAmmStr);
+
+    // Prefer disk when available; otherwise derive from chain
+    let poolKeys: LiquidityPoolKeys;
+    try {
+      const disk = readPoolJson();
+      if (envAmmStr && envAmmStr !== disk.id) {
+        return {
+          ok: false,
+          reason: `raydium_swap_build_error: pool id mismatch (env=${envAmmStr} json=${disk.id})`,
+        };
+      }
+      poolKeys = toPoolKeys(disk);
+    } catch {
+      poolKeys = await derivePoolKeysFromOnchain(conn, ammId);
+    }
+
     const tokenAccounts = await fetchUserTokenAccounts(conn, params.user);
     const amountIn = new BN(params.amountInBase.toString());
 
@@ -522,15 +579,22 @@ export async function tryAssertRaydiumFeeBps(
   if (!wantAssert) return configuredFeeBps;
 
   try {
-    // use the same disk json as the swap builder
-    const disk = readPoolJson();
-    if (disk.id !== poolId) {
-      console.warn("[raydium_fee_check] poolId mismatch env/json", {
-        env: poolId,
-        json: disk.id,
-      });
+    let poolKeys: LiquidityPoolKeys;
+    try {
+      const disk = readPoolJson();
+      if (disk.id !== poolId) {
+        console.warn("[raydium_fee_check] poolId mismatch env/json", {
+          env: poolId,
+          json: disk.id,
+        });
+      }
+      poolKeys = toPoolKeys(disk);
+    } catch {
+      poolKeys = await derivePoolKeysFromOnchain(
+        connection,
+        new PublicKey(poolId)
+      );
     }
-    const poolKeys = toPoolKeys(disk); // full keys with programId, vaults, etc.
 
     const info = await Liquidity.fetchInfo({ connection, poolKeys });
     const s: any = (info as any)?.state ?? (info as any) ?? {};
@@ -565,7 +629,10 @@ export async function tryAssertRaydiumFeeBps(
       return onchainBps;
     }
 
-    console.warn("[raydium_fee_unknown] keeping configured fee", configuredFeeBps);
+    console.warn(
+      "[raydium_fee_unknown] keeping configured fee",
+      configuredFeeBps
+    );
     return configuredFeeBps;
   } catch (e) {
     console.warn(

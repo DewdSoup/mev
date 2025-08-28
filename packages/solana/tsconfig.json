@@ -7,9 +7,16 @@
     "declaration": true,
     "declarationMap": true
   },
-  "include": ["src"],
+  "include": [
+    "src",
+    "../../types/**/*.d.ts"
+  ],
   "references": [
-    { "path": "../core" },
-    { "path": "../storage" }
+    {
+      "path": "../core"
+    },
+    {
+      "path": "../storage"
+    }
   ]
 }

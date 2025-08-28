@@ -383,7 +383,10 @@ async function main() {
   });
   sup.start();
 
-  const conn = new Connection(RPC, { commitment: "processed" });
+  // Attach WS endpoint so Phoenix runs with live subscriptions
+  const WS = process.env.RPC_WSS_URL?.trim();
+  const conn = new Connection(RPC, { commitment: "processed", wsEndpoint: WS });
+
   startHealth(conn).catch(() => { });
   initRisk();
 
@@ -454,13 +457,14 @@ async function main() {
   logger.log("edge_paths", { amms: CFG.AMMS_JSONL, phoenix: CFG.PHOENIX_JSONL, min_abs_bps: CFG.EDGE_MIN_ABS_BPS });
   logger.log("edge_config", { book_ttl_ms: CFG.BOOK_TTL_MS, synth_width_bps: CFG.SYNTH_WIDTH_BPS });
 
+  // Log the exact inputs used by EV (note: AMM fee is 0 here because it's already in eff px)
   logger.log("edge_decision_config", {
     trade_threshold_bps: CFG.TRADE_THRESHOLD_BPS,
     max_slippage_bps: CFG.MAX_SLIPPAGE_BPS,
     phoenix_slippage_bps: CFG.PHOENIX_SLIPPAGE_BPS,
     trade_size_base: CFG.TRADE_SIZE_BASE,
     phoenix_taker_fee_bps: PHX_FEE_BPS,
-    amm_taker_fee_bps: AMM_FEE_BPS,
+    amm_taker_fee_bps: 0,                     // ← important: no double-count
     fixed_tx_cost_quote: CFG.FIXED_TX_COST_QUOTE,
     decision_dedupe_ms: CFG.DECISION_DEDUPE_MS,
     decision_bucket_ms: CFG.DECISION_BUCKET_MS,
@@ -477,8 +481,8 @@ async function main() {
     shadow_trading: SHADOW,
   });
 
-  // RPC sim fn is OFF in live because USE_RPC_SIM=0
-  const rpcSimFn: RpcSimFn | undefined = undefined;
+  // RPC sim fn is OFF in live because USE_RPC_SIM=0 (unless you set it on)
+  const rpcSimFn: RpcSimFn | undefined = CFG.USE_RPC_SIM ? (async () => undefined) as any : undefined;
 
   const mkShadowSig = () =>
     `shadow_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e9).toString(36)}`;
@@ -507,7 +511,7 @@ async function main() {
   // ──────────────────────────────────────────────────────────────────────
   const onDecision: DecisionHook = (_wouldTrade, _edgeNetBps, _expectedPnl, d) => {
     const edgeNetBps = Number(_edgeNetBps ?? 0);
-    const expPnl = Number(_expectedPnl ?? 0);
+    const expPnl = Number(_expectedPnl ?? 0); // expected PnL in QUOTE
     if (!d) { recordDecision(false, edgeNetBps, expPnl); return; }
 
     if (ALLOWED !== "both" && d.path && d.path !== ALLOWED) {
@@ -625,28 +629,29 @@ async function main() {
     if (s?.blocked) rpcBlocked++;
   };
 
+  // Use CFG values (not ad-hoc env fallbacks); AMM fee = 0 in EV (already in eff px)
   const joiner = new EdgeJoiner(
     {
-      minAbsBps: Number(process.env.EDGE_MIN_ABS_BPS ?? 0),
-      waitLogMs: Number(process.env.EDGE_WAIT_LOG_MS ?? 5000),
-      thresholdBps: Number(process.env.TRADE_THRESHOLD_BPS ?? 0.05),
-      flatSlippageBps: Number(process.env.MAX_SLIPPAGE_BPS ?? 2.0),
-      tradeSizeBase: Number(process.env.TRADE_SIZE_BASE ?? 0.02),
+      minAbsBps: CFG.EDGE_MIN_ABS_BPS,
+      waitLogMs: CFG.EDGE_WAIT_LOG_MS,
+      thresholdBps: CFG.TRADE_THRESHOLD_BPS,
+      flatSlippageBps: CFG.MAX_SLIPPAGE_BPS,
+      tradeSizeBase: CFG.TRADE_SIZE_BASE,
       phoenixFeeBps: PHX_FEE_BPS,
-      ammFeeBps: AMM_FEE_BPS,
-      fixedTxCostQuote: Number(process.env.FIXED_TX_COST_QUOTE ?? 0),
+      ammFeeBps: 0,                           // ← important: no double-count
+      fixedTxCostQuote: CFG.FIXED_TX_COST_QUOTE,
     },
     {
-      bookTtlMs: Number(process.env.BOOK_TTL_MS ?? 500),
-      activeSlippageMode: "adaptive",
-      phoenixSlippageBps: Number(process.env.PHOENIX_SLIPPAGE_BPS ?? 3),
-      cpmmMaxPoolTradeFrac: Number(process.env.CPMM_MAX_POOL_TRADE_FRAC ?? 0.05),
-      dynamicSlippageExtraBps: Number(process.env.DYNAMIC_SLIPPAGE_BPS ?? 0.25),
-      logSimFields: String(process.env.LOG_SIM_FIELDS ?? "1") === "1",
-      enforceDedupe: true,
-      decisionBucketMs: Number(process.env.DECISION_BUCKET_MS ?? 200),
-      decisionMinEdgeDeltaBps: Number(process.env.DECISION_MIN_EDGE_DELTA_BPS ?? 0.05),
-      useRpcSim: false,
+      bookTtlMs: CFG.BOOK_TTL_MS,
+      activeSlippageMode: CFG.ACTIVE_SLIPPAGE_MODE,
+      phoenixSlippageBps: CFG.PHOENIX_SLIPPAGE_BPS,
+      cpmmMaxPoolTradeFrac: CFG.CPMM_MAX_POOL_TRADE_FRAC,
+      dynamicSlippageExtraBps: CFG.DYNAMIC_SLIPPAGE_EXTRA_BPS,
+      logSimFields: CFG.LOG_SIM_FIELDS,
+      enforceDedupe: CFG.ENFORCE_DEDUPE,
+      decisionBucketMs: CFG.DECISION_BUCKET_MS,
+      decisionMinEdgeDeltaBps: CFG.DECISION_MIN_EDGE_DELTA_BPS,
+      useRpcSim: CFG.USE_RPC_SIM,
     },
     onDecision,
     rpcSimFn,

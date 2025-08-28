@@ -21,8 +21,8 @@ function parseTopOfBook(stdout: string) {
   if (askLine.length < 2 || bidLine.length < 2) return null
 
   const ask_price = askLine[0]
-  const ask_size  = askLine[1]
-  const bid_size  = bidLine[0]
+  const ask_size = askLine[1]
+  const bid_size = bidLine[0]
   const bid_price = bidLine[1]
 
   if (![ask_price, ask_size, bid_price, bid_size].every(Number.isFinite)) return null

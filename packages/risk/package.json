@@ -8,5 +8,9 @@
     },
     "devDependencies": {
         "typescript": "^5.9.2"
+    },
+    "dependencies": {
+        "@ellipsis-labs/phoenix-sdk": "2.0.3",
+        "@solana/web3.js": "^1.98.4"
     }
 }

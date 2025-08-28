@@ -11,12 +11,12 @@
         "build": "tsc -b"
     },
     "dependencies": {
+        "@ellipsis-labs/phoenix-sdk": "2.0.3",
         "@mev/storage": "workspace:*",
         "@solana/spl-token": "^0.4.13",
-        "@solana/web3.js": "^1.98.4"
+        "@solana/web3.js": "^1.95.3"
     },
     "devDependencies": {
-        "@types/node": "^24.2.1",
         "tsx": "^4.20.3",
         "typescript": "^5.9.2"
     }

@@ -6,17 +6,17 @@
     "types": "dist/index.d.ts",
     "scripts": {
         "dev": "tsx watch src/index.ts",
-        "build": "tsc -b"
+        "build": "tsc -b",
+        "start": "node dist/index.js"
     },
     "dependencies": {
-        "@ellipsis-labs/phoenix-sdk": "1.0.5",
+        "@ellipsis-labs/phoenix-sdk": "2.0.3",
         "@mev/storage": "workspace:*",
         "@solana/web3.js": "^1.98.4",
         "dotenv": "^16.6.1",
         "zod": "^4.0.17"
     },
     "devDependencies": {
-        "@types/node": "^22.17.1",
         "fastestsmallesttextencoderdecoder": "^1.0.22",
         "tslib": "^2.8.1",
         "tsx": "^4.20.3",

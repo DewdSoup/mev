@@ -1,0 +1,8 @@
+/// <reference types="node" />
+
+// Minimal ambient modules so the editor doesn't require .d.ts from the SDKs
+declare module "@ellipsis-labs/phoenix-sdk" {
+    const mod: any;
+    export = mod;
+}
+

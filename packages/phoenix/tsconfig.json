@@ -1,14 +1,23 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "composite": true,
-    "outDir": "dist",
     "rootDir": "src",
-    "types": ["node"]
+    "outDir": "dist",
+    "composite": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "types": [
+      "node"
+    ],
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true
   },
-  "include": ["src"],
-  "references": [
-    { "path": "../core" },
-    { "path": "../risk" }
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "../../types/**/*.d.ts"
   ]
 }

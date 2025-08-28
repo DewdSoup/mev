@@ -13,22 +13,25 @@
         "daily": "tsx scripts/daily.ts",
         "daily:if-needed": "tsx scripts/daily_if_needed.ts",
         "report:live": "tsx scripts/live_report.ts",
+        "dump:raydium": "tsx scripts/dump_raydium_pool_keys.ts",
+        "phoenix:diag": "tsx src/diag.ts",
         "start:prod": "node dist/src/main.js",
         "ml:tap": "tsx scripts/ml_tap.ts",
         "start": "node dist/main.js"
     },
     "dependencies": {
-        "@ellipsis-labs/phoenix-sdk": "1.0.5",
+        "@ellipsis-labs/phoenix-sdk": "2.0.3",
         "@mev/core": "workspace:*",
         "@mev/phoenix": "workspace:*",
+        "@raydium-io/raydium-sdk": "1.3.1-beta.58",
         "@mev/risk": "workspace:*",
         "@mev/storage": "workspace:*",
         "@solana/web3.js": "^1.95.3",
-        "dotenv": "^16.4.5"
+        "dotenv": "^16.4.5",
+        "tslib": "^2.6.3"
     },
     "devDependencies": {
-        "@types/node": "^22.7.4",
-        "tsx": "^4.20.3",
+        "tsx": "^4.20.5",
         "typescript": "^5.9.2"
     }
 }

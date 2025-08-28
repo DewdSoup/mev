@@ -6,21 +6,33 @@ import fs from "fs";
 import path from "path";
 import { logger as base } from "@mev/storage";
 import { writeMlEvent } from "./ml_events.js";
-import { stamp } from "./config.js";
 
-const SESSION_ID = (process.env.SESSION_ID?.trim() || `sess_${stamp()}`) as string;
+// local, file-safe timestamp (YYYYMMDDTHHMMSSmmmZ → sans colons)
+function stamp() {
+  return new Date().toISOString().replace(/[:.]/g, "").replace("Z", "Z");
+}
+
+const SESSION_ID =
+  (process.env.SESSION_ID?.trim() || `sess_${stamp()}`) as string;
 const SESSION_LOGS_ENABLE = getBool("SESSION_LOGS_ENABLE", true);
-const SESSION_LOGS_DIR = process.env.SESSION_LOGS_DIR?.trim() || "services/arb-mm/data/sessions";
-const SESSION_FILE = path.resolve(process.cwd(), SESSION_LOGS_DIR, `${SESSION_ID}.events.jsonl`);
+const SESSION_LOGS_DIR =
+  process.env.SESSION_LOGS_DIR?.trim() || "services/arb-mm/data/sessions";
+const SESSION_FILE = path.resolve(
+  process.cwd(),
+  SESSION_LOGS_DIR,
+  `${SESSION_ID}.events.jsonl`,
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// small io helper
+// small io helpers
 function getBool(k: string, d = false) {
   const v = String(process.env[k] ?? (d ? "1" : "0")).toLowerCase();
   return v === "1" || v === "true" || v === "yes";
 }
 function ensureDir(p: string) {
-  try { fs.mkdirSync(p, { recursive: true }); } catch {}
+  try {
+    fs.mkdirSync(p, { recursive: true });
+  } catch {}
 }
 function appendJsonl(obj: any) {
   if (!SESSION_LOGS_ENABLE) return;
@@ -44,111 +56,116 @@ type Stats = {
   filled_quote_sum?: number;
   filled_base_sum?: number;
 };
+
 const stats: Stats = {
-  considered: 0, would_trade: 0, would_not_trade: 0,
-  submitted_tx: 0, landed: 0, land_error: 0,
+  considered: 0,
+  would_trade: 0,
+  would_not_trade: 0,
+  submitted_tx: 0,
+  landed: 0,
+  land_error: 0,
   tip_lamports_sum: 0,
 };
 
-type PathCounts = {
-  [path: string]: {
-    considered?: number;
-    submitted?: number;
-    landed?: number;
-    errors?: number;
-  };
-};
-const pathCounts: PathCounts = Object.create(null);
+const pathCounts: Record<string, number> = Object.create(null);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// session_start row
-appendJsonl({ ts: Date.now(), session_id: SESSION_ID, name: "session_start", data: {
-  pid: process.pid,
-  cwd: process.cwd(),
-  env_digest: {
-    LIVE_TRADING: getBool("LIVE_TRADING", false),
-    SHADOW_TRADING: getBool("SHADOW_TRADING", false),
-    USE_RPC_SIM: getBool("USE_RPC_SIM", false),
+function bumpStats(event: string, data?: any) {
+  switch (event) {
+    case "would_trade":
+      stats.considered++;
+      stats.would_trade++;
+      break;
+    case "would_not_trade":
+      stats.considered++;
+      stats.would_not_trade++;
+      break;
+    case "submitted_tx":
+      stats.submitted_tx++;
+      break;
+    case "landed":
+      if (data?.status === "ok") {
+        stats.landed++;
+      } else {
+        stats.land_error++;
+      }
+      break;
   }
-}});
 
-function bumpStats(event: string, data: any) {
-  // per-path counters
-  const p = data?.path as string | undefined;
-  if (p) {
-    const c = (pathCounts[p] ||= {});
-    if (event === "would_trade" || event === "would_not_trade") {
-      c.considered = (c.considered ?? 0) + 1;
-    } else if (event === "submitted_tx") {
-      c.submitted = (c.submitted ?? 0) + 1;
-    } else if (event === "landed") {
-      c.landed = (c.landed ?? 0) + 1;
-    } else if (event === "land_error") {
-      c.errors = (c.errors ?? 0) + 1;
+  const edge = Number(data?.edge_bps_net ?? data?.edge_bps);
+  if (Number.isFinite(edge)) {
+    if (stats.best_edge_bps === undefined || edge > stats.best_edge_bps) {
+      stats.best_edge_bps = edge;
+    }
+    if (stats.worst_edge_bps === undefined || edge < stats.worst_edge_bps) {
+      stats.worst_edge_bps = edge;
     }
   }
 
-  // overall stats
-  if (event === "would_trade" || event === "would_not_trade") {
-    stats.considered++;
-    if (event === "would_trade") stats.would_trade++; else stats.would_not_trade++;
-    const b = Number(data?.edge_bps_net);
-    if (Number.isFinite(b)) {
-      stats.best_edge_bps = stats.best_edge_bps == null ? b : Math.max(stats.best_edge_bps, b);
-      stats.worst_edge_bps = stats.worst_edge_bps == null ? b : Math.min(stats.worst_edge_bps, b);
-    }
-  } else if (event === "submitted_tx") {
-    stats.submitted_tx++;
-  } else if (event === "landed") {
-    stats.landed++;
-    const fq = Number(data?.filled_quote);
-    const fb = Number(data?.filled_base);
-    if (Number.isFinite(fq)) stats.filled_quote_sum = (stats.filled_quote_sum ?? 0) + fq;
-    if (Number.isFinite(fb)) stats.filled_base_sum = (stats.filled_base_sum ?? 0) + fb;
-  } else if (event === "land_error") {
-    stats.land_error++;
-  } else if (event === "tip_calc") {
-    const t = Number(data?.tip_lamports);
-    if (Number.isFinite(t)) stats.tip_lamports_sum += t;
+  const tip = Number(data?.tip_lamports ?? data?.tipLamports);
+  if (Number.isFinite(tip)) {
+    stats.tip_lamports_sum += tip;
   }
+
+  const fq = Number(data?.filled_quote ?? data?.filledQuote);
+  if (Number.isFinite(fq)) stats.filled_quote_sum = (stats.filled_quote_sum ?? 0) + fq;
+
+  const fb = Number(data?.filled_base ?? data?.filledBase);
+  if (Number.isFinite(fb)) stats.filled_base_sum = (stats.filled_base_sum ?? 0) + fb;
+
+  const p = String(data?.path ?? "").trim();
+  if (p) pathCounts[p] = (pathCounts[p] ?? 0) + 1;
 }
 
+export function getSessionId() {
+  return SESSION_ID;
+}
+export function getSessionStats(): Stats {
+  return { ...stats };
+}
+
+// Unified logger: forwards to base runtime logger *and* writes ML/session JSONL.
 export const logger = {
-  log(event: string, data?: any) {
-    // 1) normal runtime line
-    base.log(event, data);
-    // 2) mirror to ML file
-    writeMlEvent({ ts: Date.now(), session_id: SESSION_ID, name: event, data });
-    // 3) write to session aggregate file
-    appendJsonl({ ts: Date.now(), session_id: SESSION_ID, name: event, data });
-    // 4) update counters
-    bumpStats(event, data ?? {});
+  log(event: string, payload?: any) {
+    // 1) Forward to base (@mev/storage) so existing logs stay identical
+    base.log(event, payload);
+
+    // 2) ML-friendly line (include session_id)
+    const now = Date.now();
+    const rec = payload === undefined ? { ts: now, event, session_id: SESSION_ID }
+                                      : { ts: now, event, session_id: SESSION_ID, ...payload };
+    try { writeMlEvent(rec); } catch {}
+
+    // 3) Per-session JSONL aggregator (human tail-able)
+    appendJsonl(rec);
+
+    // 4) Stats
+    bumpStats(event, payload);
+  },
+
+  // Optional: simple scoping like @mev/storage.logger.scope()
+  scope(scope: string) {
+    return {
+      log: (event: string, payload?: any) =>
+        logger.log(`${scope}_${event}`, payload),
+    };
   },
 };
 
-// flush a session_end row on shutdown
-function flushSessionEnd(code?: number) {
-  appendJsonl({
-    ts: Date.now(),
-    session_id: SESSION_ID,
-    name: "session_end",
-    data: {
-      exit_code: code ?? 0,
-      stats: { ...stats },
-      counts_by_path: { ...pathCounts },
-    },
-  });
-}
-let flushed = false;
-function onceFlush(code?: number) {
-  if (flushed) return;
-  flushed = true;
-  try { flushSessionEnd(code); } catch {}
-}
-process.on("beforeExit", () => onceFlush(0));
-process.on("exit", (code) => onceFlush(code ?? 0));
-process.on("SIGINT", () => { onceFlush(0); });
-process.on("SIGTERM", () => { onceFlush(0); });
+// Write a one-liner at process start so the session file exists early.
+appendJsonl({ ts: Date.now(), event: "session_start", session_id: SESSION_ID });
 
-export function getSessionId() { return SESSION_ID; }
-export function getSessionStats(): Stats { return { ...stats }; }
+// Write a summary at shutdown
+function writeSessionEnd() {
+  const out = {
+    ts: Date.now(),
+    event: "session_end",
+    session_id: SESSION_ID,
+    stats: { ...stats },
+    counts_by_path: { ...pathCounts },
+  };
+  try { appendJsonl(out); } catch {}
+}
+
+process.once("SIGINT", () => writeSessionEnd());
+process.once("SIGTERM", () => writeSessionEnd());
+process.once("beforeExit", () => writeSessionEnd());

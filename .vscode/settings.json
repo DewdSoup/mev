@@ -2,6 +2,10 @@
   "editor.formatOnSave": true,
   "files.trimTrailingWhitespace": true,
   "typescript.tsdk": "node_modules/typescript/lib",
-  "eslint.validate": ["typescript"],
-  "editor.defaultFormatter": "esbenp.prettier-vscode"
+  "eslint.validate": [
+    "typescript"
+  ],
+  "typescript.enablePromptUseWorkspaceTsdk": true,
+  "typescript.validate.enable": false, // <- hides TS problems in this workspace
+  "javascript.validate.enable": false // <- optional, if you don’t want JS validation either
 }

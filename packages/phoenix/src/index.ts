@@ -1,554 +1,393 @@
 // packages/phoenix/src/index.ts
-// Phoenix L2 publisher with robust .env loading, Helius-first RPC, SDK multi-path L2,
-// optional WS subscribe, and Pyth fallback (Hermes).
-// Adds top-N depth arrays (levels_bids/levels_asks) for depth-walking on the consumer side.
-//
+// Phoenix L2 publisher with SDK L3 fallback (aggregates L3 → L2)
 // Emits:
-//   - phoenix_l2 { ts, market, symbol, best_bid/best_ask, phoenix_mid, tick_ms, source, levels_*? }
-//   - phoenix_mid { ts, market, symbol, px, px_str, best_bid?, best_ask?, tick_ms, source }
-//   - phoenix_l2_empty { ts, market, symbol, haveBid, haveAsk, tick_ms, source }
+//   phoenix_l2  { ts, market, symbol, best_bid, best_ask, phoenix_mid, tick_ms, source, levels_bids?, levels_asks? }
+//   phoenix_mid { ts, market, symbol, px, px_str, best_bid?, best_ask?, tick_ms, source }
+//   phoenix_l2_empty { ts, market, symbol, haveBid, haveAsk, tick_ms, source }
 
 import fs from "fs";
 import path from "path";
 import * as dotenv from "dotenv";
-import { Connection, PublicKey, clusterApiUrl } from "@solana/web3.js";
-// NOTE: In phoenix-sdk v1.0.x the package does not export Client/MarketState
-// as named exports.  Import the entire module and use dynamic resolution.
+import { Connection, PublicKey, Commitment } from "@solana/web3.js";
 import * as PhoenixSDK from "@ellipsis-labs/phoenix-sdk";
 import { logger } from "@mev/storage";
+import { makePhoenixConnection } from "./rpc.js";
 
-// Fallback typings so TypeScript will compile even if the SDK type exports change.
 type MarketState = any;
 
-// ── Load .env from repo root ────────────────────────────────────────────────
-function loadRootEnv() {
-  const candidates = [
+// ── env load ──────────────────────────────────────────────────────────────────
+(function loadRootEnv() {
+  const c = [
     path.resolve(process.cwd(), ".env"),
-    path.resolve(process.cwd(), "..", "..", ".env"),
-    path.resolve(process.cwd(), "..", "..", "..", ".env"),
+    path.resolve(process.cwd(), ".env.live"),
+    path.resolve(process.cwd(), "packages/phoenix/.env"),
   ];
-  for (const p of candidates) {
-    if (fs.existsSync(p)) {
-      dotenv.config({ path: p });
-      return;
-    }
-  }
+  for (const p of c) if (fs.existsSync(p)) { dotenv.config({ path: p }); break; }
   dotenv.config();
-}
-loadRootEnv();
+})();
 
-// ── Env helpers ─────────────────────────────────────────────────────────────
-function parseMsEnv(v: string | undefined, def = 2000, min = 200, max = 60000) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return def;
-  return Math.max(min, Math.min(max, Math.floor(n)));
-}
-function parseIntEnv(v: string | undefined, def = 1, min = 1, max = 50) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return def;
-  return Math.max(min, Math.min(max, Math.floor(n)));
-}
-function parseBoolEnv(v: string | undefined, def = true) {
-  if (v == null) return def;
+// ── helpers ───────────────────────────────────────────────────────────────────
+const numOr = (v: string | undefined, d: number) => {
+  const n = Number(v); return Number.isFinite(n) ? n : d;
+};
+const boolOr = (v: string | undefined, d: boolean) => {
+  if (v == null) return d;
   const s = v.trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes";
-}
+};
+const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
 
-// ── RPC: Helius-first ──────────────────────────────────────────────────────
-function resolveRpc(): string {
-  const primary = process.env.RPC_PRIMARY?.trim();
+// ── RPC resolve (for logging/masking only) ────────────────────────────────────
+function resolveRpcForMask(): string {
+  const primary = process.env.RPC_PRIMARY?.trim() || process.env.RPC_URL?.trim();
   if (primary) return primary;
   const heliusKey = process.env.HELIUS_API_KEY?.trim();
   if (heliusKey) return `https://rpc.helius.xyz/?api-key=${heliusKey}`;
-  return clusterApiUrl("mainnet-beta");
+  return "https://api.mainnet-beta.solana.com";
 }
-function maskUrl(u: string): string {
+function maskUrl(u: string) {
   try {
     const url = new URL(u);
     if (url.searchParams.has("api-key")) url.searchParams.set("api-key", "***");
     return url.toString();
-  } catch {
-    return u;
-  }
+  } catch { return u; }
 }
-const RPC = resolveRpc();
 
-const TICK_MS = parseMsEnv(process.env.PHOENIX_TICK_MS, 2000, 200, 60000);
-const L2_FETCH_DEPTH = parseIntEnv(process.env.PHOENIX_L2_DEPTH, 12, 1, 50);
-const PUBLISH_DEPTH = parseIntEnv(process.env.PHOENIX_DEPTH_LEVELS, L2_FETCH_DEPTH, 1, 50);
-const TRY_WS = parseBoolEnv(process.env.PHOENIX_WS_ENABLED, true);
+const RPC_MASK = resolveRpcForMask();
+const COMMITMENT: Commitment = "processed";
 
-// ── Config models ───────────────────────────────────────────────────────────
-type MarketCfg = {
-  symbol: string;
-  phoenix?: { market: string };
-  pyth_price_id?: string;
-};
+const TICK_MS = clamp(numOr(process.env.PHOENIX_TICK_MS, 2000), 100, 60000);
+const L2_FETCH_DEPTH = clamp(numOr(process.env.PHOENIX_L2_DEPTH, 10), 1, 50);
+const PUBLISH_DEPTH = clamp(numOr(process.env.PHOENIX_DEPTH_LEVELS, L2_FETCH_DEPTH), 1, 50);
+const TRY_WS = boolOr(process.env.PHOENIX_WS_ENABLED, true);
 
+// ── config file (optional) ────────────────────────────────────────────────────
+type MarketCfg = { symbol: string; phoenix?: { market: string } };
 function loadMarketsConfig(): MarketCfg[] | null {
-  const candidates = [
+  const cands = [
     path.resolve(process.cwd(), "configs/markets.json"),
-    path.resolve(process.cwd(), "..", "..", "configs", "markets.json"),
-    path.resolve(process.cwd(), "..", "..", "..", "configs", "markets.json"),
-    path.resolve(process.cwd(), "..", "..", "..", "packages", "phoenix", "configs", "markets.json"),
+    path.resolve(process.cwd(), "packages/phoenix/configs/markets.json"),
   ];
-  for (const p of candidates) {
+  for (const p of cands) {
     try {
-      if (!fs.existsSync(p)) continue;
-      const arr = JSON.parse(fs.readFileSync(p, "utf8")) as MarketCfg[];
-      if (Array.isArray(arr) && arr.length) return arr;
-    } catch {
-      /* ignore */
-    }
+      if (fs.existsSync(p)) {
+        const arr = JSON.parse(fs.readFileSync(p, "utf8")) as MarketCfg[];
+        if (Array.isArray(arr) && arr.length) return arr;
+      }
+    } catch {/* ignore */ }
   }
   return null;
 }
 
-// ── SDK Client helpers ──────────────────────────────────────────────────────
-async function makeClient(conn: Connection): Promise<any> {
-  // Dynamically resolve the Client constructor on the Phoenix SDK.  The SDK
-  // exports differ across versions: some expose `Client` on the module
-  // itself, others nest it under `default`.  We pick whichever exists.
+// ── client bootstrap ─────────────────────────────────────────────────────────
+async function makeClient(conn: Connection, seedMarkets: string[] = []): Promise<any> {
   const mod: any = PhoenixSDK;
-  const ctor: any = mod?.Client ?? mod?.default?.Client;
-  if (ctor?.create) {
-    return await ctor.create(conn);
+  const Ctor: any = mod?.Client ?? mod?.default?.Client;
+  if (!Ctor) throw new Error("phoenix_sdk_missing_Client");
+
+  const seeds = seedMarkets
+    .map(s => { try { return new PublicKey(s); } catch { return null; } })
+    .filter(Boolean) as PublicKey[];
+
+  // Known-good seeding path: (connection, seeds)
+  if (seeds.length && typeof Ctor.createWithMarketAddresses === "function") {
+    try {
+      const client = await (Ctor as any).createWithMarketAddresses(conn, seeds);
+      logger.log("phoenix_client_seeded", { order: "conn,seeds", seeds: seedMarkets });
+      return client;
+    } catch (e: any) {
+      logger.log("phoenix_client_seed_attempt_error", { order: "conn,seeds", err: String(e?.message ?? e) });
+    }
+    logger.log("phoenix_client_seed_all_failed", { seeds: seedMarkets });
   }
-  return new ctor(conn);
+
+  // Fallback (older SDKs)
+  const client = typeof Ctor.create === "function" ? await Ctor.create(conn) : new Ctor(conn);
+  logger.log("phoenix_client_unseeded", { note: "Client.create(connection)" });
+  return client;
 }
 
+// ── extractors & L3→L2 aggregation ───────────────────────────────────────────
+type Level = { px: number; qty: number };
 type MaybeBbo = {
   bestBid?: number;
   bestAsk?: number;
+  bids?: Level[];
+  asks?: Level[];
   source: string;
-  bids?: Array<{ px: number; qty: number }>;
-  asks?: Array<{ px: number; qty: number }>;
 };
 
-function extractPx(lvl: any): number | undefined {
-  if (!lvl) return undefined;
-  if (typeof lvl.price === "number") return lvl.price;
-  if (typeof lvl.uiPrice === "number") return lvl.uiPrice;
-  if (typeof lvl.price?.toNumber === "function") return lvl.price.toNumber();
-  if (typeof lvl?.toNumber === "function") return lvl.toNumber();
-  return undefined;
-}
-function extractQty(lvl: any): number | undefined {
-  if (!lvl) return undefined;
-  if (typeof lvl.quantity === "number") return lvl.quantity;
-  if (typeof lvl.uiQuantity === "number") return lvl.uiQuantity;
-  if (typeof lvl.quantity?.toNumber === "function") return lvl.quantity.toNumber();
-  if (typeof lvl?.baseLots?.toNumber === "function" && typeof lvl?.lotSize === "number") {
-    return lvl.baseLots.toNumber() * lvl.lotSize;
+// Accept many shapes: {price,size}, {price,quantity}, tuple [price,size], BN-ish, etc.
+function pxFrom(l: any): number | undefined {
+  if (l == null) return;
+  if (Array.isArray(l)) {
+    const v = Number(l[0]);
+    return Number.isFinite(v) ? v : undefined;
   }
-  return undefined;
+  const v =
+    typeof l.uiPrice === "number" ? l.uiPrice :
+      typeof l.price === "number" ? l.price :
+        typeof l.px === "number" ? l.px :
+          (typeof l.price?.toNumber === "function" ? l.price.toNumber() :
+            (typeof l?.toNumber === "function" ? l.toNumber() : undefined));
+  return Number.isFinite(v) ? v : undefined;
 }
-function mapDepthSide(sideArr: any[] | undefined, max: number) {
-  const out: Array<{ px: number; qty: number }> = [];
-  if (!Array.isArray(sideArr)) return out;
-  for (const lvl of sideArr.slice(0, max)) {
-    const px = extractPx(lvl);
-    const qty = extractQty(lvl);
-    if (typeof px === "number" && px > 0 && typeof qty === "number" && qty > 0) {
-      out.push({ px, qty });
+function qtyFrom(l: any): number | undefined {
+  if (l == null) return;
+  if (Array.isArray(l)) {
+    const v = Number(l[1]);
+    return Number.isFinite(v) ? v : undefined;
+  }
+  const v =
+    typeof l.uiQuantity === "number" ? l.uiQuantity :
+      typeof l.quantity === "number" ? l.quantity :
+        typeof l.uiSize === "number" ? l.uiSize :
+          typeof l.size === "number" ? l.size :
+            (typeof l.quantity?.toNumber === "function" ? l.quantity.toNumber() :
+              (typeof l.baseLots?.toNumber === "function" && typeof l?.lotSize === "number"
+                ? l.baseLots.toNumber() * l.lotSize
+                : (typeof l.sizeLots === "number" && typeof l.lotSize === "number"
+                  ? l.sizeLots * l.lotSize
+                  : undefined)));
+  return Number.isFinite(v) ? v : undefined;
+}
+
+// aggregate arbitrary L3 rows into L2 levels
+function l3ToL2(levels: any[] | undefined, side: "bids" | "asks", depth: number): Level[] {
+  if (!Array.isArray(levels) || levels.length === 0) return [];
+  const m = new Map<number, number>();
+  for (const row of levels) {
+    const px = pxFrom(row);
+    const qty = qtyFrom(row);
+    if (!Number.isFinite(px) || !Number.isFinite(qty)) continue;
+    m.set(px!, (m.get(px!) ?? 0) + (qty as number));
+  }
+  let arr = [...m.entries()].map(([px, qty]) => ({ px, qty }));
+  arr.sort((a, b) => side === "bids" ? b.px - a.px : a.px - b.px);
+  return arr.slice(0, depth);
+}
+
+// ── depth fetcher (tries UI ladder → L2 → L3UI → L3 → refreshMarket) ─────────
+async function fetchDepth(client: any, market: PublicKey, depth: number): Promise<MaybeBbo> {
+  // 1) getUiLadder (L2)
+  if (typeof client?.getUiLadder === "function") {
+    try {
+      const lad = await client.getUiLadder(market, depth);
+      const bids = l3ToL2(lad?.bids, "bids", depth); // safe even if already L2
+      const asks = l3ToL2(lad?.asks, "asks", depth);
+      const bestBid = bids[0]?.px, bestAsk = asks[0]?.px;
+      if (Number.isFinite(bestBid) || Number.isFinite(bestAsk))
+        return { bestBid, bestAsk, bids, asks, source: "sdk:getUiLadder" };
+    } catch { }
+  }
+
+  // 2) getL2
+  if (typeof client?.getL2 === "function") {
+    try {
+      const lad = await client.getL2(market, depth);
+      const bids = l3ToL2(lad?.bids, "bids", depth);
+      const asks = l3ToL2(lad?.asks, "asks", depth);
+      const bestBid = bids[0]?.px, bestAsk = asks[0]?.px;
+      if (Number.isFinite(bestBid) || Number.isFinite(bestAsk))
+        return { bestBid, bestAsk, bids, asks, source: "sdk:getL2" };
+    } catch { }
+  }
+
+  // 3) getL3UiBook
+  if (typeof client?.getL3UiBook === "function") {
+    try {
+      const book = await client.getL3UiBook(market);
+      const bids = l3ToL2(book?.bids, "bids", depth);
+      const asks = l3ToL2(book?.asks, "asks", depth);
+      const bestBid = bids[0]?.px, bestAsk = asks[0]?.px;
+      if (Number.isFinite(bestBid) || Number.isFinite(bestAsk))
+        return { bestBid, bestAsk, bids, asks, source: "sdk:getL3UiBook(agg)" };
+    } catch { }
+  }
+
+  // 4) getL3Book
+  if (typeof client?.getL3Book === "function") {
+    try {
+      const book = await client.getL3Book(market);
+      const bids = l3ToL2(book?.bids, "bids", depth);
+      const asks = l3ToL2(book?.asks, "asks", depth);
+      const bestBid = bids[0]?.px, bestAsk = asks[0]?.px;
+      if (Number.isFinite(bestBid) || Number.isFinite(bestAsk))
+        return { bestBid, bestAsk, bids, asks, source: "sdk:getL3Book(agg)" };
+    } catch { }
+  }
+
+  // 5) refreshMarket → read any embedded book shape
+  try {
+    const ms: MarketState = typeof client?.refreshMarket === "function"
+      ? await client.refreshMarket(market, false)
+      : undefined;
+    const ob: any = (ms as any)?.orderBook ?? (ms as any)?.book ?? {};
+    const bids = l3ToL2(ob?.bids, "bids", depth);
+    const asks = l3ToL2(ob?.asks, "asks", depth);
+    const bestBid = bids[0]?.px, bestAsk = asks[0]?.px;
+    return { bestBid, bestAsk, bids, asks, source: "sdk:refreshMarket(agg)" };
+  } catch {
+    return { source: "none" };
+  }
+}
+
+// ── optional WS (best-effort; polling still runs) ────────────────────────────
+async function tryAttachWs(client: any, market: PublicKey, onKick: () => void): Promise<boolean> {
+  if (!TRY_WS) return false;
+  try {
+    if (typeof client?.subscribeToMarket === "function") {
+      await client.subscribeToMarket(market);
+      if (typeof client?.onMarketUpdate === "function") client.onMarketUpdate(market, onKick);
+      logger.log("phoenix_ws_subscribed", { via: "subscribeToMarket" });
+      return true;
     }
-  }
-  return out;
+  } catch { /* fall through */ }
+  try {
+    if (typeof client?.subscribeToL2 === "function") {
+      await client.subscribeToL2(market);
+      logger.log("phoenix_ws_subscribed", { via: "subscribeToL2" });
+      return true;
+    }
+  } catch { /* fall through */ }
+  try {
+    if (typeof client?.subscribeL2 === "function") {
+      await client.subscribeL2(market);
+      logger.log("phoenix_ws_subscribed", { via: "subscribeL2" });
+      return true;
+    }
+  } catch { /* fall through */ }
+  logger.log("phoenix_ws_unavailable", { note: "polling only" });
+  return false;
 }
 
-// Helper: await if promise-like, else return directly
-async function maybeAwait<T>(v: T): Promise<T extends Promise<infer U> ? U : T> {
-  if (v && typeof (v as any).then === "function") {
-    return await (v as any);
-  }
-  return v as any;
-}
+// ── single market loop ────────────────────────────────────────────────────────
+async function runMarket(client: any, symbol: string, marketStr: string) {
+  const market = new PublicKey(marketStr);
 
-// Try a set of SDK methods that exist in different versions.
-async function trySdkL2(client: any, marketStr: string, marketPk: PublicKey): Promise<MaybeBbo | null> {
-  // 0) getUiLadder / getLadder
-  for (const method of ["getUiLadder", "getLadder"] as const) {
-    const f = (client as any)[method];
-    if (typeof f === "function") {
-      try {
-        let ladder = f.length >= 2 ? f.call(client, marketStr, L2_FETCH_DEPTH) : f.call(client, marketStr);
-        ladder = await maybeAwait(ladder);
-        const bids = mapDepthSide((ladder as any)?.bids, PUBLISH_DEPTH);
-        const asks = mapDepthSide((ladder as any)?.asks, PUBLISH_DEPTH);
-        const bestBid = bids[0]?.px ?? extractPx((ladder as any)?.bestBid);
-        const bestAsk = asks[0]?.px ?? extractPx((ladder as any)?.bestAsk);
-        if (bestBid || bestAsk) return { bestBid, bestAsk, source: `sdk:${method}`, bids, asks };
-      } catch (e) {
-        logger.log("phoenix_warn", { stage: method, err: String(e), market: marketStr });
+  try {
+    // Prefer addMarket first, then refresh; ensures state existence across SDKs
+    if (typeof client?.addMarket === "function") await client.addMarket(market);
+    if (typeof client?.refreshMarket === "function") await client.refreshMarket(market, false);
+  } catch {/* ignore */ }
+
+  let kick = true;
+  const wsAttached = await tryAttachWs(client, market, () => (kick = true)).catch(() => false);
+
+  logger.log("phoenix_boot", { rpc: maskUrl(RPC_MASK), ws_attached: wsAttached });
+
+  while (true) {
+    try {
+      const depth = await fetchDepth(client, market, L2_FETCH_DEPTH);
+      const ts = Date.now();
+
+      const best_bid = depth.bestBid ?? NaN;
+      const best_ask = depth.bestAsk ?? NaN;
+      const mid =
+        Number.isFinite(best_bid) && Number.isFinite(best_ask) ? (best_bid + best_ask) / 2
+          : Number.isFinite(best_bid) ? best_bid
+            : Number.isFinite(best_ask) ? best_ask
+              : NaN;
+
+      if (Number.isFinite(best_bid) || Number.isFinite(best_ask)) {
+        const levels_bids = (depth.bids ?? []).slice(0, PUBLISH_DEPTH);
+        const levels_asks = (depth.asks ?? []).slice(0, PUBLISH_DEPTH);
+
+        logger.log("phoenix_l2", {
+          ts,
+          market: market.toBase58(),
+          symbol,
+          best_bid,
+          best_bid_str: Number.isFinite(best_bid) ? best_bid.toFixed(12) : undefined,
+          best_ask,
+          best_ask_str: Number.isFinite(best_ask) ? best_ask.toFixed(12) : undefined,
+          phoenix_mid: Number.isFinite(mid) ? mid : undefined,
+          tick_ms: TICK_MS,
+          source: depth.source,
+          levels_bids,
+          levels_asks,
+        });
+
+        logger.log("phoenix_mid", {
+          ts,
+          market: market.toBase58(),
+          symbol,
+          px: Number.isFinite(mid) ? mid : undefined,
+          px_str: Number.isFinite(mid) ? mid.toFixed(12) : undefined,
+          best_bid: Number.isFinite(best_bid) ? best_bid : undefined,
+          best_ask: Number.isFinite(best_ask) ? best_ask : undefined,
+          tick_ms: TICK_MS,
+          source: depth.source,
+        });
+      } else {
+        logger.log("phoenix_l2_empty", {
+          ts,
+          market: market.toBase58(),
+          symbol,
+          haveBid: false,
+          haveAsk: false,
+          tick_ms: TICK_MS,
+          source: depth.source,
+        });
       }
+    } catch (e: any) {
+      logger.log("phoenix_poll_error", { market: marketStr, error: String(e?.message ?? e) });
     }
-  }
 
-  // 1) getL2 (try string then PublicKey)
-  if (typeof (client as any).getL2 === "function") {
-    try {
-      const l2s = await maybeAwait((client as any).getL2(marketStr, L2_FETCH_DEPTH));
-      const bids = mapDepthSide(l2s?.bids, PUBLISH_DEPTH);
-      const asks = mapDepthSide(l2s?.asks, PUBLISH_DEPTH);
-      const bestBid = bids[0]?.px;
-      const bestAsk = asks[0]?.px;
-      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getL2:str", bids, asks };
-    } catch { }
-    try {
-      const l2p = await maybeAwait((client as any).getL2(marketPk, L2_FETCH_DEPTH));
-      const bids = mapDepthSide(l2p?.bids, PUBLISH_DEPTH);
-      const asks = mapDepthSide(l2p?.asks, PUBLISH_DEPTH);
-      const bestBid = bids[0]?.px;
-      const bestAsk = asks[0]?.px;
-      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getL2:pk", bids, asks };
-    } catch (e) {
-      logger.log("phoenix_warn", { stage: "getL2", err: String(e), market: marketStr });
-    }
-  }
-
-  // 2) getBbo (fallback, no depth)
-  if (typeof (client as any).getBbo === "function") {
-    try {
-      const bboS = await maybeAwait((client as any).getBbo(marketStr));
-      const bestBid = typeof bboS?.bestBid === "number" ? bboS.bestBid : extractPx(bboS?.bestBid);
-      const bestAsk = typeof bboS?.bestAsk === "number" ? bboS.bestAsk : extractPx(bboS?.bestAsk);
-      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getBbo:str" };
-    } catch { }
-    try {
-      const bboP = await maybeAwait((client as any).getBbo(marketPk));
-      const bestBid = typeof bboP?.bestBid === "number" ? bboP.bestBid : extractPx(bboP?.bestBid);
-      const bestAsk = typeof bboP?.bestAsk === "number" ? bboP.bestAsk : extractPx(bboP?.bestAsk);
-      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "sdk:getBbo:pk" };
-    } catch (e) {
-      logger.log("phoenix_warn", { stage: "getBbo", err: String(e), market: marketStr });
-    }
-  }
-
-  // 3) refreshMarket and inspect OB (depth capable)
-  try {
-    let ms: MarketState | undefined;
-    try {
-      ms = await maybeAwait((client as any).refreshMarket(marketStr, false));
-    } catch { }
-    if (!ms) {
-      try {
-        ms = await maybeAwait((client as any).refreshMarket(marketPk, false));
-      } catch { }
-    }
-    if (ms) {
-      const ob: any = (ms as any)?.orderBook ?? (ms as any)?.book ?? undefined;
-      const bidsRaw: any[] =
-        Array.isArray(ob?.bids) ? ob.bids :
-          Array.isArray(ob?.book?.bids) ? ob.book.bids : [];
-      const asksRaw: any[] =
-        Array.isArray(ob?.asks) ? ob.asks :
-          Array.isArray(ob?.book?.asks) ? ob.book.asks : [];
-      const bids = mapDepthSide(bidsRaw, PUBLISH_DEPTH);
-      const asks = mapDepthSide(asksRaw, PUBLISH_DEPTH);
-      const bestBid = bids[0]?.px;
-      const bestAsk = asks[0]?.px;
-      if (bestBid || bestAsk) return { bestBid, bestAsk, source: "refreshMarket:orderBook", bids, asks };
-    }
-  } catch (e) {
-    logger.log("phoenix_warn", { stage: "refreshMarket_inspect", err: String(e), market: marketStr });
-  }
-
-  return null;
-}
-
-// Optional WS subscription (best-effort): per market
-async function tryAttachWs(
-  client: any,
-  marketStr: string,
-  marketPk: PublicKey,
-  setWs: (bbo: { bid?: number; ask?: number } | null) => void
-) {
-  if (!TRY_WS) return;
-  const candidates = ["subscribeL2", "subscribeToL2", "subscribeToMarket", "onMarketUpdate"];
-
-  for (const fn of candidates) {
-    const f = client?.[fn];
-    if (typeof f !== "function") continue;
-
-    const cb = (l2: any) => {
-      try {
-        const bid = Array.isArray(l2?.bids) && l2.bids[0] ? extractPx(l2.bids[0]) : undefined;
-        const ask = Array.isArray(l2?.asks) && l2.asks[0] ? extractPx(l2.asks[0]) : undefined;
-        if (bid || ask) setWs({ bid, ask });
-      } catch { }
-    };
-
-    try {
-      try {
-        await f.call(client, marketStr, L2_FETCH_DEPTH, cb);
-      } catch { }
-      try {
-        await f.call(client, marketStr, cb, L2_FETCH_DEPTH);
-      } catch { }
-      try {
-        await f.call(client, marketStr, cb);
-      } catch { }
-      try {
-        await f.call(client, marketPk, L2_FETCH_DEPTH, cb);
-      } catch { }
-      try {
-        await f.call(client, marketPk, cb, L2_FETCH_DEPTH);
-      } catch { }
-      try {
-        await f.call(client, marketPk, cb);
-      } catch { }
-      logger.log("phoenix_ws_attach_attempted", { method: fn, market: marketStr });
-    } catch (e) {
-      logger.log("phoenix_warn", { stage: "ws_attach", method: fn, err: String(e), market: marketStr });
-    }
+    kick = false;
+    await new Promise(r => setTimeout(r, TICK_MS));
   }
 }
 
-// ── Pyth fallback (Hermes) ─────────────────────────────────────────────────
-async function fetchPythMid(pythId: string | undefined): Promise<number | undefined> {
-  if (!pythId) return undefined;
-  try {
-    const url = `https://hermes.pyth.network/api/latest_price_feeds?ids[]=${encodeURIComponent(pythId)}`;
-    const res = await fetch(url, { headers: { accept: "application/json" } });
-    if (!res.ok) throw new Error(`pyth_http_${res.status}`);
-    const arr: any = await res.json();
-    const item = Array.isArray(arr) ? arr[0] : null;
-    const px = item?.price?.price ?? item?.ema_price?.price;
-    const expo = item?.price?.expo ?? item?.ema_price?.expo;
-    if (typeof px === "string" || typeof px === "number") {
-      const n = Number(px);
-      if (Number.isFinite(n) && typeof expo === "number") {
-        const m = n * Math.pow(10, expo); // expo is negative for USD pairs
-        return Number(m);
-      }
-    }
-  } catch (e) {
-    logger.log("phoenix_warn", { stage: "pyth_http", err: String(e), pyth: (pythId ?? "").slice(0, 10) + "..." });
-  }
-  return undefined;
-}
-
-// ── Emitters ────────────────────────────────────────────────────────────────
-function fmtPx(n: number | undefined): { px?: number; px_str?: string } {
-  if (typeof n !== "number" || !Number.isFinite(n)) return {};
-  const px = Number(n.toFixed(6));
-  const px_str = n.toFixed(9);
-  return { px, px_str };
-}
-
-function publishL2(
-  symbol: string,
-  marketStr: string,
-  bestBid: number,
-  bestAsk: number,
-  meta: Record<string, unknown> = {}
-) {
-  const bidFmt = fmtPx(bestBid);
-  const askFmt = fmtPx(bestAsk);
-  const mid = (bestBid + bestAsk) / 2;
-  logger.log("phoenix_l2", {
-    ts: Date.now(),
-    market: marketStr,
-    symbol,
-    best_bid: bidFmt.px,
-    best_bid_str: bidFmt.px_str,
-    best_ask: askFmt.px,
-    best_ask_str: askFmt.px_str,
-    phoenix_mid: Number(mid.toFixed(6)),
-    tick_ms: TICK_MS,
-    ...meta, // may include source + levels_bids/levels_asks
-  });
-}
-
-function publishMid(
-  symbol: string,
-  marketStr: string,
-  bestBid?: number,
-  bestAsk?: number,
-  meta: Record<string, unknown> = {}
-) {
-  if (typeof bestBid !== "number" || typeof bestAsk !== "number") return;
-  const mid = (bestBid + bestAsk) / 2;
-  const bidFmt = fmtPx(bestBid);
-  const askFmt = fmtPx(bestAsk);
-  const midFmt = fmtPx(mid);
-
-  logger.log("phoenix_mid", {
-    ts: Date.now(),
-    market: marketStr,
-    symbol,
-    ...midFmt,
-    best_bid: bidFmt.px,
-    best_bid_str: bidFmt.px_str,
-    best_ask: askFmt.px,
-    best_ask_str: askFmt.px_str,
-    tick_ms: TICK_MS,
-    ...meta,
-  });
-}
-
-// ── Per-market runner ───────────────────────────────────────────────────────
-async function runMarket(client: any, symbol: string, marketStr: string, pythId?: string) {
-  const marketPk = new PublicKey(marketStr);
-
-  // One-time “loaded”
-  try {
-    let ms: MarketState | undefined;
-    try {
-      ms = await (client as any).refreshMarket?.(marketStr, false);
-    } catch { }
-    if (!ms) {
-      try {
-        ms = await (client as any).refreshMarket?.(marketPk, false);
-      } catch { }
-    }
-    const ob: any = (ms as any)?.orderBook ?? (ms as any)?.book ?? undefined;
-    const hasBids =
-      !!(
-        (Array.isArray(ob?.bids) && ob.bids.length > 0) ||
-        (Array.isArray(ob?.book?.bids) && ob.book.bids.length > 0)
-      );
-    const hasAsks =
-      !!(
-        (Array.isArray(ob?.asks) && ob.asks.length > 0) ||
-        (Array.isArray(ob?.book?.asks) && ob.book.asks.length > 0)
-      );
-    logger.log("phoenix_loaded", { id: marketStr, name: symbol, hasBids, hasAsks });
-  } catch (err) {
-    logger.log("phoenix_error", { stage: "refresh_market", market: symbol, err: String(err) });
-  }
-
-  // Try to attach WS (best-effort)
-  let wsBbo: { bid?: number; ask?: number } | null = null;
-  tryAttachWs(client, marketStr, marketPk, (bbo) => {
-    wsBbo = bbo;
-  }).catch(() => { });
-
-  const tick = async () => {
-    // WS snapshot
-    if (wsBbo && typeof wsBbo.bid === "number" && typeof wsBbo.ask === "number") {
-      const bid = wsBbo.bid!;
-      const ask = wsBbo.ask!;
-      publishL2(symbol, marketStr, bid, ask, { source: "sdk:ws-l2" });
-      publishMid(symbol, marketStr, bid, ask, { source: "sdk:ws-l2" });
-      return;
-    }
-
-    // Sync SDK paths
-    let got: MaybeBbo | null = null;
-    try {
-      got = await trySdkL2(client, marketStr, marketPk);
-    } catch (e) {
-      logger.log("phoenix_warn", { stage: "trySdkL2", err: String(e), market: marketStr });
-    }
-
-    if (got && typeof got.bestBid === "number" && typeof got.bestAsk === "number") {
-      const meta: Record<string, unknown> = { source: got.source };
-      if (Array.isArray(got.bids)) meta.levels_bids = got.bids;
-      if (Array.isArray(got.asks)) meta.levels_asks = got.asks;
-      publishL2(symbol, marketStr, got.bestBid, got.bestAsk, meta);
-      publishMid(symbol, marketStr, got.bestBid, got.bestAsk, { source: got.source });
-      return;
-    }
-
-    // Empty + Pyth fallback
-    logger.log("phoenix_l2_empty", {
-      ts: Date.now(),
-      market: marketStr,
-      symbol,
-      haveBid: false,
-      haveAsk: false,
-      tick_ms: TICK_MS,
-      source: "none",
-    });
-
-    const pythPx = await fetchPythMid(pythId);
-    if (typeof pythPx === "number" && Number.isFinite(pythPx)) {
-      const n = Number(pythPx.toFixed(6));
-      logger.log("phoenix_mid", {
-        ts: Date.now(),
-        market: marketStr,
-        symbol,
-        px: n,
-        px_str: pythPx.toFixed(9),
-        tick_ms: TICK_MS,
-        source: "pyth",
-        pyth_id: pythId,
-      });
-    }
-  };
-
-  // run once now, then interval
-  tick().catch((e) => logger.log("phoenix_warn", { stage: "initial_tick", err: String(e), market: marketStr }));
-  setInterval(() => {
-    tick().catch((e) => logger.log("phoenix_warn", { stage: "tick", err: String(e), market: marketStr }));
-  }, TICK_MS);
-}
-
-// ── Main ────────────────────────────────────────────────────────────────────
+// ── main ─────────────────────────────────────────────────────────────────────
 async function main() {
-  logger.log("phoenix_boot", { rpc: maskUrl(RPC) });
-  const conn = new Connection(RPC, { commitment: "processed" });
-  let client: any;
+  // Use the RPC helper that attaches wsEndpoint when RPC_WSS_URL is set (Helius)
+  const conn = makePhoenixConnection(COMMITMENT);
 
+  const cfg = loadMarketsConfig();
+  const envMarket = (process.env.PHOENIX_MARKET ?? "").trim();
+
+  const seed: string[] = [];
+  if (envMarket) seed.push(envMarket);
+  (cfg ?? []).forEach(m => { if (m.phoenix?.market) seed.push(m.phoenix.market); });
+
+  let client: any;
   try {
-    client = await makeClient(conn);
+    client = await makeClient(conn, seed);
   } catch (e) {
     logger.log("phoenix_error", { stage: "client_create", err: String(e) });
     setInterval(() => { }, 1 << 30);
     return;
   }
 
-  // ENV-FIRST single market
-  const envMarket = (process.env.PHOENIX_MARKET ?? "").trim();
   if (envMarket) {
-    await runMarket(
-      client,
-      "SOL/USDC",
-      envMarket,
-      (process.env.PYTH_PRICE_ID_SOL_USDC ?? "").trim() || undefined
-    );
+    await runMarket(client, "SOL/USDC", envMarket);
     setInterval(() => { }, 1 << 30);
     return;
   }
 
-  // CONFIG multi-market
-  const cfg = loadMarketsConfig();
   if (cfg && cfg.length) {
-    const markets = cfg
-      .filter((m) => m.phoenix?.market)
-      .map((m) => ({
-        symbol: m.symbol,
-        market: m.phoenix!.market,
-        pyth: m.pyth_price_id,
-      }));
-
-    if (markets.length) {
-      for (const m of markets)
-        runMarket(client, m.symbol, m.market, m.pyth).catch((e) =>
-          logger.log("phoenix_fatal_market", { symbol: m.symbol, err: String(e) })
-        );
+    const mkts = cfg.filter(m => m.phoenix?.market).map(m => ({
+      symbol: m.symbol ?? "UNK",
+      market: m.phoenix!.market,
+    }));
+    if (mkts.length) {
+      for (const m of mkts) runMarket(client, m.symbol, m.market).catch(e =>
+        logger.log("phoenix_fatal_market", { symbol: m.symbol, err: String(e) })
+      );
       setInterval(() => { }, 1 << 30);
       return;
     }
   }
 
-  // Default single market (SOL/USDC)
-  await runMarket(
-    client,
-    "SOL/USDC",
-    "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg",
-    (process.env.PYTH_PRICE_ID_SOL_USDC ?? "").trim() || undefined
-  );
-
-  // keep alive
+  // default single market
+  await runMarket(client, "SOL/USDC", "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg");
   setInterval(() => { }, 1 << 30);
 }
 
 main().catch((e) => logger.log("phoenix_fatal", { err: String(e) }));
 
-// ────────────────────────────────────────────────────────────────────────────
-// Export atomic taker builder for arb-mm (lives in ./atomic.ts)
+// keep atomic exports
 export {
   buildPhoenixSwapIxs,
   type PhoenixSwapIxParams,
