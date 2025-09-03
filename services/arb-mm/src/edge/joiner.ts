@@ -2,12 +2,20 @@
 // Book-first edge calc + decision layer (CPMM/adaptive) + optional RPC-sim.
 // Depth-aware Phoenix (optional) and fee-accurate effective prices.
 // Emits clean edge_report logs and ML features.
+// CHANGES:
+// - Compute a recommended dynamic size using optimizeSize(...) when L2 depth + reserves exist.
+// - Pass recommended_size_base to DecisionHook so main.ts can execute with it.
 
 import { logger } from "../ml_logger.js";
 import { synthFromMid, type PhoenixBook } from "../syntheticPhoenix.js";
 import { emitFeature, featureFromEdgeAndDecision } from "../feature_sink.js";
 import { noteDecision } from "../risk.js";
 import type { SlipMode } from "../config.js";
+import {
+  optimizeSize,
+  type CpmmReserves as SizeCpmmReserves,
+  type PhoenixBook as SizePhoenixBook,
+} from "../executor/size.js";
 
 function nnum(x: any): number | undefined {
   return typeof x === "number" && Number.isFinite(x) ? x : undefined;
@@ -80,6 +88,8 @@ export type DecisionHookDetails = {
   buy_px: number;
   sell_px: number;
   rpc_eff_px?: number;
+  // NEW: dynamic sizing result (used by main.ts)
+  recommended_size_base?: number;
 };
 
 export type DecisionHook = (
@@ -446,6 +456,60 @@ export class EdgeJoiner {
       ? { path: "AMM->PHX" as const, side: "sell" as const, buyPx: buyA_used, sellPx: sellA, edgeBpsNet: bpsNetA, edgeBpsGross: bpsGrossA, expectedPnl: pnlNetA }
       : { path: "PHX->AMM" as const, side: "buy" as const, buyPx: buyB, sellPx: sellB_used, edgeBpsNet: bpsNetB, edgeBpsGross: bpsGrossB, expectedPnl: pnlNetB };
 
+    // ── NEW: compute recommended size using optimizeSize (only if we have reserves AND depth levels)
+    let recommendedSizeBase: number | undefined = undefined;
+    if (this.reserves && this.phxBook && Array.isArray((this.phxBook as any).levels_bids) && Array.isArray((this.phxBook as any).levels_asks)) {
+      try {
+        const bidsL2 = ((this.phxBook as any).levels_bids as DepthSide[]).filter(l => l && l.px > 0 && l.qty > 0).map(l => ({ px: l.px, qtyBase: l.qty }));
+        const asksL2 = ((this.phxBook as any).levels_asks as DepthSide[]).filter(l => l && l.px > 0 && l.qty > 0).map(l => ({ px: l.px, qtyBase: l.qty }));
+        if (bidsL2.length && asksL2.length) {
+          const bookOpt: SizePhoenixBook = {
+            bids: bidsL2,
+            asks: asksL2,
+            takerFeeBps: this.P.phoenixFeeBps,
+          };
+          const feeBpsCpmm = Number.isFinite(Number(process.env.RAYDIUM_TRADE_FEE_BPS))
+            ? Number(process.env.RAYDIUM_TRADE_FEE_BPS)
+            : (this.P.ammFeeBps > 0 ? this.P.ammFeeBps : 25);
+          const cpmmOpt: SizeCpmmReserves = {
+            base: this.reserves.base,
+            quote: this.reserves.quote,
+            feeBps: feeBpsCpmm,
+          };
+          const lowerBase = Number.isFinite(Number(process.env.SIZEOPT_MIN_BASE))
+            ? Number(process.env.SIZEOPT_MIN_BASE)
+            : Math.max(1e-6, this.P.tradeSizeBase);
+          const maxFrac = Number.isFinite(Number(process.env.SIZEOPT_MAX_POOL_FRAC))
+            ? Number(process.env.SIZEOPT_MAX_POOL_FRAC)
+            : this.C.cpmmMaxPoolTradeFrac;
+          const upperAbs = Number.isFinite(Number(process.env.SIZEOPT_ABS_MAX_BASE))
+            ? Number(process.env.SIZEOPT_ABS_MAX_BASE)
+            : undefined;
+          const probes = Math.max(5, Math.min(25, Number(process.env.SIZEOPT_PROBE_STEPS ?? 9)));
+
+          const { bestBase, bestPnl } = optimizeSize(
+            {
+              kind: best.path, // optimize on the chosen path
+              book: bookOpt,
+              cpmm: cpmmOpt,
+              maxPoolFrac: maxFrac,
+              lowerBase,
+              upperBaseCap: upperAbs,
+            },
+            probes
+          );
+
+          // Best pnl is QUOTE; subtract per-trade fixed cost for safety display (gating still handled below as before)
+          const bestPnlAfterFixed = bestPnl - this.P.fixedTxCostQuote;
+          if (bestBase > 0 && Number.isFinite(bestPnlAfterFixed)) {
+            recommendedSizeBase = bestBase;
+          }
+        }
+      } catch {
+        // swallow and continue with static size
+      }
+    }
+
     const base: any = {
       symbol: "SOL/USDC",
       path: best.path,
@@ -465,6 +529,7 @@ export class EdgeJoiner {
       fees_bps: { phoenix: this.P.phoenixFeeBps, amm: this.P.ammFeeBps },
       fixed_tx_cost_quote: round(this.P.fixedTxCostQuote, 6),
     };
+    if (recommendedSizeBase != null) base.recommended_size_base = round(recommendedSizeBase, 9);
 
     if (this.C.logSimFields) {
       base.phx_spread_bps = round(((phxAsk / phxBid) - 1) * 10_000, 4);
@@ -559,6 +624,7 @@ export class EdgeJoiner {
       buy_px: round(best.buyPx),
       sell_px: round(best.sellPx),
       rpc_eff_px: (base as any).rpc_eff_px,
+      recommended_size_base: recommendedSizeBase,
     });
 
     if (edgeForFeature) {

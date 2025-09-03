@@ -1,8 +1,7 @@
 // services/arb-mm/src/executor/live.ts
 // CHANGES:
-// - ensureRaydiumPoolMeta(): no SDK discovery; reads full keys from disk,
-//   then (optional) on-chain decode fallback; final fallback = env mints.
-// - removes the noisy `raydium_poolkeys_fetch_error` + `...not found via SDK` path.
+// - (Optional) Add a lightweight debug log for Raydium minOut inputs (size/fee/slippage/reserves).
+//   No behavioral changes beyond logging.
 
 import fs from "fs";
 import path from "path";
@@ -299,13 +298,24 @@ export class LiveExecutor {
       const bufferBps = Number.parseFloat(process.env.RAYDIUM_MINOUT_BUFFER_BPS ?? "0");
       const usedSlip = Math.max(0, SLIPPAGE_BPS + dynExtra + bufferBps);
 
-      // minOut
+      // minOut (+debug)
       let minOut: bigint;
       if (reserves) {
         const x = baseIn ? reserves.base : reserves.quote;
         const y = baseIn ? reserves.quote : reserves.base;
         const expectedOut = cpmmExpectedOutBig({ dx: amountInAtoms, x, y, feeBps });
         minOut = applyBpsDownBig(expectedOut, usedSlip);
+
+        logger.log("raydium_minout_dbg", {
+          base_in: baseIn,
+          amount_in_atoms: amountInAtoms.toString(),
+          fee_bps: feeBps,
+          slip_bps_used: usedSlip,
+          reserves_base: x.toString(),
+          reserves_quote: y.toString(),
+          expected_out_atoms: expectedOut.toString(),
+          min_out_atoms: minOut.toString(),
+        });
       } else {
         // Conservative reference-price fallback
         const refPx =
@@ -326,6 +336,17 @@ export class LiveExecutor {
           const outAtoms = BigInt(Math.floor(outUi * 1e9)); // BASE atoms
           minOut = applyBpsDownBig(outAtoms, usedSlip);
         }
+
+        logger.log("raydium_minout_dbg", {
+          base_in: baseIn,
+          amount_in_atoms: amountInAtoms.toString(),
+          fee_bps: feeBps,
+          slip_bps_used: usedSlip,
+          reserves_base: null,
+          reserves_quote: null,
+          ref_px_used: refPx,
+          min_out_atoms: minOut.toString(),
+        });
       }
 
       const inMint: PublicKey = baseIn ? meta.baseMint : meta.quoteMint;

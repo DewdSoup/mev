@@ -1,17 +1,7 @@
 // services/arb-mm/src/main.ts
-// Live arbitrage runner (Raydium <-> Phoenix) with:
-// - .env.live auto-load (override .env)
-// - Embedded publisher supervisor (optional) to auto-run low-latency feeds
-// - Robust balance reads (env ATAs -> fallback to scan by mint)
-// - Clear terminal logs for START/END and DELTAs
-// - Executes only when joiner says EV>0 (no forced unprofitable sends)
-// - Direction lock via EXEC_ALLOWED_PATH (default BOTH)
-// - Atomic-preferred payload (ATOMIC_MODE=single_tx supported)
-// - 30-minute auto-stop (RUN_FOR_MINUTES) + clean SIGINT/SIGTERM shutdown
-//
-// CHANGES in this file:
-// - No functional changes required for the Raydium pool-keys fix. Left intact,
-//   only comments updated to reflect disk-based keys in executor.
+// Live arbitrage runner (Raydium <-> Phoenix) with dynamic size advisory.
+// CHANGES:
+// - Use d.recommended_size_base from joiner (when present) as the execution size (fallback to LIVE_SIZE_BASE).
 
 import fs from "fs";
 import path from "path";
@@ -433,7 +423,7 @@ async function main() {
   });
   sup.start();
 
-  // Attach WS endpoint so Phoenix runs with live subscriptions
+  // Attach WS endpoint (Phoenix publisher will poll if SDK lacks subs)
   const WS = process.env.RPC_WSS_URL?.trim();
   const conn = new Connection(RPC, {
     commitment: "processed",
@@ -628,7 +618,7 @@ async function main() {
           quote: LAST_CPMM.quote,
           feeBps: 25,
         }; // on-chain Raydium taker fee
-        const sizeBase =
+        const sizeBaseDebug =
           Number(process.env.LIVE_SIZE_BASE ?? 0) || CFG.TRADE_SIZE_BASE;
 
         const pnlPhxToAmm = pnlQuoteForSizeBase(
@@ -637,9 +627,9 @@ async function main() {
             book,
             cpmm,
             maxPoolFrac: CFG.CPMM_MAX_POOL_TRADE_FRAC,
-            lowerBase: sizeBase,
+            lowerBase: sizeBaseDebug,
           },
-          sizeBase
+          sizeBaseDebug
         );
         const pnlAmmToPhx = pnlQuoteForSizeBase(
           {
@@ -647,13 +637,13 @@ async function main() {
             book,
             cpmm,
             maxPoolFrac: CFG.CPMM_MAX_POOL_TRADE_FRAC,
-            lowerBase: sizeBase,
+            lowerBase: sizeBaseDebug,
           },
-          sizeBase
+          sizeBaseDebug
         );
 
         const dbg = {
-          trade_size_base: sizeBase,
+          trade_size_base: sizeBaseDebug,
           phx_to_amm: { pnl_quote: Number(roundN(pnlPhxToAmm, 6)) },
           amm_to_phx: { pnl_quote: Number(roundN(pnlAmmToPhx, 6)) },
         };
@@ -693,8 +683,12 @@ async function main() {
     recordDecision(doExecute, edgeNetBps, expPnl);
     if (!doExecute) return;
 
+    // ── NEW: prefer recommended_size_base from joiner; fallback to LIVE_SIZE_BASE
     const execSize =
-      Number(process.env.LIVE_SIZE_BASE ?? 0) || CFG.TRADE_SIZE_BASE;
+      (d.recommended_size_base && d.recommended_size_base > 0
+        ? d.recommended_size_base
+        : (Number(process.env.LIVE_SIZE_BASE ?? 0) || CFG.TRADE_SIZE_BASE));
+
     const notional = coalesceRound(
       6,
       execSize * ((d.buy_px + d.sell_px) / 2)
@@ -702,7 +696,7 @@ async function main() {
 
     const payload: any = {
       path: d.path,
-      size_base: execSize,
+      size_base: execSize,                // ← dynamic size (or fallback)
       buy_px: d.buy_px,
       sell_px: d.sell_px,
       notional_quote: notional,
@@ -804,8 +798,8 @@ async function main() {
       thresholdBps: CFG.TRADE_THRESHOLD_BPS,
       flatSlippageBps: CFG.MAX_SLIPPAGE_BPS,
       tradeSizeBase: CFG.TRADE_SIZE_BASE,
-      phoenixFeeBps: PHX_FEE_BPS,
-      ammFeeBps: 0, // ← important: no double-count
+      phoenixFeeBps: resolveFeeBps("PHOENIX", PHX_MARKET, CFG.PHOENIX_TAKER_FEE_BPS),
+      ammFeeBps: 0, // ← important: no double-count in EV
       fixedTxCostQuote: CFG.FIXED_TX_COST_QUOTE,
     },
     {
