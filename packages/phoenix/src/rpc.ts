@@ -1,22 +1,25 @@
 // packages/phoenix/src/rpc.ts
-import 'dotenv/config';
-import { Connection, Commitment } from '@solana/web3.js';
+import { Commitment, Connection, clusterApiUrl } from "@solana/web3.js";
 
-/**
- * Phoenix needs an HTTP endpoint, with the WS endpoint passed via config.
- * Passing a wss:// string directly as the first arg throws in @solana/web3.js.
- */
-export function makePhoenixConnection(commitment: Commitment = 'processed'): Connection {
-    const http =
-        process.env.RPC_URL?.trim() ||
+function pickHttpRpc(): string {
+    const env =
         process.env.RPC_PRIMARY?.trim() ||
-        (process.env.HELIUS_API_KEY ? `https://rpc.helius.xyz/?api-key=${process.env.HELIUS_API_KEY.trim()}` : 'https://api.mainnet-beta.solana.com');
+        process.env.RPC_URL?.trim();
+    if (env) return env;
 
-    if (!http) throw new Error('Missing RPC_URL or RPC_PRIMARY');
+    const helius = process.env.HELIUS_API_KEY?.trim();
+    if (helius) return `https://rpc.helius.xyz/?api-key=${helius}`;
 
-    const wss = process.env.RPC_WSS_URL?.trim();
-    const cfg = wss ? { commitment, wsEndpoint: wss } : { commitment };
+    return clusterApiUrl("mainnet-beta");
+}
 
-    // web3.js 1.98 expects HTTP here; WS must be in cfg.wsEndpoint
-    return new Connection(http, cfg as any);
+export function makePhoenixConnection(commitment: Commitment = "processed"): Connection {
+    const http = pickHttpRpc();
+    const ws = process.env.RPC_WSS_URL?.trim();
+
+    // Connection accepts an options object with wsEndpoint.
+    // We keep it minimal; commitment comes from caller.
+    const conn = new Connection(http, { commitment, wsEndpoint: ws });
+
+    return conn;
 }

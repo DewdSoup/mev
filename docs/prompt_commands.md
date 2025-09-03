@@ -14,6 +14,8 @@ git commit -m "update: latest changes pushed" --no-verify
 git push origin main
 
 
+##############################
+
 # Rebuild Git
 # nuke everything not in git
 git reset --hard origin/main
