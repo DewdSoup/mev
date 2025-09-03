@@ -1,10 +1,14 @@
 // services/arb-mm/src/executor/buildRaydiumCpmmIx.ts
 // Raydium CPMM v4 fixed-in swap builder for @raydium-io/raydium-sdk (v1).
-// - Uses explicit ATAs for tokenAccountIn/out
-// - Uses BN for in/out amounts
-// - Handles common SDK return shapes safely
-// - Avoids incorrect Token constructions that caused runtime errors
+// CHANGES:
+// - ❌ Removed SDK discovery (fetchAllPoolKeys / fetchPoolKeysById)
+// - ✅ Loads full pool-keys from disk (configs/raydium.pool.json) with env overrides
+// - ✅ Verifies pool id matches env to avoid mismatched keys
+// - ✅ Keeps robust return-shape handling + ATA resolution
 
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import {
   Connection,
   PublicKey,
@@ -13,12 +17,16 @@ import {
 import BN from "bn.js";
 import {
   Liquidity,
-  SPL_ACCOUNT_LAYOUT,
 } from "@raydium-io/raydium-sdk";
 import {
   getAssociatedTokenAddressSync,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
+
+// ───────────────────────────────────────────────────────────────────────────────
+// ESM-safe dirname
+const __filename = fileURLToPath(import.meta.url);
+const __here = path.dirname(__filename);
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -41,46 +49,122 @@ function ensureIxArray(ixs: any, label: string): TransactionInstruction[] {
   return arr as TransactionInstruction[];
 }
 
-async function findPoolById(conn: Connection, poolId: PublicKey): Promise<any | null> {
-  try {
-    // v1 exposes fetchAllPoolKeys for CPMM v4 pools
-    const pools: any[] = await (Liquidity as any).fetchAllPoolKeys(conn);
-    const pool = pools.find((p: any) => {
-      if (p?.id instanceof PublicKey) return (p.id as PublicKey).equals(poolId);
-      if (typeof p?.id === "string") return new PublicKey(p.id).equals(poolId);
-      return false;
-    });
-    if (pool) return pool;
-  } catch {
-    // fall through
-  }
-
-  // Fallback: some builds expose singular by-id lookup
-  try {
-    if (typeof (Liquidity as any).fetchPoolKeysById === "function") {
-      const pool = await (Liquidity as any).fetchPoolKeysById(conn, poolId);
-      if (pool) return pool;
-    }
-  } catch {
-    // ignore
-  }
-  return null;
+function getenv(k: string) {
+  const v = process.env[k];
+  return typeof v === "string" && v.trim() ? v.trim() : undefined;
 }
 
-// Optional: read vault amounts if you want to pre-compute minOut using reserves
-export async function getVaultReservesFromPool(
-  conn: Connection,
-  pool: any
-): Promise<{ base: bigint; quote: bigint }> {
-  const accs = await conn.getMultipleAccountsInfo([pool.baseVault, pool.quoteVault], {
-    commitment: "processed" as any,
-  });
-  if (!accs[0]?.data || !accs[1]?.data) throw new Error("raydium_pool_reserves_missing");
-  const baseInfo: any = SPL_ACCOUNT_LAYOUT.decode(accs[0].data);
-  const quoteInfo: any = SPL_ACCOUNT_LAYOUT.decode(accs[1].data);
-  const base = BigInt(new BN(baseInfo.amount).toString());
-  const quote = BigInt(new BN(quoteInfo.amount).toString());
-  return { base, quote };
+function findPoolJsonPath(): string {
+  // 1) env
+  const envs = [
+    getenv("RAYDIUM_POOL_JSON_PATH"),
+    getenv("RAYDIUM_POOL_KEYS_JSON"),
+    getenv("RAYDIUM_POOLS_FILE"),
+  ];
+  for (const e of envs) {
+    if (e && fs.existsSync(e)) return path.resolve(e);
+  }
+  // 2) repo-relative fallbacks
+  const candidates = [
+    path.resolve(process.cwd(), "configs", "raydium.pool.json"),
+    path.resolve(process.cwd(), "..", "configs", "raydium.pool.json"),
+    path.resolve(process.cwd(), "..", "..", "configs", "raydium.pool.json"),
+    path.resolve(__here, "..", "..", "configs", "raydium.pool.json"),
+    path.resolve(__here, "..", "..", "..", "configs", "raydium.pool.json"),
+  ];
+  for (const p of candidates) if (fs.existsSync(p)) return p;
+
+  throw new Error(
+    "Raydium: missing full keys file. Set RAYDIUM_POOL_JSON_PATH or place configs/raydium.pool.json"
+  );
+}
+
+type DiskPoolKeys = {
+  id: string;
+  programId: string;
+  authority: string;
+  openOrders: string;
+  targetOrders: string;
+  baseVault: string;
+  quoteVault: string;
+  withdrawQueue: string;
+  lpVault: string;
+  baseMint: string;
+  quoteMint: string;
+  marketProgramId: string;
+  marketId: string;
+  marketBids: string;
+  marketAsks: string;
+  marketEventQueue: string;
+  marketBaseVault: string;
+  marketQuoteVault: string;
+  marketAuthority?: string;
+  lpMint?: string;
+  version: 4 | 5 | number;
+};
+
+function readDiskPool(): DiskPoolKeys {
+  const p = findPoolJsonPath();
+  const j = JSON.parse(fs.readFileSync(p, "utf8")) as DiskPoolKeys;
+  const req = [
+    "id",
+    "programId",
+    "authority",
+    "openOrders",
+    "targetOrders",
+    "baseVault",
+    "quoteVault",
+    "withdrawQueue",
+    "lpVault",
+    "baseMint",
+    "quoteMint",
+    "marketProgramId",
+    "marketId",
+    "marketBids",
+    "marketAsks",
+    "marketEventQueue",
+    "marketBaseVault",
+    "marketQuoteVault",
+    "version",
+  ] as const;
+  for (const k of req) {
+    // @ts-ignore
+    if (!j[k]) throw new Error(`Raydium: pool-keys JSON invalid (missing ${k})`);
+  }
+  return j;
+}
+
+function toPoolKeys(d: DiskPoolKeys): any /* LiquidityPoolKeys */ {
+  const v = (d.version === 5 ? 5 : 4) as 4 | 5;
+  const out = {
+    id: new PublicKey(d.id),
+    baseMint: new PublicKey(d.baseMint),
+    quoteMint: new PublicKey(d.quoteMint),
+    lpMint: new PublicKey(d.lpMint ?? d.baseMint), // satisfy type
+    version: v,
+    programId: new PublicKey(d.programId),
+    authority: new PublicKey(d.authority),
+    openOrders: new PublicKey(d.openOrders),
+    targetOrders: new PublicKey(d.targetOrders),
+    baseVault: new PublicKey(d.baseVault),
+    quoteVault: new PublicKey(d.quoteVault),
+
+    marketProgramId: new PublicKey(d.marketProgramId),
+    marketId: new PublicKey(d.marketId),
+    marketBids: new PublicKey(d.marketBids),
+    marketAsks: new PublicKey(d.marketAsks),
+    marketEventQueue: new PublicKey(d.marketEventQueue),
+    marketBaseVault: new PublicKey(d.marketBaseVault),
+    marketQuoteVault: new PublicKey(d.marketQuoteVault),
+
+    withdrawQueue: new PublicKey(d.withdrawQueue),
+    lpVault: new PublicKey(d.lpVault),
+
+    ...(d.marketAuthority
+      ? { marketAuthority: new PublicKey(d.marketAuthority) }
+      : {}),
+  };
+  return out;
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -93,22 +177,37 @@ export async function buildRaydiumCpmmSwapIx(args: {
   poolId: PublicKey;
   inMint: PublicKey;
   outMint: PublicKey;
-  amountIn: bigint;      // atoms of inMint
-  amountOutMin: bigint;  // atoms of outMint
+  amountIn: bigint; // atoms of inMint
+  amountOutMin: bigint; // atoms of outMint
 }): Promise<TransactionInstruction[]> {
-  const { connection, owner, poolId, inMint, outMint, amountIn, amountOutMin } = args;
+  const { connection, owner, poolId, inMint, outMint, amountIn, amountOutMin } =
+    args;
 
-  // 1) Discover pool keys (CPMM v4)
-  const pool = await findPoolById(connection, poolId);
-  if (!pool) {
-    throw new Error(`Raydium: pool ${poolId.toBase58()} not found via SDK pool discovery`);
+  // 1) Load full pool-keys from disk (no SDK discovery)
+  const disk = readDiskPool();
+  const diskId = new PublicKey(disk.id);
+  if (!diskId.equals(poolId)) {
+    throw new Error(
+      `Raydium: pool id mismatch (env=${poolId.toBase58()} json=${diskId.toBase58()})`
+    );
   }
+  const pool = toPoolKeys(disk);
 
   // 2) Resolve user token accounts (ATAs)
-  const ataIn = getAssociatedTokenAddressSync(inMint, owner, false, TOKEN_PROGRAM_ID);
-  const ataOut = getAssociatedTokenAddressSync(outMint, owner, false, TOKEN_PROGRAM_ID);
+  const ataIn = getAssociatedTokenAddressSync(
+    inMint,
+    owner,
+    false,
+    TOKEN_PROGRAM_ID
+  );
+  const ataOut = getAssociatedTokenAddressSync(
+    outMint,
+    owner,
+    false,
+    TOKEN_PROGRAM_ID
+  );
 
-  // 3) BN amounts expected by v1 builder
+  // 3) BN amounts expected by builders
   const amountInBn = new BN(amountIn.toString());
   const minOutBn = new BN(amountOutMin.toString());
 
@@ -116,15 +215,17 @@ export async function buildRaydiumCpmmSwapIx(args: {
   type BuilderResult =
     | TransactionInstruction[]
     | { instructions?: TransactionInstruction[] }
-    | { innerTransaction?: { instructions?: TransactionInstruction[] } };
+    | { innerTransaction?: { instructions?: TransactionInstruction[] } }
+    | { innerTransactions?: Array<{ instructions?: TransactionInstruction[] }> };
 
   const tryMake = async (): Promise<BuilderResult> => {
     const build: any = (Liquidity as any).makeSwapFixedInInstruction;
     if (typeof build !== "function") {
-      throw new Error("Raydium: makeSwapFixedInInstruction is not available in this SDK build");
+      throw new Error(
+        "Raydium: makeSwapFixedInInstruction not available in this SDK build"
+      );
     }
-
-    // Variant A: canonical v1 signature
+    // Variant A: canonical
     try {
       return await build({
         connection,
@@ -139,7 +240,7 @@ export async function buildRaydiumCpmmSwapIx(args: {
         minAmountOut: minOutBn,
       });
     } catch (e) {
-      // Variant B: some builds require explicit version as numeric second arg
+      // Variant B: explicit version
       try {
         return await build(
           {
@@ -154,10 +255,10 @@ export async function buildRaydiumCpmmSwapIx(args: {
             amountIn: amountInBn,
             minAmountOut: minOutBn,
           },
-          4 // CPMM v4
+          4
         );
       } catch {
-        // Variant C: options-like object as second arg
+        // Variant C: options object
         return await build(
           {
             connection,
@@ -184,7 +285,7 @@ export async function buildRaydiumCpmmSwapIx(args: {
     // Last resort: older helper name in some forks
     const simple: any = (Liquidity as any).makeSwapInstructionSimple;
     if (typeof simple === "function") {
-      built = await simple({
+      const r = await simple({
         connection,
         poolKeys: pool,
         userKeys: {
@@ -197,8 +298,11 @@ export async function buildRaydiumCpmmSwapIx(args: {
         minAmountOut: minOutBn,
         fixedSide: "in",
       });
+      built = r;
     } else {
-      throw new Error(`Raydium: swap builder unavailable (${e?.message ?? "unknown"})`);
+      throw new Error(
+        `Raydium: swap builder unavailable (${e?.message ?? "unknown"})`
+      );
     }
   }
 
@@ -206,9 +310,13 @@ export async function buildRaydiumCpmmSwapIx(args: {
   const ixs =
     (built as any)?.innerTransaction?.instructions ??
     (built as any)?.instructions ??
+    (Array.isArray((built as any)?.innerTransactions)
+      ? (built as any).innerTransactions.flatMap((it: any) => it?.instructions ?? [])
+      : undefined) ??
     built;
 
   const out = ensureIxArray(ixs, "raydium_inner_instructions");
-  if (!out.length) throw new Error("Raydium: swap builder returned no instructions");
+  if (!out.length)
+    throw new Error("Raydium: swap builder returned no instructions");
   return out;
 }

@@ -1,4 +1,12 @@
 // services/arb-mm/src/executor/live.ts
+// CHANGES:
+// - ensureRaydiumPoolMeta(): no SDK discovery; reads full keys from disk,
+//   then (optional) on-chain decode fallback; final fallback = env mints.
+// - removes the noisy `raydium_poolkeys_fetch_error` + `...not found via SDK` path.
+
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import {
   Connection,
   PublicKey,
@@ -6,12 +14,17 @@ import {
   Keypair,
 } from "@solana/web3.js";
 import BN from "bn.js";
-import { Liquidity, SPL_ACCOUNT_LAYOUT } from "@raydium-io/raydium-sdk";
+import { SPL_ACCOUNT_LAYOUT, LIQUIDITY_STATE_LAYOUT_V4 } from "@raydium-io/raydium-sdk";
 import { logger } from "../ml_logger.js";
 import { buildRaydiumCpmmSwapIx } from "./buildRaydiumCpmmIx.js";
 import { buildPhoenixSwapIxs } from "../util/phoenix.js";
 import { toIxArray, assertIxArray } from "../util/ix.js";
 import { submitAtomic, buildPreIxs } from "../tx/submit.js";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ESM-safe dirname
+const __filename = fileURLToPath(import.meta.url);
+const __here = path.dirname(__filename);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tunables / env
@@ -51,41 +64,89 @@ function cpmmExpectedOutBig(args: { dx: bigint; x: bigint; y: bigint; feeBps: nu
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Raydium: robust pool meta + reserves
+// Raydium: robust pool meta + reserves (disk → on-chain → env)
 // ─────────────────────────────────────────────────────────────────────────────
 type PoolMeta = { baseMint: PublicKey; quoteMint: PublicKey; baseVault?: PublicKey; quoteVault?: PublicKey };
 const POOL_META_CACHE = new Map<string, PoolMeta>();
 const DEFAULT_BASE_MINT = new PublicKey("So11111111111111111111111111111111111111112"); // WSOL
 const DEFAULT_QUOTE_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
 
+function getenv(k: string) {
+  const v = process.env[k];
+  return typeof v === "string" && v.trim() ? v.trim() : undefined;
+}
+function findPoolJsonPath(): string | undefined {
+  const envs = [
+    getenv("RAYDIUM_POOL_JSON_PATH"),
+    getenv("RAYDIUM_POOL_KEYS_JSON"),
+    getenv("RAYDIUM_POOLS_FILE"),
+  ];
+  for (const e of envs) {
+    if (e && fs.existsSync(e)) return path.resolve(e);
+  }
+  const candidates = [
+    path.resolve(process.cwd(), "configs", "raydium.pool.json"),
+    path.resolve(process.cwd(), "..", "configs", "raydium.pool.json"),
+    path.resolve(process.cwd(), "..", "..", "configs", "raydium.pool.json"),
+    path.resolve(__here, "..", "..", "configs", "raydium.pool.json"),
+    path.resolve(__here, "..", "..", "..", "configs", "raydium.pool.json"),
+  ];
+  for (const p of candidates) if (fs.existsSync(p)) return p;
+  return undefined;
+}
+
 async function ensureRaydiumPoolMeta(conn: Connection, poolId: PublicKey): Promise<PoolMeta> {
   const key = poolId.toBase58();
   if (POOL_META_CACHE.has(key)) return POOL_META_CACHE.get(key)!;
 
-  // Best-effort: try SDK list
+  // 1) Disk full-keys
   try {
-    const pools: any[] = await (Liquidity as any).fetchAllPoolKeys(conn);
-    const p = pools.find((x: any) => {
-      if (!x?.id) return false;
-      try {
-        return (x.id instanceof PublicKey ? (x.id as PublicKey) : new PublicKey(x.id)).equals(poolId);
-      } catch { return false; }
-    });
+    const p = findPoolJsonPath();
     if (p) {
+      const j = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (j?.id) {
+        const id = new PublicKey(j.id);
+        if (!id.equals(poolId)) {
+          logger.log("raydium_pool_id_mismatch_env_disk", {
+            env: poolId.toBase58(),
+            json: id.toBase58(),
+          });
+        }
+        const meta: PoolMeta = {
+          baseMint: new PublicKey(j.baseMint),
+          quoteMint: new PublicKey(j.quoteMint),
+          baseVault: j.baseVault ? new PublicKey(j.baseVault) : undefined,
+          quoteVault: j.quoteVault ? new PublicKey(j.quoteVault) : undefined,
+        };
+        POOL_META_CACHE.set(key, meta);
+        logger.log("raydium_pool_meta_source", { pool: key, source: "disk" });
+        return meta;
+      }
+    }
+  } catch (e: any) {
+    logger.log("raydium_pool_meta_disk_error", { pool: key, err: String(e?.message ?? e) });
+  }
+
+  // 2) On-chain decode (AmmV4 state)
+  try {
+    const info = await conn.getAccountInfo(poolId, "processed");
+    if (info?.data) {
+      const s: any = LIQUIDITY_STATE_LAYOUT_V4.decode(info.data);
       const meta: PoolMeta = {
-        baseMint: p.baseMint instanceof PublicKey ? p.baseMint : new PublicKey(p.baseMint),
-        quoteMint: p.quoteMint instanceof PublicKey ? p.quoteMint : new PublicKey(p.quoteMint),
-        baseVault: p.baseVault ? (p.baseVault instanceof PublicKey ? p.baseVault : new PublicKey(p.baseVault)) : undefined,
-        quoteVault: p.quoteVault ? (p.quoteVault instanceof PublicKey ? p.quoteVault : new PublicKey(p.quoteVault)) : undefined,
+        baseMint: new PublicKey(s.baseMint),
+        quoteMint: new PublicKey(s.quoteMint),
+        baseVault: new PublicKey(s.baseVault),
+        quoteVault: new PublicKey(s.quoteVault),
       };
       POOL_META_CACHE.set(key, meta);
+      logger.log("raydium_pool_meta_source", { pool: key, source: "onchain" });
       return meta;
     }
   } catch (e: any) {
-    logger.log("raydium_poolkeys_fetch_error", { pool: key, err: String(e?.message ?? e) });
+    logger.log("raydium_pool_meta_onchain_error", { pool: key, err: String(e?.message ?? e) });
   }
 
-  // Fallback: env or known SOL/USDC mints
+  // 3) Env fallback (mints only)
   const baseMint = (() => {
     const e = process.env.RAYDIUM_POOL_BASE_MINT?.trim();
     try { return e ? new PublicKey(e) : DEFAULT_BASE_MINT; } catch { return DEFAULT_BASE_MINT; }
@@ -97,7 +158,7 @@ async function ensureRaydiumPoolMeta(conn: Connection, poolId: PublicKey): Promi
 
   const meta: PoolMeta = { baseMint, quoteMint };
   POOL_META_CACHE.set(key, meta);
-  logger.log("raydium_poolkeys_fallback", { pool: key, baseMint: baseMint.toBase58(), quoteMint: quoteMint.toBase58() });
+  logger.log("raydium_pool_meta_source", { pool: key, source: "env" });
   return meta;
 }
 
@@ -204,7 +265,7 @@ export class LiveExecutor {
       assertIxArray(phxIxs, "phoenix");
 
       // ─────────────────────────────────────────────────────────────────────
-      // 2) Raydium leg (robust meta + reserves → CPMM minOut; fallback to refPx)
+      // 2) Raydium leg (disk/on-chain meta + reserves → CPMM minOut; refPx fallback)
       // ─────────────────────────────────────────────────────────────────────
       const baseIn = path === "PHX->AMM"; // PHX buy → have BASE → AMM leg is BASE->QUOTE
 
@@ -220,10 +281,10 @@ export class LiveExecutor {
       const poolIdStr = DEFAULT_RAYDIUM_POOL_ID;
       const poolId = new PublicKey(poolIdStr);
 
-      // robust meta
+      // robust meta (disk → on-chain → env)
       const meta = await ensureRaydiumPoolMeta(this.conn, poolId);
 
-      // reserves (optional)
+      // reserves (optional but preferred)
       let reserves: { base: bigint; quote: bigint } | undefined;
       try {
         if (meta.baseVault && meta.quoteVault) {
@@ -279,6 +340,7 @@ export class LiveExecutor {
         amountIn: amountInAtoms,
         amountOutMin: minOut,
       });
+
       if (!Array.isArray(rayIxs) || rayIxs.length === 0) {
         logger.log("submit_error", { where: "maybe_execute", error: "no_ray_ixs" });
         return;
@@ -328,7 +390,6 @@ export class LiveExecutor {
         slot,
         conf_ms,
         shadow: false,
-        // For PnL attribution you can optionally attach fill/quote estimates here.
       });
     } catch (e: any) {
       logger.log("submit_error", { where: "maybe_execute", error: String(e?.message ?? e) });

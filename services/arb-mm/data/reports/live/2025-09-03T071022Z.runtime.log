@@ -1,0 +1,454 @@
+
+> mev@ dev:all /home/dudesoup/code/mev
+> env FORCE_COLOR=1 concurrently -k --raw -n PHOENIX,AMMS,ARB -c "green,yellow,cyan" "bash -lc 'pnpm -C packages/phoenix dev'" "bash -lc 'pnpm -C packages/amms dev'" "bash -lc 'pnpm -C services/arb-mm dev'"
+
+
+> @mev/phoenix@0.0.0 dev /home/dudesoup/code/mev/packages/phoenix
+> tsx watch src/index.ts
+
+
+> @mev/arb-mm@0.0.0 dev /home/dudesoup/code/mev/services/arb-mm
+> tsx watch src/main.ts
+
+
+> @mev/amms@0.0.0 dev /home/dudesoup/code/mev/packages/amms
+> tsx watch src/reserves.ts
+
+2025-09-03T07:10:27.872Z amms_boot { rpc: [32m'https://mainnet.helius-rpc.com/?api-key=***'[39m }
+2025-09-03T07:10:27.878Z amms_pools_loaded { count: [33m1[39m, fromLocal: [33mtrue[39m, via: [32m'adapter-registry'[39m }
+2025-09-03T07:10:27.879Z amms_market_match {
+  name: [32m'SOL/USDC (RAYDIUM)'[39m,
+  pool: [32m'58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2'[39m
+}
+2025-09-03T07:10:28.355Z amms_price {
+  ts: [33m1756883427880[39m,
+  symbol: [32m'SOL/USDC'[39m,
+  ammId: [32m'58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2'[39m,
+  baseDecimals: [33m9[39m,
+  quoteDecimals: [33m6[39m,
+  px: [33m208.78550856854736[39m,
+  px_str: [32m'208.78550856854736'[39m,
+  base_int: [32m'38332247674409'[39m,
+  quote_int: [32m'8003217825277'[39m,
+  tick_ms: [33m2000[39m
+}
+BOOT rpc=https://mainnet.helius-rpc.com/?api-key=***  LIVE_TRADING=1  SHADOW_TRADING=0  EXEC_ALLOWED_PATH=both  USE_RPC_SIM=0  USE_RAYDIUM_SWAP_SIM=0  ATOMIC_MODE=single_tx  ENABLE_EMBEDDED_PUBLISHERS=0  RUN_FOR_MINUTES=20
+2025-09-03T07:10:28.952Z arb boot {
+  rpc: [32m'https://mainnet.helius-rpc.com/?api-key=***'[39m,
+  atomic_mode: [32m'single_tx'[39m
+}
+2025-09-03T07:10:28.953Z pubsv_off { reason: [32m'ENABLE_EMBEDDED_PUBLISHERS=0'[39m }
+{"event":"risk_caps","ts":"2025-09-03T07:10:28.956Z","caps":{"perMinNotionalQuote":10000,"perVenueNotionalQuote":0,"errorBurstMax":0}}
+START_PREF owner=5wqHjxk5VhRTUc9Gavgtan3MN5k31ETjDvnU7x4MPRHr wsolATA=GkvWNym7ctZ3Q6fnB4VuqRV2LDeViygqbtzKRU9Pi4yj usdcATA=FEcYTKzvgkNDD2VG9SdcvNH1bWYZ2Ggn59XES5y2nAc6
+2025-09-03T07:10:30.242Z balances_start { sol: [33m1.503839135[39m, wsol: [33m0.998000213[39m, usdc: [33m174.004234[39m }
+START  SOL=1.503839135  WSOL=0.998000213  USDC=174.004234
+2025-09-03T07:10:30.436Z phoenix_sdk_pick {
+  from: [32m'@ellipsis-labs/phoenix-sdk'[39m,
+  exportName: [32m'Client'[39m,
+  methods: [
+    [32m'constructor'[39m,
+    [32m'addMarket'[39m,
+    [32m'refreshAllMarkets'[39m,
+    [32m'refreshMarket'[39m,
+    [32m'reloadClock'[39m,
+    [32m'reloadClockFromBuffer'[39m,
+    [32m'getLadder'[39m,
+    [32m'getUiLadder'[39m,
+    [32m'getL3Book'[39m,
+    [32m'getL3BookWithParams'[39m,
+    [32m'getL3UiBook'[39m,
+    [32m'getL3UiBookWithParams'[39m,
+    [32m'printLadder'[39m,
+    [32m'getMarketExpectedOutAmount'[39m,
+    [32m'getBaseAccountKey'[39m,
+    [32m'getQuoteAccountKey'[39m,
+    [32m'getQuoteVaultKey'[39m,
+    [32m'getBaseVaultKey'[39m,
+    [32m'getSeatKey'[39m,
+    [32m'floatPriceToTicks'[39m,
+    [32m'ticksToFloatPrice'[39m,
+    [32m'rawBaseUnitsToBaseLotsRoundedDown'[39m,
+    [32m'rawBaseUnitsToBaseLotsRoundedUp'[39m,
+    [32m'baseAtomsToBaseLots'[39m,
+    [32m'baseLotsToBaseAtoms'[39m,
+    [32m'quoteUnitsToQuoteLots'[39m,
+    [32m'quoteAtomsToQuoteLots'[39m,
+    [32m'quoteLotsToQuoteAtoms'[39m,
+    [32m'baseAtomsToRawBaseUnits'[39m,
+    [32m'quoteAtomsToQuoteUnits'[39m,
+    [32m'createCancelAllOrdersInstruction'[39m,
+    [32m'createCancelAllOrdersWithFreeFundsInstruction'[39m,
+    [32m'createCancelMultipleOrdersByIdInstruction'[39m,
+    [32m'createCancelMultipleOrdersByIdWithFreeFundsInstruction'[39m,
+    [32m'createCancelUpToInstruction'[39m,
+    [32m'createCancelUpToWithFreeFundsInstruction'[39m,
+    [32m'createDepositFundsInstruction'[39m,
+    [32m'createPlaceLimitOrderInstruction'[39m,
+    [32m'createPlaceLimitOrderWithFreeFundsInstruction'[39m,
+    [32m'createPlaceMultiplePostOnlyOrdersInstruction'[39m,
+    [32m'createPlaceMultiplePostOnlyOrdersInstructionWithFreeFunds'[39m,
+    [32m'createReduceOrderInstruction'[39m,
+    [32m'createReduceOrderWithFreeFundsInstruction'[39m,
+    [32m'createRequestSeatInstruction'[39m,
+    [32m'createSwapInstruction'[39m,
+    [32m'createSwapWithFreeFundsInstruction'[39m,
+    [32m'createWithdrawFundsInstruction'[39m,
+    [32m'getLimitOrderInstructionfromTemplate'[39m,
+    [32m'getPostOnlyOrderInstructionfromTemplate'[39m,
+    [32m'getImmediateOrCancelOrderIxfromTemplate'[39m
+  ]
+}
+2025-09-03T07:10:30.462Z amms_price {
+  ts: [33m1756883430358[39m,
+  symbol: [32m'SOL/USDC'[39m,
+  ammId: [32m'58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2'[39m,
+  baseDecimals: [33m9[39m,
+  quoteDecimals: [33m6[39m,
+  px: [33m208.78550856854736[39m,
+  px_str: [32m'208.78550856854736'[39m,
+  base_int: [32m'38332247674409'[39m,
+  quote_int: [32m'8003217825277'[39m,
+  tick_ms: [33m2000[39m
+}
+2025-09-03T07:10:30.831Z phoenix_client_seeded {
+  order: [32m'conn,seeds'[39m,
+  seeds: [
+    [32m'4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg'[39m,
+    [32m'4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg'[39m
+  ]
+}
+2025-09-03T07:10:31.814Z phoenix_client_seeded {
+  order: [32m'conn,seeds'[39m,
+  seeds: [ [32m'4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg'[39m ]
+}
+2025-09-03T07:10:31.826Z phoenix_cache_warm {
+  markets: [ [32m'4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg'[39m ],
+  ok: [33m1[39m,
+  fail: [33m0[39m
+}
+2025-09-03T07:10:31.829Z fee_config {
+  raydium_pool: [32m'58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2'[39m,
+  amm_fee_bps: [33m25[39m,
+  phoenix_market: [32m'4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg'[39m,
+  phoenix_fee_bps: [33m0[39m
+}
+2025-09-03T07:10:31.830Z edge_paths {
+  amms: [32m'/home/dudesoup/code/mev/packages/amms/logs/runtime.jsonl'[39m,
+  phoenix: [32m'/home/dudesoup/code/mev/packages/phoenix/logs/runtime.jsonl'[39m,
+  min_abs_bps: [33m0.05[39m
+}
+2025-09-03T07:10:31.830Z edge_config { book_ttl_ms: [33m750[39m, synth_width_bps: [33m8[39m }
+2025-09-03T07:10:31.832Z edge_decision_config {
+  trade_threshold_bps: [33m3[39m,
+  max_slippage_bps: [33m3[39m,
+  phoenix_slippage_bps: [33m2[39m,
+  trade_size_base: [33m0.001[39m,
+  phoenix_taker_fee_bps: [33m0[39m,
+  amm_taker_fee_bps: [33m0[39m,
+  fixed_tx_cost_quote: [33m0[39m,
+  decision_dedupe_ms: [33m500[39m,
+  decision_bucket_ms: [33m150[39m,
+  decision_min_edge_delta_bps: [33m0.05[39m,
+  enforceDedupe: [33mtrue[39m,
+  slippage_mode: [32m'adaptive'[39m,
+  use_pool_impact_sim: [33mtrue[39m,
+  use_rpc_sim: [33mfalse[39m,
+  use_raydium_swap_sim: [32m'0'[39m,
+  cpmm_max_pool_trade_frac: [33m0.05[39m,
+  dynamicSlippageExtraBps: [33m0.25[39m,
+  allow_synth_trades: [33mfalse[39m,
+  edge_follow_poll_ms: [33m500[39m,
+  shadow_trading: [33mfalse[39m
+}
+2025-09-03T07:10:31.833Z edge_follow_opened {
+  file: [32m'/home/dudesoup/code/mev/packages/amms/logs/runtime.jsonl'[39m,
+  initial_size: [33m5317640[39m
+}
+2025-09-03T07:10:31.834Z edge_follow_opened {
+  file: [32m'/home/dudesoup/code/mev/packages/phoenix/logs/runtime.jsonl'[39m,
+  initial_size: [33m321248[39m
+}
+2025-09-03T07:10:32.095Z arb health {
+  slot: [33m364334912[39m,
+  tps: [33m3387.33[39m,
+  version: { [32m'feature-set'[39m: [33m3640012085[39m, [32m'solana-core'[39m: [32m'2.3.7'[39m },
+  httpHealth: { ok: [33mtrue[39m, body: [32m'ok'[39m }
+}
+HEALTH slot=364334912 tps=3387.33 version=2.3.7
+2025-09-03T07:10:32.463Z amms_price {
+  ts: [33m1756883432360[39m,
+  symbol: [32m'SOL/USDC'[39m,
+  ammId: [32m'58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2'[39m,
+  baseDecimals: [33m9[39m,
+  quoteDecimals: [33m6[39m,
+  px: [33m208.78550856854736[39m,
+  px_str: [32m'208.78550856854736'[39m,
+  base_int: [32m'38332247674409'[39m,
+  quote_int: [32m'8003217825277'[39m,
+  tick_ms: [33m2000[39m
+}
+2025-09-03T07:10:32.465Z edge_waiting {
+  have_raydium: [33mtrue[39m,
+  have_phoenix_mid: [33mfalse[39m,
+  have_phoenix_book: [33mfalse[39m,
+  min_abs_bps: [33m0.05[39m
+}
+2025-09-03T07:10:33.205Z phoenix_ws_unavailable { note: [32m'polling only'[39m }
+2025-09-03T07:10:33.207Z phoenix_boot {
+  rpc: [32m'https://mainnet.helius-rpc.com/?api-key=***'[39m,
+  ws_attached: [33mfalse[39m
+}
+2025-09-03T07:10:33.210Z phoenix_l2 {
+  ts: [33m1756883433210[39m,
+  market: [32m'4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg'[39m,
+  symbol: [32m'SOL/USDC'[39m,
+  best_bid: [33m208.205[39m,
+  best_bid_str: [32m'208.205000000000'[39m,
+  best_ask: [33m208.36[39m,
+  best_ask_str: [32m'208.360000000000'[39m,
+  phoenix_mid: [33m208.28250000000003[39m,
+  tick_ms: [33m2000[39m,
+  source: [32m'sdk:getUiLadder'[39m,
+  levels_bids: [ { px: [33m208.205[39m, qty: [33m19.211[39m } ],
+  levels_asks: [ { px: [33m208.36[39m, qty: [33m19.197[39m } ]
+}
+2025-09-03T07:10:33.212Z phoenix_mid {
+  ts: [33m1756883433210[39m,
+  market: [32m'4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg'[39m,
+  symbol: [32m'SOL/USDC'[39m,
+  px: [33m208.28250000000003[39m,
+  px_str: [32m'208.282500000000'[39m,
+  best_bid: [33m208.205[39m,
+  best_ask: [33m208.36[39m,
+  tick_ms: [33m2000[39m,
+  source: [32m'sdk:getUiLadder'[39m
+}
+2025-09-03T07:10:33.217Z edge_report {
+  symbol: [32m'SOL/USDC'[39m,
+  amm_mid: [33m208.785509[39m,
+  amm_mid_str: [32m'208.785508569'[39m,
+  phoenix_bid: [33m208.205[39m,
+  phoenix_bid_str: [32m'208.205000000'[39m,
+  phoenix_ask: [33m208.36[39m,
+  phoenix_ask_str: [32m'208.360000000'[39m,
+  phoenix_mid: [33m208.2825[39m,
+  phoenix_source: [32m'book'[39m,
+  toPhoenixSellBps: [33m27.8816[39m,
+  toPhoenixBuyBps: [33m-20.3802[39m,
+  absBps: [33m27.8816[39m,
+  phoenix_book_method: [32m'sdk:getUiLadder'[39m,
+  amm_eff_px_buy: [33m208.785514[39m,
+  amm_price_impact_bps_buy: [33m0.0003[39m,
+  amm_eff_px_sell: [33m208.785503[39m,
+  amm_price_impact_bps_sell: [33m-0.0003[39m
+}
+2025-09-03T07:10:33.220Z would_trade {
+  symbol: [32m'SOL/USDC'[39m,
+  path: [32m'PHX->AMM'[39m,
+  side: [32m'buy'[39m,
+  trade_size_base: [33m0.001[39m,
+  threshold_bps: [33m3[39m,
+  slippage_bps: [33m3[39m,
+  phoenix_slippage_bps: [33m2[39m,
+  slippage_mode: [32m'adaptive'[39m,
+  phoenix_source: [32m'book'[39m,
+  phoenix_book_method: [32m'sdk:getUiLadder'[39m,
+  buy_px: [33m208.442767[39m,
+  sell_px: [33m208.722873[39m,
+  edge_bps_net: [33m13.438[39m,
+  expected_pnl: [33m0.00028[39m,
+  fees_bps: { phoenix: [33m0[39m, amm: [33m0[39m },
+  fixed_tx_cost_quote: [33m0[39m,
+  phx_spread_bps: [33m7.4446[39m,
+  phx_slippage_bps_used: [33m3.9723[39m,
+  amm_buy_px_sim: [33m208.790734[39m,
+  amm_sell_px_sim: [33m208.780283[39m,
+  cpmm_max_pool_trade_frac: [33m0.05[39m,
+  dynamic_slippage_extra_bps: [33m0.25[39m,
+  amm_eff_px: [33m208.780283[39m,
+  amm_price_impact_bps: [33m-0.2503[39m,
+  reason: [32m'edge above threshold'[39m
+}
+EXEC (EV>0) PHX->AMM base=0.001 notional≈0.2086 mid=0
+2025-09-03T07:10:33.223Z phoenix_build_params {
+  market: [32m'4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg'[39m,
+  side: [32m'buy'[39m,
+  sizeBase: [33m0.001[39m,
+  limitPx: [33m208.442767[39m,
+  slippageBps: [33m2[39m
+}
+2025-09-03T07:10:33.266Z phoenix_build_result_shape { type: [32m'object'[39m, hasIxsField: [33mtrue[39m, isArray: [33mfalse[39m, keys: [ [32m'ixs'[39m ] }
+2025-09-03T07:10:33.270Z raydium_poolkeys_fetch_error {
+  pool: [32m'58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2'[39m,
+  err: [32m"Cannot read properties of undefined (reading '4')"[39m
+}
+2025-09-03T07:10:33.271Z raydium_poolkeys_fallback {
+  pool: [32m'58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2'[39m,
+  baseMint: [32m'So11111111111111111111111111111111111111112'[39m,
+  quoteMint: [32m'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'[39m
+}
+2025-09-03T07:10:33.272Z submit_error {
+  where: [32m'maybe_execute'[39m,
+  error: [32m'Raydium: pool 58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2 not found via SDK pool discovery'[39m
+}
+2025-09-03T07:10:34.468Z amms_price {
+  ts: [33m1756883434360[39m,
+  symbol: [32m'SOL/USDC'[39m,
+  ammId: [32m'58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2'[39m,
+  baseDecimals: [33m9[39m,
+  quoteDecimals: [33m6[39m,
+  px: [33m208.78550856854736[39m,
+  px_str: [32m'208.78550856854736'[39m,
+  base_int: [32m'38332247674409'[39m,
+  quote_int: [32m'8003217825277'[39m,
+  tick_ms: [33m2000[39m
+}
+2025-09-03T07:10:34.471Z edge_report {
+  symbol: [32m'SOL/USDC'[39m,
+  amm_mid: [33m208.785509[39m,
+  amm_mid_str: [32m'208.785508569'[39m,
+  phoenix_bid: [33m208.240844[39m,
+  phoenix_bid_str: [32m'208.240843500'[39m,
+  phoenix_ask: [33m208.324157[39m,
+  phoenix_ask_str: [32m'208.324156500'[39m,
+  phoenix_mid: [33m208.2825[39m,
+  phoenix_source: [32m'book'[39m,
+  toPhoenixSellBps: [33m26.1555[39m,
+  toPhoenixBuyBps: [33m-22.0969[39m,
+  absBps: [33m26.1555[39m,
+  amm_eff_px_buy: [33m208.785514[39m,
+  amm_price_impact_bps_buy: [33m0.0003[39m,
+  amm_eff_px_sell: [33m208.785503[39m,
+  amm_price_impact_bps_sell: [33m-0.0003[39m
+}
+2025-09-03T07:10:34.472Z would_trade {
+  symbol: [32m'SOL/USDC'[39m,
+  path: [32m'PHX->AMM'[39m,
+  side: [32m'buy'[39m,
+  trade_size_base: [33m0.001[39m,
+  threshold_bps: [33m3[39m,
+  slippage_bps: [33m3[39m,
+  phoenix_slippage_bps: [33m2[39m,
+  slippage_mode: [32m'adaptive'[39m,
+  phoenix_source: [32m'book'[39m,
+  phoenix_book_method: [32m'unknown'[39m,
+  buy_px: [33m208.371038[39m,
+  sell_px: [33m208.722873[39m,
+  edge_bps_net: [33m16.885[39m,
+  expected_pnl: [33m0.000352[39m,
+  fees_bps: { phoenix: [33m0[39m, amm: [33m0[39m },
+  fixed_tx_cost_quote: [33m0[39m,
+  phx_spread_bps: [33m4.0008[39m,
+  phx_slippage_bps_used: [33m2.2504[39m,
+  amm_buy_px_sim: [33m208.790734[39m,
+  amm_sell_px_sim: [33m208.780283[39m,
+  cpmm_max_pool_trade_frac: [33m0.05[39m,
+  dynamic_slippage_extra_bps: [33m0.25[39m,
+  amm_eff_px: [33m208.780283[39m,
+  amm_price_impact_bps: [33m-0.2503[39m,
+  reason: [32m'edge above threshold'[39m
+}
+EXEC (EV>0) PHX->AMM base=0.001 notional≈0.2085 mid=undefined
+2025-09-03T07:10:34.492Z phoenix_build_params {
+  market: [32m'4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg'[39m,
+  side: [32m'buy'[39m,
+  sizeBase: [33m0.001[39m,
+  limitPx: [33m208.371038[39m,
+  slippageBps: [33m2[39m
+}
+2025-09-03T07:10:34.514Z phoenix_build_result_shape { type: [32m'object'[39m, hasIxsField: [33mtrue[39m, isArray: [33mfalse[39m, keys: [ [32m'ixs'[39m ] }
+2025-09-03T07:10:34.515Z submit_error {
+  where: [32m'maybe_execute'[39m,
+  error: [32m'Raydium: pool 58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2 not found via SDK pool discovery'[39m
+}
+2025-09-03T07:10:35.085Z arb health {
+  slot: [33m364334920[39m,
+  tps: [33m3385.75[39m,
+  version: { [32m'feature-set'[39m: [33m3640012085[39m, [32m'solana-core'[39m: [32m'2.3.7'[39m },
+  httpHealth: { ok: [33mtrue[39m, body: [32m'ok'[39m }
+}
+HEALTH slot=364334920 tps=3385.75 version=2.3.7
+2025-09-03T07:10:35.214Z phoenix_l2 {
+  ts: [33m1756883435214[39m,
+  market: [32m'4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg'[39m,
+  symbol: [32m'SOL/USDC'[39m,
+  best_bid: [33m208.205[39m,
+  best_bid_str: [32m'208.205000000000'[39m,
+  best_ask: [33m208.36[39m,
+  best_ask_str: [32m'208.360000000000'[39m,
+  phoenix_mid: [33m208.28250000000003[39m,
+  tick_ms: [33m2000[39m,
+  source: [32m'sdk:getUiLadder'[39m,
+  levels_bids: [ { px: [33m208.205[39m, qty: [33m19.211[39m } ],
+  levels_asks: [ { px: [33m208.36[39m, qty: [33m19.197[39m } ]
+}
+2025-09-03T07:10:35.215Z phoenix_mid {
+  ts: [33m1756883435214[39m,
+  market: [32m'4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg'[39m,
+  symbol: [32m'SOL/USDC'[39m,
+  px: [33m208.28250000000003[39m,
+  px_str: [32m'208.282500000000'[39m,
+  best_bid: [33m208.205[39m,
+  best_ask: [33m208.36[39m,
+  tick_ms: [33m2000[39m,
+  source: [32m'sdk:getUiLadder'[39m
+}
+2025-09-03T07:10:35.216Z edge_report {
+  symbol: [32m'SOL/USDC'[39m,
+  amm_mid: [33m208.785509[39m,
+  amm_mid_str: [32m'208.785508569'[39m,
+  phoenix_bid: [33m208.205[39m,
+  phoenix_bid_str: [32m'208.205000000'[39m,
+  phoenix_ask: [33m208.36[39m,
+  phoenix_ask_str: [32m'208.360000000'[39m,
+  phoenix_mid: [33m208.2825[39m,
+  phoenix_source: [32m'book'[39m,
+  toPhoenixSellBps: [33m27.8816[39m,
+  toPhoenixBuyBps: [33m-20.3802[39m,
+  absBps: [33m27.8816[39m,
+  phoenix_book_method: [32m'sdk:getUiLadder'[39m,
+  amm_eff_px_buy: [33m208.785514[39m,
+  amm_price_impact_bps_buy: [33m0.0003[39m,
+  amm_eff_px_sell: [33m208.785503[39m,
+  amm_price_impact_bps_sell: [33m-0.0003[39m
+}
+2025-09-03T07:10:35.217Z would_trade {
+  symbol: [32m'SOL/USDC'[39m,
+  path: [32m'PHX->AMM'[39m,
+  side: [32m'buy'[39m,
+  trade_size_base: [33m0.001[39m,
+  threshold_bps: [33m3[39m,
+  slippage_bps: [33m3[39m,
+  phoenix_slippage_bps: [33m2[39m,
+  slippage_mode: [32m'adaptive'[39m,
+  phoenix_source: [32m'book'[39m,
+  phoenix_book_method: [32m'sdk:getUiLadder'[39m,
+  buy_px: [33m208.442767[39m,
+  sell_px: [33m208.722873[39m,
+  edge_bps_net: [33m13.438[39m,
+  expected_pnl: [33m0.00028[39m,
+  fees_bps: { phoenix: [33m0[39m, amm: [33m0[39m },
+  fixed_tx_cost_quote: [33m0[39m,
+  phx_spread_bps: [33m7.4446[39m,
+  phx_slippage_bps_used: [33m3.9723[39m,
+  amm_buy_px_sim: [33m208.790734[39m,
+  amm_sell_px_sim: [33m208.780283[39m,
+  cpmm_max_pool_trade_frac: [33m0.05[39m,
+  dynamic_slippage_extra_bps: [33m0.25[39m,
+  amm_eff_px: [33m208.780283[39m,
+  amm_price_impact_bps: [33m-0.2503[39m,
+  reason: [32m'edge above threshold'[39m
+}
+EXEC (EV>0) PHX->AMM base=0.001 notional≈0.2086 mid=undefined
+2025-09-03T07:10:35.219Z phoenix_build_params {
+  market: [32m'4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg'[39m,
+  side: [32m'buy'[39m,
+  sizeBase: [33m0.001[39m,
+  limitPx: [33m208.442767[39m,
+  slippageBps: [33m2[39m
+}
+2025-09-03T07:10:35.237Z phoenix_build_result_shape { type: [32m'object'[39m, hasIxsField: [33mtrue[39m, isArray: [33mfalse[39m, keys: [ [32m'ixs'[39m ] }
+2025-09-03T07:10:35.239Z submit_error {
+  where: [32m'maybe_execute'[39m,
+  error: [32m'Raydium: pool 58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2 not found via SDK pool discovery'[39m
+}
