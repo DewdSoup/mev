@@ -2,9 +2,11 @@
 // Book-first edge calc + decision layer (CPMM/adaptive) + optional RPC-sim.
 // Depth-aware Phoenix (optional) and fee-accurate effective prices.
 // Emits clean edge_report logs and ML features.
-// CHANGES:
-// - Compute a recommended dynamic size using optimizeSize(...) when L2 depth + reserves exist.
-// - Pass recommended_size_base to DecisionHook so main.ts can execute with it.
+// CHANGES (baseline hardening):
+// - Compute recommended_size_base and then EVALUATE/GATE on that size
+// - Logs now show the EVALUATED size (no more .0001 vs .002 conflicts)
+// - Pass recommended_size_base to DecisionHook so main.ts executes same size
+// - Gate with safety margin: edge_bps_net >= (threshold + PNL_SAFETY_BPS) AND expected_pnl > 0
 
 import { logger } from "../ml_logger.js";
 import { synthFromMid, type PhoenixBook } from "../syntheticPhoenix.js";
@@ -20,8 +22,6 @@ import {
 function nnum(x: any): number | undefined {
   return typeof x === "number" && Number.isFinite(x) ? x : undefined;
 }
-
-// SAFE round: tolerate undefined/NaN/strings/bigints without throwing.
 function round(n: any, p = 6): number {
   const num =
     typeof n === "bigint" ? Number(n) :
@@ -29,7 +29,6 @@ function round(n: any, p = 6): number {
         Number(n);
   return Number.isFinite(num) ? Number(num.toFixed(p)) : Number.NaN;
 }
-
 function sig(obj: any): string {
   const pick = {
     s: obj.symbol,
@@ -53,7 +52,6 @@ type Reserves = {
   quoteDecimals: number;
   ts: number;
 };
-
 type DepthSide = { px: number; qty: number };
 
 export interface JoinerParams {
@@ -66,7 +64,6 @@ export interface JoinerParams {
   ammFeeBps: number;          // NOTE: EV will NOT subtract this when using CPMM eff px
   fixedTxCostQuote: number;
 }
-
 export interface JoinerCfg {
   bookTtlMs: number;
   activeSlippageMode: SlipMode;
@@ -74,11 +71,9 @@ export interface JoinerCfg {
   cpmmMaxPoolTradeFrac: number;
   dynamicSlippageExtraBps: number;
   logSimFields: boolean;
-
   enforceDedupe: boolean;
   decisionBucketMs: number;
   decisionMinEdgeDeltaBps: number;
-
   useRpcSim: boolean;
 }
 
@@ -88,8 +83,7 @@ export type DecisionHookDetails = {
   buy_px: number;
   sell_px: number;
   rpc_eff_px?: number;
-  // NEW: dynamic sizing result (used by main.ts)
-  recommended_size_base?: number;
+  recommended_size_base?: number;   // used by main.ts to execute
 };
 
 export type DecisionHook = (
@@ -107,19 +101,16 @@ export type RpcSimFn = (input: {
   ammMid: number;
   reserves?: { base: number; quote: number };
   ammFeeBps: number;
-}) => Promise<
-  | {
-    rpc_eff_px?: number;
-    rpc_price_impact_bps?: number;
-    rpc_sim_ms: number;
-    rpc_sim_mode: string;
-    rpc_sim_error?: string;
-    rpc_qty_out?: number;
-    rpc_units?: number;
-    prioritization_fee?: number;
-  }
-  | undefined
->;
+}) => Promise<{
+  rpc_eff_px?: number;
+  rpc_price_impact_bps?: number;
+  rpc_sim_ms: number;
+  rpc_sim_mode: string;
+  rpc_sim_error?: string;
+  rpc_qty_out?: number;
+  rpc_units?: number;
+  prioritization_fee?: number;
+} | undefined>;
 
 export class EdgeJoiner {
   private amms?: Mid;
@@ -221,6 +212,45 @@ export class EdgeJoiner {
     return null;
   }
 
+  // CPMM: USDC per SOL for buy (QUOTE in -> BASE out)
+  private cpmmBuyQuotePerBase(xBase: number, yQuote: number, wantBase: number, feeBps: number) {
+    if (!(xBase > 0 && yQuote > 0) || !(wantBase > 0)) return;
+    const fee = Math.max(0, feeBps) / 10_000;
+    if (wantBase >= xBase * (1 - 1e-9)) return;
+    const dqPrime = (wantBase * yQuote) / (xBase - wantBase);
+    const dq = dqPrime / (1 - fee);
+    if (!Number.isFinite(dq)) return;
+    return dq / wantBase;
+  }
+  // CPMM: USDC per SOL for sell (BASE in -> QUOTE out)
+  private cpmmSellQuotePerBase(xBase: number, yQuote: number, sellBase: number, feeBps: number) {
+    if (!(xBase > 0 && yQuote > 0) || !(sellBase > 0)) return;
+    const fee = Math.max(0, feeBps) / 10_000;
+    const dbPrime = sellBase * (1 - fee);
+    const dy = (yQuote * dbPrime) / (xBase + dbPrime);
+    if (!Number.isFinite(dy)) return;
+    return dy / sellBase;
+  }
+
+  private shouldEmit(path: "AMM->PHX" | "PHX->AMM", side: "buy" | "sell", edgeNetBps: number): boolean {
+    if (!this.C.enforceDedupe) return true;
+    const now = Date.now();
+    if (now - this.lastDecisionAtMs < this.C.decisionBucketMs) return false;
+    if (
+      this.lastPath === path &&
+      this.lastSide === side &&
+      this.lastEdgeNetBps != null &&
+      Math.abs(edgeNetBps - this.lastEdgeNetBps) < this.C.decisionMinEdgeDeltaBps
+    ) {
+      return false;
+    }
+    this.lastDecisionAtMs = now;
+    this.lastPath = path;
+    this.lastSide = side;
+    this.lastEdgeNetBps = edgeNetBps;
+    return true;
+  }
+
   private async maybeReport() {
     const now = Date.now();
     const book = this.getFreshBook();
@@ -265,32 +295,14 @@ export class EdgeJoiner {
     };
     if ((book as any).book_method) payload.phoenix_book_method = (book as any).book_method;
 
-    if (
-      this.C.logSimFields &&
-      (this.C.activeSlippageMode === "amm_cpmm" || this.C.activeSlippageMode === "adaptive") &&
-      this.reserves &&
-      this.P.tradeSizeBase > 0 &&
-      this.P.tradeSizeBase <= this.reserves.base * this.C.cpmmMaxPoolTradeFrac
-    ) {
-      const { base, quote } = this.reserves;
-      const buySim = this.cpmmBuyQuotePerBase(base, quote, this.P.tradeSizeBase, this.P.ammFeeBps);
-      const sellSim = this.cpmmSellQuotePerBase(base, quote, this.P.tradeSizeBase, this.P.ammFeeBps);
-      if (buySim != null && Number.isFinite(buySim)) {
-        (payload as any).amm_eff_px_buy = round(buySim);
-        (payload as any).amm_price_impact_bps_buy = round((buySim / ammPx - 1) * 10_000, 4);
-      }
-      if (sellSim != null && Number.isFinite(sellSim)) {
-        (payload as any).amm_eff_px_sell = round(sellSim);
-        (payload as any).amm_price_impact_bps_sell = round((sellSim / ammPx - 1) * 10_000, 4);
-      }
-    }
-
+    // Emit deduped edge snapshot
     const payloadSig = sig(payload);
     if (this.lastEdgeSig !== payloadSig) {
       logger.log("edge_report", payload);
       this.lastEdgeSig = payloadSig;
     }
 
+    // Prepare feature row
     const edgeForFeature: any = {
       symbol: "SOL/USDC",
       amm_mid: Number(ammPx.toFixed(6)),
@@ -314,47 +326,7 @@ export class EdgeJoiner {
     await this.decideAndLog(ammPx, bid, ask, (book as any).book_method, edgeForFeature);
   }
 
-  // CPMM buy: wantBase, input is USDC. Price per SOL returned (USDC/SOL), incl fee.
-  private cpmmBuyQuotePerBase(xBase: number, yQuote: number, wantBase: number, feeBps: number) {
-    if (!(xBase > 0 && yQuote > 0) || !(wantBase > 0)) return;
-    const fee = Math.max(0, feeBps) / 10_000;     // input-side
-    if (wantBase >= xBase * (1 - 1e-9)) return;
-    const dqPrime = (wantBase * yQuote) / (xBase - wantBase); // quote out (fee applied on input side → need gross in)
-    const dq = dqPrime / (1 - fee);
-    if (!Number.isFinite(dq)) return;
-    return dq / wantBase; // USDC per SOL
-  }
-
-  // CPMM sell: sellBase, output is USDC. Price per SOL returned (USDC/SOL), incl fee.
-  private cpmmSellQuotePerBase(xBase: number, yQuote: number, sellBase: number, feeBps: number) {
-    if (!(xBase > 0 && yQuote > 0) || !(sellBase > 0)) return;
-    const fee = Math.max(0, feeBps) / 10_000;     // input-side
-    const dbPrime = sellBase * (1 - fee);
-    const dy = (yQuote * dbPrime) / (xBase + dbPrime);
-    if (!Number.isFinite(dy)) return;
-    return dy / sellBase; // USDC per SOL
-  }
-
-  private shouldEmit(path: "AMM->PHX" | "PHX->AMM", side: "buy" | "sell", edgeNetBps: number): boolean {
-    if (!this.C.enforceDedupe) return true;
-    const now = Date.now();
-    if (now - this.lastDecisionAtMs < this.C.decisionBucketMs) return false;
-    if (
-      this.lastPath === path &&
-      this.lastSide === side &&
-      this.lastEdgeNetBps != null &&
-      Math.abs(edgeNetBps - this.lastEdgeNetBps) < this.C.decisionMinEdgeDeltaBps
-    ) {
-      return false;
-    }
-    this.lastDecisionAtMs = now;
-    this.lastPath = path;
-    this.lastSide = side;
-    this.lastEdgeNetBps = edgeNetBps;
-    return true;
-  }
-
-  // Depth-walk Phoenix book to our size (optional, env-driven)
+  // Depth-walk Phoenix book to our size (optional)
   private walkPhoenix(side: "buy" | "sell", sizeBase: number, feeBps: number) {
     const B = this.getFreshBook();
     if (!B) return undefined;
@@ -376,13 +348,9 @@ export class EdgeJoiner {
     const depthExtra = Math.max(0, Number(process.env.PHOENIX_DEPTH_EXTRA_BPS ?? 0) / 10_000);
 
     const avgPx = notional / sizeBase;
-    if (side === "sell") {
-      // receive on PHX
-      return avgPx * (1 - depthExtra - extra) * (1 - fee);
-    } else {
-      // pay on PHX
-      return avgPx * (1 + depthExtra + extra) * (1 + fee);
-    }
+    return side === "sell"
+      ? avgPx * (1 - depthExtra - extra) * (1 - fee) // receive on PHX
+      : avgPx * (1 + depthExtra + extra) * (1 + fee); // pay on PHX
   }
 
   private async decideAndLog(
@@ -392,73 +360,14 @@ export class EdgeJoiner {
     bookMethod?: string,
     edgeForFeature?: any
   ) {
-    const flatSlip = this.P.flatSlippageBps / 10_000;
-    const spreadBps = ((phxAsk / phxBid) - 1) * 10_000;
-    const phxSlipBpsUsed = Math.max(this.C.phoenixSlippageBps, spreadBps * 0.5) + this.C.dynamicSlippageExtraBps;
-    const phxSlip = phxSlipBpsUsed / 10_000;
-
-    const phxFee = this.P.phoenixFeeBps / 10_000;
-    const ammFee = this.P.ammFeeBps / 10_000; // NOTE: EV does not subtract AMM fee separately when using CPMM eff px
-    const sizeBase = this.P.tradeSizeBase;
-
-    const buyFlat = (px: number, fee: number, slip: number) => px * (1 + slip) * (1 + fee);
-    const sellFlat = (px: number, fee: number, slip: number) => px * (1 - slip) * (1 - fee);
-
-    let ammBuyPxSim: number | undefined;
-    let ammSellPxSim: number | undefined;
-    if ((this.C.activeSlippageMode === "amm_cpmm" || this.C.activeSlippageMode === "adaptive") && this.reserves) {
-      const { base, quote } = this.reserves;
-      const maxDb = base * this.C.cpmmMaxPoolTradeFrac;
-      if (sizeBase > 0 && sizeBase <= maxDb) {
-        // CPMM sims include AMM input fee already
-        ammBuyPxSim = this.cpmmBuyQuotePerBase(base, quote, sizeBase, this.P.ammFeeBps);
-        ammSellPxSim = this.cpmmSellQuotePerBase(base, quote, sizeBase, this.P.ammFeeBps);
-        if (ammBuyPxSim != null) ammBuyPxSim *= (1 + this.C.dynamicSlippageExtraBps / 10_000);
-        if (ammSellPxSim != null) ammSellPxSim *= (1 - this.C.dynamicSlippageExtraBps / 10_000);
-      }
-    }
-
-    // Depth-aware Phoenix (optional)
-    const phxDepthOn = String(process.env.PHOENIX_DEPTH_ENABLED ?? "0").toLowerCase() === "1" || String(process.env.PHOENIX_DEPTH_ENABLED ?? "").toLowerCase() === "true";
-    const phxSellEffDepth = phxDepthOn ? this.walkPhoenix("sell", sizeBase, this.P.phoenixFeeBps) : undefined;
-    const phxBuyEffDepth = phxDepthOn ? this.walkPhoenix("buy", sizeBase, this.P.phoenixFeeBps) : undefined;
-
-    // Path A: AMM -> PHX (buy on AMM, sell on PHX)
-    const buyA_flat = buyFlat(ammMid, ammFee, flatSlip); // conservative fallback (flat)
-    const buyA_used =
-      this.C.activeSlippageMode === "flat" || ammBuyPxSim == null
-        ? buyA_flat
-        : this.C.activeSlippageMode === "amm_cpmm"
-          ? ammBuyPxSim
-          : Math.max(buyA_flat, ammBuyPxSim);
-    const sellA = phxSellEffDepth ?? sellFlat(phxBid, phxFee, phxSlip);
-
-    const bpsNetA = (sellA / buyA_used - 1) * 10_000;
-    const pnlNetA = (sellA - buyA_used) * sizeBase - this.P.fixedTxCostQuote;
-    const bpsGrossA = (phxBid / ammMid - 1) * 10_000;
-
-    // Path B: PHX -> AMM (buy on PHX, sell on AMM)
-    const buyB = phxBuyEffDepth ?? buyFlat(phxAsk, phxFee, phxSlip);
-    const sellB_flat = sellFlat(ammMid, ammFee, flatSlip); // conservative fallback
-    const sellB_used =
-      this.C.activeSlippageMode === "flat" || ammSellPxSim == null
-        ? sellB_flat
-        : this.C.activeSlippageMode === "amm_cpmm"
-          ? ammSellPxSim
-          : Math.min(sellB_flat, ammSellPxSim);
-
-    const bpsNetB = (sellB_used / buyB - 1) * 10_000;
-    const pnlNetB = (sellB_used - buyB) * sizeBase - this.P.fixedTxCostQuote;
-    const bpsGrossB = (ammMid / phxAsk - 1) * 10_000;
-
-    const chooseA = bpsNetA >= bpsNetB;
-    const best = chooseA
-      ? { path: "AMM->PHX" as const, side: "sell" as const, buyPx: buyA_used, sellPx: sellA, edgeBpsNet: bpsNetA, edgeBpsGross: bpsGrossA, expectedPnl: pnlNetA }
-      : { path: "PHX->AMM" as const, side: "buy" as const, buyPx: buyB, sellPx: sellB_used, edgeBpsNet: bpsNetB, edgeBpsGross: bpsGrossB, expectedPnl: pnlNetB };
-
-    // ── NEW: compute recommended size using optimizeSize (only if we have reserves AND depth levels)
+    // ---------- Recommended size (before EV/gating) ----------
     let recommendedSizeBase: number | undefined = undefined;
-    if (this.reserves && this.phxBook && Array.isArray((this.phxBook as any).levels_bids) && Array.isArray((this.phxBook as any).levels_asks)) {
+    if (
+      this.reserves &&
+      this.phxBook &&
+      Array.isArray((this.phxBook as any).levels_bids) &&
+      Array.isArray((this.phxBook as any).levels_asks)
+    ) {
       try {
         const bidsL2 = ((this.phxBook as any).levels_bids as DepthSide[]).filter(l => l && l.px > 0 && l.qty > 0).map(l => ({ px: l.px, qtyBase: l.qty }));
         const asksL2 = ((this.phxBook as any).levels_asks as DepthSide[]).filter(l => l && l.px > 0 && l.qty > 0).map(l => ({ px: l.px, qtyBase: l.qty }));
@@ -486,10 +395,9 @@ export class EdgeJoiner {
             ? Number(process.env.SIZEOPT_ABS_MAX_BASE)
             : undefined;
           const probes = Math.max(5, Math.min(25, Number(process.env.SIZEOPT_PROBE_STEPS ?? 9)));
-
-          const { bestBase, bestPnl } = optimizeSize(
+          const { bestBase } = optimizeSize(
             {
-              kind: best.path, // optimize on the chosen path
+              kind: "PHX->AMM",
               book: bookOpt,
               cpmm: cpmmOpt,
               maxPoolFrac: maxFrac,
@@ -498,23 +406,83 @@ export class EdgeJoiner {
             },
             probes
           );
-
-          // Best pnl is QUOTE; subtract per-trade fixed cost for safety display (gating still handled below as before)
-          const bestPnlAfterFixed = bestPnl - this.P.fixedTxCostQuote;
-          if (bestBase > 0 && Number.isFinite(bestPnlAfterFixed)) {
-            recommendedSizeBase = bestBase;
-          }
+          if (bestBase > 0) recommendedSizeBase = bestBase;
         }
-      } catch {
-        // swallow and continue with static size
+      } catch { }
+    }
+    // Evaluation size = recommended (if present) else configured static
+    const evalSize = recommendedSizeBase && recommendedSizeBase > 0 ? recommendedSizeBase : this.P.tradeSizeBase;
+
+    // ---------- Slippage & fee setup ----------
+    const flatSlip = this.P.flatSlippageBps / 10_000;
+    const spreadBps = ((phxAsk / phxBid) - 1) * 10_000;
+    const phxSlipBpsUsed = Math.max(this.C.phoenixSlippageBps, spreadBps * 0.5) + this.C.dynamicSlippageExtraBps;
+    const phxSlip = phxSlipBpsUsed / 10_000;
+
+    const phxFee = this.P.phoenixFeeBps / 10_000;
+    const ammFee = this.P.ammFeeBps / 10_000; // do not double-count with CPMM sims
+
+    const buyFlat = (px: number, fee: number, slip: number) => px * (1 + slip) * (1 + fee);
+    const sellFlat = (px: number, fee: number, slip: number) => px * (1 - slip) * (1 - fee);
+
+    // CPMM sims at EVALUATION SIZE
+    let ammBuyPxSim: number | undefined;
+    let ammSellPxSim: number | undefined;
+    if ((this.C.activeSlippageMode === "amm_cpmm" || this.C.activeSlippageMode === "adaptive") && this.reserves) {
+      const { base, quote } = this.reserves;
+      const maxDb = base * this.C.cpmmMaxPoolTradeFrac;
+      if (evalSize > 0 && evalSize <= maxDb) {
+        ammBuyPxSim = this.cpmmBuyQuotePerBase(base, quote, evalSize, this.P.ammFeeBps);
+        ammSellPxSim = this.cpmmSellQuotePerBase(base, quote, evalSize, this.P.ammFeeBps);
+        if (ammBuyPxSim != null) ammBuyPxSim *= (1 + this.C.dynamicSlippageExtraBps / 10_000);
+        if (ammSellPxSim != null) ammSellPxSim *= (1 - this.C.dynamicSlippageExtraBps / 10_000);
       }
     }
+
+    // Phoenix depth-aware price at EVALUATION SIZE
+    const phxDepthOn = (String(process.env.PHOENIX_DEPTH_ENABLED ?? "0").toLowerCase() === "1") ||
+      (String(process.env.PHOENIX_DEPTH_ENABLED ?? "").toLowerCase() === "true");
+    const phxSellEffDepth = phxDepthOn ? this.walkPhoenix("sell", evalSize, this.P.phoenixFeeBps) : undefined;
+    const phxBuyEffDepth = phxDepthOn ? this.walkPhoenix("buy", evalSize, this.P.phoenixFeeBps) : undefined;
+
+    // ---------- Path A: AMM -> PHX ----------
+    const buyA_flat = buyFlat(ammMid, ammFee, flatSlip);
+    const buyA_used =
+      this.C.activeSlippageMode === "flat" || ammBuyPxSim == null
+        ? buyA_flat
+        : this.C.activeSlippageMode === "amm_cpmm"
+          ? ammBuyPxSim
+          : Math.max(buyA_flat, ammBuyPxSim);
+    const sellA = phxSellEffDepth ?? sellFlat(phxBid, phxFee, phxSlip);
+
+    const bpsNetA = (sellA / buyA_used - 1) * 10_000;
+    const pnlNetA = (sellA - buyA_used) * evalSize - this.P.fixedTxCostQuote;
+    const bpsGrossA = (phxBid / ammMid - 1) * 10_000;
+
+    // ---------- Path B: PHX -> AMM ----------
+    const buyB = phxBuyEffDepth ?? buyFlat(phxAsk, phxFee, phxSlip);
+    const sellB_flat = sellFlat(ammMid, ammFee, flatSlip);
+    const sellB_used =
+      this.C.activeSlippageMode === "flat" || ammSellPxSim == null
+        ? sellB_flat
+        : this.C.activeSlippageMode === "amm_cpmm"
+          ? ammSellPxSim
+          : Math.min(sellB_flat, ammSellPxSim);
+
+    const bpsNetB = (sellB_used / buyB - 1) * 10_000;
+    const pnlNetB = (sellB_used - buyB) * evalSize - this.P.fixedTxCostQuote;
+    const bpsGrossB = (ammMid / phxAsk - 1) * 10_000;
+
+    const chooseA = bpsNetA >= bpsNetB;
+    const best = chooseA
+      ? { path: "AMM->PHX" as const, side: "sell" as const, buyPx: buyA_used, sellPx: sellA, edgeBpsNet: bpsNetA, edgeBpsGross: bpsGrossA, expectedPnl: pnlNetA }
+      : { path: "PHX->AMM" as const, side: "buy" as const, buyPx: buyB, sellPx: sellB_used, edgeBpsNet: bpsNetB, edgeBpsGross: bpsGrossB, expectedPnl: pnlNetB };
 
     const base: any = {
       symbol: "SOL/USDC",
       path: best.path,
       side: best.side,
-      trade_size_base: round(this.P.tradeSizeBase, 9),
+      trade_size_base: round(evalSize, 9),               // ← evaluated/execution size
       threshold_bps: round(this.P.thresholdBps, 4),
       slippage_bps: round(this.P.flatSlippageBps, 4),
       phoenix_slippage_bps: round(this.C.phoenixSlippageBps, 4),
@@ -525,7 +493,6 @@ export class EdgeJoiner {
       sell_px: round(best.sellPx),
       edge_bps_net: round(best.edgeBpsNet, 4),
       expected_pnl: round(best.expectedPnl, 6),
-      // For transparency only; EV does NOT subtract AMM fee again when using CPMM eff px
       fees_bps: { phoenix: this.P.phoenixFeeBps, amm: this.P.ammFeeBps },
       fixed_tx_cost_quote: round(this.P.fixedTxCostQuote, 6),
     };
@@ -542,7 +509,6 @@ export class EdgeJoiner {
         base.dynamic_slippage_extra_bps = this.C.dynamicSlippageExtraBps;
       }
     }
-
     const ammEffPx =
       best.path === "AMM->PHX"
         ? (this.C.activeSlippageMode === "flat" ? ammMid : (ammBuyPxSim ?? ammMid))
@@ -555,7 +521,7 @@ export class EdgeJoiner {
       try {
         const out = await this.rpcSim({
           path: best.path,
-          sizeBase,
+          sizeBase: evalSize,
           ammMid,
           reserves: { base: this.reserves.base, quote: this.reserves.quote },
           ammFeeBps: this.P.ammFeeBps,
@@ -575,7 +541,6 @@ export class EdgeJoiner {
           if (typeof out.rpc_qty_out === "number" && Number.isFinite(out.rpc_qty_out)) base.rpc_qty_out = round(out.rpc_qty_out, 9);
           if (typeof out.rpc_units === "number" && Number.isFinite(out.rpc_units)) { base.rpc_units = out.rpc_units; base.compute_units = out.rpc_units; }
           if (typeof out.prioritization_fee === "number" && Number.isFinite(out.prioritization_fee)) base.prioritization_fee = out.prioritization_fee;
-          if (out.rpc_sim_error) base.rpc_sim_error = out.rpc_sim_error;
 
           this.onRpcSample?.({ ms: (out.rpc_sim_ms ?? 0), blocked: false });
         }
@@ -584,6 +549,7 @@ export class EdgeJoiner {
       }
     }
 
+    // Optional RPC deviation guard
     const rpcEff = (base as any).rpc_eff_px;
     if (rpcEff != null && Number.isFinite(rpcEff)) {
       const delta_bps = Math.abs((rpcEff / base.amm_eff_px - 1) * 10_000);
@@ -603,19 +569,30 @@ export class EdgeJoiner {
       this.onRpcSample?.({ ms: (base as any).rpc_sim_ms ?? 0, blocked: false });
     }
 
-    const wouldTrade = best.edgeBpsNet >= this.P.thresholdBps && best.expectedPnl >= 0;
+    // ---- FINAL gate on EV at EVALUATED SIZE (with safety) ----
+    const safetyBps = Number(process.env.PNL_SAFETY_BPS ?? "0") || 0;
+    const wantBps = this.P.thresholdBps + safetyBps;
+
+    const wouldTrade =
+      best.edgeBpsNet >= wantBps &&
+      best.expectedPnl > 0;
+
     if (!this.shouldEmit(best.path, best.side, best.edgeBpsNet)) return;
 
     if (wouldTrade) {
-      const notionalQuote = this.P.tradeSizeBase * ((best.buyPx + best.sellPx) / 2);
+      const notionalQuote = evalSize * ((best.buyPx + best.sellPx) / 2);
       noteDecision(notionalQuote);
-      logger.log("would_trade", { ...base, reason: "edge above threshold" });
+      logger.log("would_trade", {
+        ...base,
+        safety_bps: round(safetyBps, 4),
+        reason: "edge above threshold+safety"
+      });
     } else {
       const reason =
-        best.expectedPnl < 0
+        best.expectedPnl <= 0
           ? "negative expected pnl after fees/slippage"
-          : `edge below threshold (net_bps=${round(best.edgeBpsNet, 4)} < ${this.P.thresholdBps})`;
-      logger.log("would_not_trade", { ...base, reason });
+          : `edge below threshold+safety (net_bps=${round(best.edgeBpsNet, 4)} < ${wantBps})`;
+      logger.log("would_not_trade", { ...base, safety_bps: round(safetyBps, 4), reason });
     }
 
     this.onDecision(wouldTrade, best.edgeBpsNet, best.expectedPnl, {
@@ -623,8 +600,7 @@ export class EdgeJoiner {
       side: best.side,
       buy_px: round(best.buyPx),
       sell_px: round(best.sellPx),
-      rpc_eff_px: (base as any).rpc_eff_px,
-      recommended_size_base: recommendedSizeBase,
+      recommended_size_base: recommendedSizeBase ?? this.P.tradeSizeBase,
     });
 
     if (edgeForFeature) {
@@ -638,7 +614,7 @@ export class EdgeJoiner {
           expected_pnl: round(best.expectedPnl, 6),
           threshold_bps: this.P.thresholdBps,
           slippage_bps: this.P.flatSlippageBps,
-          trade_size_base: this.P.tradeSizeBase,
+          trade_size_base: evalSize,
           would_trade: wouldTrade,
         })
       );
