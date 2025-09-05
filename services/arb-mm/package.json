@@ -4,7 +4,7 @@
     "type": "module",
     "main": "dist/index.js",
     "scripts": {
-        "//": "──────────── Live reports ────────────",
+        "//": "──────────── Live reports / utilities ────────────",
         "dev": "tsx watch src/main.ts",
         "build": "tsc -b",
         "backtest": "tsx src/replay.ts",
@@ -17,7 +17,13 @@
         "phoenix:diag": "tsx src/diag.ts",
         "start:prod": "node dist/src/main.js",
         "ml:tap": "tsx scripts/ml_tap.ts",
-        "start": "node dist/main.js"
+        "start": "node dist/main.js",
+        "//_logs": "──────────── Log path unification (no code changes) ────────────",
+        "logs:link": "bash -lc 'set -e; REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd); cd \"$REPO_ROOT\"; mkdir -p services/arb-mm/data/reports/phoenix services/arb-mm/data/reports/amms services/arb-mm/data/reports/arb; rm -rf packages/phoenix/logs && ln -s ../../services/arb-mm/data/reports/phoenix packages/phoenix/logs; rm -rf packages/amms/logs && ln -s ../../services/arb-mm/data/reports/amms packages/amms/logs; rm -rf services/arb-mm/logs && ln -s ../data/reports/arb services/arb-mm/logs'",
+        "logs:clean": "bash -lc 'set -e; REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd); cd \"$REPO_ROOT\"; rm -rf services/arb-mm/services services/arb-mm/packages services/arb-mm/logs services/arb-mm/events-*.jsonl'",
+        "//_hooks": "──────────── Keep symlinks correct before local runs ────────────",
+        "predev": "pnpm run logs:link",
+        "prestart:prod": "pnpm run logs:link"
     },
     "dependencies": {
         "@ellipsis-labs/phoenix-sdk": "2.0.3",
