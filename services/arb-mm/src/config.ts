@@ -1,6 +1,7 @@
 // services/arb-mm/src/config.ts
 // Centralized env + defaults + params merge + path helpers.
 // Enhanced to prefer .env.live (then fall back to .env). Supports ENV_FILE override.
+// NEW: respects __ENV_LIVE_LOCKED=1 to avoid re-loading env files if upstream already loaded them.
 
 import fs from "fs";
 import path from "path";
@@ -16,6 +17,9 @@ const SVC_ROOT = path.resolve(__dirname, "..");
 
 // Load .env.live with highest precedence, then .env
 function loadRootEnv() {
+  // If upstream (main.ts or shell) has already loaded & locked env, skip.
+  if (String(process.env.__ENV_LIVE_LOCKED ?? "0") === "1") return;
+
   const ENV_FILE = process.env.ENV_FILE?.trim();
   const candidates = [
     // explicit file (absolute or relative)

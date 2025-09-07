@@ -1,8 +1,9 @@
 // services/arb-mm/src/executor/live.ts
 // CHANGES:
-// - Pre-send EV sanity gate with PNL_SAFETY_BPS
-// - Log pre_tx_balances and post_tx_balances (SOL lamports, WSOL ui, USDC ui)
-// - Log realized deltas per tx (realized_usdc_delta, wsol_delta, sol_lamports_delta)
+// - Force-send pathway: respect FORCE_EXECUTE_EVEN_IF_NEG (+ optional FORCE_EXECUTE_MAX_BASE clamp).
+// - Pre-send EV sanity gate with PNL_SAFETY_BPS (skipped when forced).
+// - Log pre_tx_balances and post_tx_balances (SOL lamports, WSOL ui, USDC ui).
+// - Log realized deltas per tx (realized_usdc_delta, wsol_delta, sol_lamports_delta).
 
 import fs from "fs";
 import path from "path";
@@ -37,6 +38,15 @@ const CU_LIMIT = Number.isFinite(Number(process.env.SUBMIT_CU_LIMIT)) ? Number(p
 const CU_PRICE = Number.isFinite(Number(process.env.TIP_MICROLAMPORTS_PER_CU)) ? Number(process.env.TIP_MICROLAMPORTS_PER_CU) : 0;
 const FIXED_TX_COST_QUOTE = Number(process.env.FIXED_TX_COST_QUOTE ?? "0") || 0;
 const PNL_SAFETY_BPS = Number(process.env.PNL_SAFETY_BPS ?? "0") || 0;
+
+function envTrue(k: string): boolean {
+  const v = String(process.env[k] ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+function envNum(k: string): number | undefined {
+  const n = Number(process.env[k]);
+  return Number.isFinite(n) ? n : undefined;
+}
 
 // Types / helpers
 export type AtomicPath = "PHX->AMM" | "AMM->PHX";
@@ -160,34 +170,49 @@ export class LiveExecutor {
   async maybeExecute(payload: any): Promise<void> {
     try {
       const path = (payload?.path as AtomicPath) || "PHX->AMM";
-      const sizeBase = Number(payload?.size_base ?? payload?.trade_size_base ?? 0);
+      let sizeBase = Number(payload?.size_base ?? payload?.trade_size_base ?? 0);
       const phoenix = payload?.phoenix || {};
       const buy_px = Number(payload?.buy_px ?? 0);
       const sell_px = Number(payload?.sell_px ?? 0);
 
-      // Stage 0: pre-send sanity (joiner already handled thresholds & safety)
+      // ── Force-send path controls ─────────────────────────────────────────
+      const FORCE = envTrue("FORCE_EXECUTE_EVEN_IF_NEG");
+      const MAX_FORCE_BASE = envNum("FORCE_EXECUTE_MAX_BASE");
+      if (FORCE && MAX_FORCE_BASE && sizeBase > MAX_FORCE_BASE) {
+        logger.log("force_exec_clamped_size", { from: sizeBase, to: MAX_FORCE_BASE });
+        sizeBase = MAX_FORCE_BASE;
+      }
+
+      // Stage 0: pre-send EV sanity (joiner already handled thresholds & safety)
       const evQuote = (sell_px - buy_px) * sizeBase - FIXED_TX_COST_QUOTE;
-      if (!(evQuote > 0)) {
-        logger.log("submit_error", { where: "pre_send_ev_gate", error: "negative_expected_pnl_quote", sizeBase, buy_px, sell_px, ev_quote: evQuote });
-        return;
+      const avgPx = (buy_px > 0 && sell_px > 0) ? (buy_px + sell_px) / 2 : 0;
+      const evBps = (avgPx > 0) ? ((sell_px / buy_px) - 1) * 10_000 : -1e9;
+
+      if (FORCE) {
+        logger.log("force_exec_enabled", {
+          path, size_base: sizeBase, buy_px, sell_px,
+          ev_quote: evQuote, ev_bps: evBps,
+          threshold_bps: Number(process.env.TRADE_THRESHOLD_BPS ?? 0) || 0,
+          safety_bps: PNL_SAFETY_BPS,
+        });
+      } else {
+        if (!(evQuote > 0)) {
+          logger.log("submit_error", { where: "pre_send_ev_gate", error: "negative_expected_pnl_quote", sizeBase, buy_px, sell_px, ev_quote: evQuote });
+          return;
+        }
+        const wantBps = (Number(process.env.TRADE_THRESHOLD_BPS ?? 0) || 0) + PNL_SAFETY_BPS;
+        if (!(evBps >= wantBps)) {
+          logger.log("submit_error", {
+            where: "pre_send_ev_gate",
+            error: "negative_or_insufficient_expected_pnl",
+            size_base: sizeBase, buy_px, sell_px, ev_quote: evQuote, ev_bps: evBps, safety_bps: PNL_SAFETY_BPS
+          });
+          return;
+        }
       }
 
       if (!phoenix?.market) {
         logger.log("submit_error", { where: "maybe_execute", error: "missing_phoenix_market" });
-        return;
-      }
-
-      // Pre-send EV safety margin (bps + fixed cost)
-      const avgPx = (buy_px > 0 && sell_px > 0) ? (buy_px + sell_px) / 2 : 0;
-      const evBps = (avgPx > 0) ? ((sell_px / buy_px) - 1) * 10_000 : -1e9;
-      if (!(evQuote > 0) || !(evBps >= Number(process.env.TRADE_THRESHOLD_BPS ?? 0) + PNL_SAFETY_BPS)) {
-        logger.log("submit_error", {
-          where: "pre_send_ev_gate",
-          error: "negative_or_insufficient_expected_pnl",
-          size_base: sizeBase,
-          buy_px, sell_px, ev_quote: evQuote, ev_bps: evBps,
-          safety_bps: PNL_SAFETY_BPS
-        });
         return;
       }
 
@@ -310,6 +335,7 @@ export class LiveExecutor {
       logger.log("pre_tx_balances", {
         path, size_base: sizeBase, size_source: payload?.size_source ?? "unknown",
         buy_px, sell_px, FIXED_TX_COST_QUOTE, PNL_SAFETY_BPS,
+        forced: FORCE || undefined,
         ...pre
       });
 

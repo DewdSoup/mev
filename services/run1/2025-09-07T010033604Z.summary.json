@@ -1,0 +1,30 @@
+{
+  "file": "/home/dudesoup/code/mev/services/arb-mm/data/live/2025-09-07T010033604Z.summary.json",
+  "started_at": "2025-09-07T00:37:30.581Z",
+  "stopped_at": "2025-09-07T01:00:33.604Z",
+  "considered": 2629,
+  "would_trade": 0,
+  "would_not_trade": 2629,
+  "pnl_sum": 0,
+  "best_edge_bps": -15.8655,
+  "worst_edge_bps": -23.5597,
+  "threshold_bps": "0.5",
+  "slippage_bps": "3",
+  "trade_size_base": "0.01",
+  "book_ttl_ms": "1500",
+  "decision_dedupe_ms": "500",
+  "decision_bucket_ms": "150",
+  "min_edge_delta_bps": "0.05",
+  "allow_synth_trades": "false",
+  "balances_start": {
+    "sol": 0.084221687,
+    "wsol": 0.08296072,
+    "usdc": 18.400239
+  },
+  "ml_events_file": "/home/dudesoup/code/mev/services/arb-mm/data/live/2025-09-07T003734309Z.events.jsonl",
+  "exec_guard": {
+    "allowed_path": "both",
+    "atomic_preferred": true
+  },
+  "atomic_mode": "single_tx"
+}
