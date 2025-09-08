@@ -1,5 +1,5 @@
 // packages/phoenix/src/index.ts
-// Phoenix L2 publisher with SDK L3 fallback (aggregates L3 → L2)
+// Phoenix L2 publisher with WS-driven triggers (account-change) and SDK fallback.
 // Emits:
 //   phoenix_l2  { ts, market, symbol, best_bid, best_ask, phoenix_mid, tick_ms, source, levels_bids?, levels_asks? }
 //   phoenix_mid { ts, market, symbol, px, px_str, best_bid?, best_ask?, tick_ms, source }
@@ -11,7 +11,7 @@ import * as dotenv from "dotenv";
 import { Connection, PublicKey, Commitment } from "@solana/web3.js";
 import * as PhoenixSDK from "@ellipsis-labs/phoenix-sdk";
 import { logger } from "@mev/storage";
-import { makePhoenixConnection } from "./rpc.js";
+import { makePhoenixConnection } from "./rpc";
 
 type MarketState = any;
 
@@ -56,9 +56,12 @@ function maskUrl(u: string) {
 const RPC_MASK = resolveRpcForMask();
 const COMMITMENT: Commitment = "processed";
 
-const TICK_MS = clamp(numOr(process.env.PHOENIX_TICK_MS, 2000), 100, 60000);
+// Cadence & depths
+const TICK_MS = clamp(numOr(process.env.PHOENIX_TICK_MS, 1000), 100, 60000);
 const L2_FETCH_DEPTH = clamp(numOr(process.env.PHOENIX_L2_DEPTH, 10), 1, 50);
 const PUBLISH_DEPTH = clamp(numOr(process.env.PHOENIX_DEPTH_LEVELS, L2_FETCH_DEPTH), 1, 50);
+
+// WS enable flag (we always *try* WS; this controls fallback poll only)
 const TRY_WS = boolOr(process.env.PHOENIX_WS_ENABLED, true);
 
 // ── config file (optional) ────────────────────────────────────────────────────
@@ -74,7 +77,7 @@ function loadMarketsConfig(): MarketCfg[] | null {
         const arr = JSON.parse(fs.readFileSync(p, "utf8")) as MarketCfg[];
         if (Array.isArray(arr) && arr.length) return arr;
       }
-    } catch {/* ignore */ }
+    } catch { /* ignore */ }
   }
   return null;
 }
@@ -89,7 +92,7 @@ async function makeClient(conn: Connection, seedMarkets: string[] = []): Promise
     .map(s => { try { return new PublicKey(s); } catch { return null; } })
     .filter(Boolean) as PublicKey[];
 
-  // Known-good seeding path: (connection, seeds)
+  // Prefer current seeding path if available
   if (seeds.length && typeof Ctor.createWithMarketAddresses === "function") {
     try {
       const client = await (Ctor as any).createWithMarketAddresses(conn, seeds);
@@ -101,7 +104,6 @@ async function makeClient(conn: Connection, seedMarkets: string[] = []): Promise
     logger.log("phoenix_client_seed_all_failed", { seeds: seedMarkets });
   }
 
-  // Fallback (older SDKs)
   const client = typeof Ctor.create === "function" ? await Ctor.create(conn) : new Ctor(conn);
   logger.log("phoenix_client_unseeded", { note: "Client.create(connection)" });
   return client;
@@ -117,7 +119,7 @@ type MaybeBbo = {
   source: string;
 };
 
-// Accept many shapes: {price,size}, {price,quantity}, tuple [price,size], BN-ish, etc.
+// Accept many shapes
 function pxFrom(l: any): number | undefined {
   if (l == null) return;
   if (Array.isArray(l)) {
@@ -167,13 +169,13 @@ function l3ToL2(levels: any[] | undefined, side: "bids" | "asks", depth: number)
   return arr.slice(0, depth);
 }
 
-// ── depth fetcher (tries UI ladder → L2 → L3UI → L3 → refreshMarket) ─────────
+// ── depth fetcher (SDK paths) ────────────────────────────────────────────────
 async function fetchDepth(client: any, market: PublicKey, depth: number): Promise<MaybeBbo> {
   // 1) getUiLadder (L2)
   if (typeof client?.getUiLadder === "function") {
     try {
       const lad = await client.getUiLadder(market, depth);
-      const bids = l3ToL2(lad?.bids, "bids", depth); // safe even if already L2
+      const bids = l3ToL2(lad?.bids, "bids", depth);
       const asks = l3ToL2(lad?.asks, "asks", depth);
       const bestBid = bids[0]?.px, bestAsk = asks[0]?.px;
       if (Number.isFinite(bestBid) || Number.isFinite(bestAsk))
@@ -232,51 +234,25 @@ async function fetchDepth(client: any, market: PublicKey, depth: number): Promis
   }
 }
 
-// ── optional WS (best-effort; polling still runs) ────────────────────────────
-async function tryAttachWs(client: any, market: PublicKey, onKick: () => void): Promise<boolean> {
-  if (!TRY_WS) return false;
-  try {
-    if (typeof client?.subscribeToMarket === "function") {
-      await client.subscribeToMarket(market);
-      if (typeof client?.onMarketUpdate === "function") client.onMarketUpdate(market, onKick);
-      logger.log("phoenix_ws_subscribed", { via: "subscribeToMarket" });
-      return true;
-    }
-  } catch { /* fall through */ }
-  try {
-    if (typeof client?.subscribeToL2 === "function") {
-      await client.subscribeToL2(market);
-      logger.log("phoenix_ws_subscribed", { via: "subscribeToL2" });
-      return true;
-    }
-  } catch { /* fall through */ }
-  try {
-    if (typeof client?.subscribeL2 === "function") {
-      await client.subscribeL2(market);
-      logger.log("phoenix_ws_subscribed", { via: "subscribeL2" });
-      return true;
-    }
-  } catch { /* fall through */ }
-  logger.log("phoenix_ws_unavailable", { note: "polling only" });
-  return false;
-}
-
-// ── single market loop ────────────────────────────────────────────────────────
-async function runMarket(client: any, symbol: string, marketStr: string) {
+// ── single market loop (WS-driven with minimal fallback) ─────────────────────
+async function runMarket(client: any, conn: Connection, symbol: string, marketStr: string) {
   const market = new PublicKey(marketStr);
 
+  // Ensure SDK has market context
   try {
-    // Prefer addMarket first, then refresh; ensures state existence across SDKs
     if (typeof client?.addMarket === "function") await client.addMarket(market);
     if (typeof client?.refreshMarket === "function") await client.refreshMarket(market, false);
   } catch {/* ignore */ }
 
-  let kick = true;
-  const wsAttached = await tryAttachWs(client, market, () => (kick = true)).catch(() => false);
+  logger.log("phoenix_boot", { rpc: maskUrl(RPC_MASK), ws_attached: true });
 
-  logger.log("phoenix_boot", { rpc: maskUrl(RPC_MASK), ws_attached: wsAttached });
+  let lastPublishTs = 0;
+  let lastWsKickTs = 0;
+  let inFlight = false;
 
-  while (true) {
+  const publish = async (reason: string) => {
+    if (inFlight) return;
+    inFlight = true;
     try {
       const depth = await fetchDepth(client, market, L2_FETCH_DEPTH);
       const ts = Date.now();
@@ -288,6 +264,8 @@ async function runMarket(client: any, symbol: string, marketStr: string) {
           : Number.isFinite(best_bid) ? best_bid
             : Number.isFinite(best_ask) ? best_ask
               : NaN;
+
+      const source = `${reason}+${depth.source}`;
 
       if (Number.isFinite(best_bid) || Number.isFinite(best_ask)) {
         const levels_bids = (depth.bids ?? []).slice(0, PUBLISH_DEPTH);
@@ -303,7 +281,7 @@ async function runMarket(client: any, symbol: string, marketStr: string) {
           best_ask_str: Number.isFinite(best_ask) ? best_ask.toFixed(12) : undefined,
           phoenix_mid: Number.isFinite(mid) ? mid : undefined,
           tick_ms: TICK_MS,
-          source: depth.source,
+          source,
           levels_bids,
           levels_asks,
         });
@@ -317,7 +295,7 @@ async function runMarket(client: any, symbol: string, marketStr: string) {
           best_bid: Number.isFinite(best_bid) ? best_bid : undefined,
           best_ask: Number.isFinite(best_ask) ? best_ask : undefined,
           tick_ms: TICK_MS,
-          source: depth.source,
+          source,
         });
       } else {
         logger.log("phoenix_l2_empty", {
@@ -327,16 +305,48 @@ async function runMarket(client: any, symbol: string, marketStr: string) {
           haveBid: false,
           haveAsk: false,
           tick_ms: TICK_MS,
-          source: depth.source,
+          source,
         });
       }
-    } catch (e: any) {
-      logger.log("phoenix_poll_error", { market: marketStr, error: String(e?.message ?? e) });
-    }
 
-    kick = false;
-    await new Promise(r => setTimeout(r, TICK_MS));
+      lastPublishTs = ts;
+    } catch (e: any) {
+      logger.log("phoenix_publish_error", { market: marketStr, error: String(e?.message ?? e) });
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  // WS: subscribe to **account changes** on the market address (fast triggers)
+  let subId: number | null = null;
+  try {
+    subId = conn.onAccountChange(
+      market,
+      () => { lastWsKickTs = Date.now(); publish("ws:onAccountChange").catch(() => { }); },
+      COMMITMENT
+    );
+    logger.log("phoenix_ws_subscribed", { via: "onAccountChange" });
+  } catch (e: any) {
+    logger.log("phoenix_ws_unavailable", { note: "onAccountChange failed", err: String(e?.message ?? e) });
   }
+
+  // Initial publish so downstream has a seed snapshot
+  await publish("init");
+
+  // Minimal fallback: if WS is quiet for 3 * TICK_MS, do one poll to refresh.
+  const FALLBACK_MULT = 3;
+  // Also, periodic sanity to avoid complete silence even with sparse WS.
+  const interval = setInterval(() => {
+    const now = Date.now();
+    const tooQuiet = now - Math.max(lastWsKickTs, lastPublishTs) > TICK_MS * FALLBACK_MULT;
+    if (tooQuiet) publish("poll:fallback").catch(() => { });
+  }, TICK_MS);
+
+  // Keep process alive
+  const noop = setInterval(() => { }, 1 << 30);
+
+  // If this ever needs teardown:
+  // return () => { if (subId != null) conn.removeAccountChangeListener(subId); clearInterval(interval); clearInterval(noop); };
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -361,8 +371,7 @@ async function main() {
   }
 
   if (envMarket) {
-    await runMarket(client, "SOL/USDC", envMarket);
-    setInterval(() => { }, 1 << 30);
+    await runMarket(client, conn, "SOL/USDC", envMarket);
     return;
   }
 
@@ -372,17 +381,15 @@ async function main() {
       market: m.phoenix!.market,
     }));
     if (mkts.length) {
-      for (const m of mkts) runMarket(client, m.symbol, m.market).catch(e =>
+      for (const m of mkts) runMarket(client, conn, m.symbol, m.market).catch(e =>
         logger.log("phoenix_fatal_market", { symbol: m.symbol, err: String(e) })
       );
-      setInterval(() => { }, 1 << 30);
       return;
     }
   }
 
   // default single market
-  await runMarket(client, "SOL/USDC", "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg");
-  setInterval(() => { }, 1 << 30);
+  await runMarket(client, conn, "SOL/USDC", "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg");
 }
 
 main().catch((e) => logger.log("phoenix_fatal", { err: String(e) }));
