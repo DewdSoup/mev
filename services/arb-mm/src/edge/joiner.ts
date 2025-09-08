@@ -2,11 +2,29 @@
 // Book-first edge calc + decision layer (CPMM/adaptive) + optional RPC-sim.
 // Depth-aware Phoenix (optional) and fee-accurate effective prices.
 // Emits clean edge_report logs and ML features.
-// CHANGES (baseline hardening):
-// - Compute recommended_size_base and then EVALUATE/GATE on that size
-// - Logs now show the EVALUATED size (no more .0001 vs .002 conflicts)
-// - Pass recommended_size_base to DecisionHook so main.ts executes same size
-// - Gate with safety margin: edge_bps_net >= (threshold + PNL_SAFETY_BPS) AND expected_pnl > 0
+//
+// NEW in this build (fixes the 0.001-SOL gate):
+// - Evaluate EV over a size grid for BOTH PATHS (AMM->PHX, PHX->AMM).
+// - Choose s* = argmax EV(s) across both paths; gate on EV(s*).
+// - Size floor at decision-time via DECISION_MIN_BASE, SIZEOPT_MIN_BASE, or
+//   dynamic floor from fixed cost (≤ target bps).
+// - Use PHOENIX L2 depth for size-based prices when enabled; CPMM for AMM leg.
+// - Emit recommended_size_base = s*; logs always show evaluated size.
+//
+// Environment knobs added/used here (optional):
+//   DECISION_MIN_BASE                (e.g., 0.03)     → hard floor in BASE
+//   DECISION_SIZE_GRID               (e.g., "0.02,0.03,0.05,0.1")
+//   DECISION_FIXEDCOST_TARGET_BPS    (default 1)      → compute dynamic floor so fixed-cost bps ≤ target
+//   SIZEOPT_MIN_BASE                 (legacy)         → used if DECISION_MIN_BASE absent
+//   SIZEOPT_ABS_MAX_BASE             (optional cap)   → absolute cap in BASE for grid
+//   SIZEOPT_MAX_POOL_FRAC            (fallback)       → else use C.cpmmMaxPoolTradeFrac
+//   PHOENIX_DEPTH_ENABLED            (1/true)         → enables depth-based PHX prices
+//
+// Notes:
+// - Fixed tx cost is deducted in EV(s) for every size probe.
+// - When depth is insufficient or CPMM is off, we fall back to conservative flat slippage paths.
+//
+// ─────────────────────────────────────────────────────────────────────────────
 
 import { logger } from "../ml_logger.js";
 import { synthFromMid, type PhoenixBook } from "../syntheticPhoenix.js";
@@ -23,10 +41,7 @@ function nnum(x: any): number | undefined {
   return typeof x === "number" && Number.isFinite(x) ? x : undefined;
 }
 function round(n: any, p = 6): number {
-  const num =
-    typeof n === "bigint" ? Number(n) :
-      typeof n === "string" ? Number(n) :
-        Number(n);
+  const num = typeof n === "bigint" ? Number(n) : typeof n === "string" ? Number(n) : Number(n);
   return Number.isFinite(num) ? Number(num.toFixed(p)) : Number.NaN;
 }
 function sig(obj: any): string {
@@ -42,6 +57,18 @@ function sig(obj: any): string {
     bm: obj.phoenix_book_method,
   };
   return JSON.stringify(pick);
+}
+function envNum(name: string): number | undefined {
+  const v = process.env[name];
+  if (v == null || v === "") return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+function envTrue(name: string, def = false): boolean {
+  const v = String(process.env[name] ?? "").trim().toLowerCase();
+  if (v === "1" || v === "true" || v === "yes") return true;
+  if (v === "0" || v === "false" || v === "no") return false;
+  return def;
 }
 
 type Mid = { px: number; ts: number };
@@ -353,6 +380,142 @@ export class EdgeJoiner {
       : avgPx * (1 + depthExtra + extra) * (1 + fee); // pay on PHX
   }
 
+  // ---- EV model for a given path + size (returns undefined if unavailable at this size) ----
+  private evForSize(
+    path: "AMM->PHX" | "PHX->AMM",
+    sizeBase: number,
+    ammMid: number,
+    phxBid: number,
+    phxAsk: number
+  ): | {
+    path: "AMM->PHX" | "PHX->AMM";
+    side: "buy" | "sell";
+    buyPx: number;    // QUOTE per BASE paid
+    sellPx: number;   // QUOTE per BASE received
+    bpsGross: number;
+    bpsNet: number;
+    pnlNet: number;   // quote
+  }
+    | undefined {
+    if (!(sizeBase > 0)) return undefined;
+    const flatSlip = this.P.flatSlippageBps / 10_000;
+    const phxSpreadBps = ((phxAsk / phxBid) - 1) * 10_000;
+    const phxSlipBpsUsed = Math.max(this.C.phoenixSlippageBps, phxSpreadBps * 0.5) + this.C.dynamicSlippageExtraBps;
+    const phxSlip = phxSlipBpsUsed / 10_000;
+
+    const phxFee = this.P.phoenixFeeBps / 10_000;
+    const ammFee = this.P.ammFeeBps / 10_000;
+
+    // AMM effective prices (size-aware if CPMM enabled)
+    let ammBuyPxSim: number | undefined;
+    let ammSellPxSim: number | undefined;
+    if ((this.C.activeSlippageMode === "amm_cpmm" || this.C.activeSlippageMode === "adaptive") && this.reserves) {
+      const { base, quote } = this.reserves;
+      const maxDb = base * this.C.cpmmMaxPoolTradeFrac;
+      if (sizeBase <= maxDb) {
+        ammBuyPxSim = this.cpmmBuyQuotePerBase(base, quote, sizeBase, this.P.ammFeeBps);
+        ammSellPxSim = this.cpmmSellQuotePerBase(base, quote, sizeBase, this.P.ammFeeBps);
+        if (ammBuyPxSim != null) ammBuyPxSim *= (1 + this.C.dynamicSlippageExtraBps / 10_000);
+        if (ammSellPxSim != null) ammSellPxSim *= (1 - this.C.dynamicSlippageExtraBps / 10_000);
+      } else {
+        // size exceeds policy cap
+        return undefined;
+      }
+    }
+
+    const buyFlat = (px: number, fee: number, slip: number) => px * (1 + slip) * (1 + fee);
+    const sellFlat = (px: number, fee: number, slip: number) => px * (1 - slip) * (1 - fee);
+
+    const phxDepthOn = envTrue("PHOENIX_DEPTH_ENABLED", false);
+    const phxSellEffDepth = phxDepthOn ? this.walkPhoenix("sell", sizeBase, this.P.phoenixFeeBps) : undefined;
+    const phxBuyEffDepth = phxDepthOn ? this.walkPhoenix("buy", sizeBase, this.P.phoenixFeeBps) : undefined;
+
+    if (path === "AMM->PHX") {
+      // Buy BASE on AMM (cost), sell BASE on PHX (revenue)
+      const buyA_flat = buyFlat(ammMid, ammFee, flatSlip);
+      const buyPx =
+        this.C.activeSlippageMode === "flat" || ammBuyPxSim == null
+          ? buyA_flat
+          : this.C.activeSlippageMode === "amm_cpmm"
+            ? ammBuyPxSim
+            : Math.max(buyA_flat, ammBuyPxSim); // adaptive: be conservative on cost
+
+      const sellPx = phxSellEffDepth ?? sellFlat(phxBid, phxFee, phxSlip);
+      if (!(buyPx > 0 && sellPx > 0)) return undefined;
+
+      const pnlNet = (sellPx - buyPx) * sizeBase - this.P.fixedTxCostQuote;
+      const bpsGross = (phxBid / ammMid - 1) * 10_000;
+      const bpsNet = (sellPx / buyPx - 1) * 10_000;
+
+      return { path, side: "sell", buyPx, sellPx, bpsGross, bpsNet, pnlNet };
+    } else {
+      // PHX->AMM: Buy BASE on PHX (cost), sell BASE on AMM (revenue)
+      const buyPx = phxBuyEffDepth ?? buyFlat(phxAsk, phxFee, phxSlip);
+
+      const sellB_flat = sellFlat(ammMid, ammFee, flatSlip);
+      const sellPx =
+        this.C.activeSlippageMode === "flat" || ammSellPxSim == null
+          ? sellB_flat
+          : this.C.activeSlippageMode === "amm_cpmm"
+            ? ammSellPxSim
+            : Math.min(sellB_flat, ammSellPxSim); // adaptive: be conservative on revenue
+
+      if (!(buyPx > 0 && sellPx > 0)) return undefined;
+
+      const pnlNet = (sellPx - buyPx) * sizeBase - this.P.fixedTxCostQuote;
+      const bpsGross = (ammMid / phxAsk - 1) * 10_000;
+      const bpsNet = (sellPx / buyPx - 1) * 10_000;
+
+      return { path, side: "buy", buyPx, sellPx, bpsGross, bpsNet, pnlNet };
+    }
+  }
+
+  private buildSizeGrid(ammMid: number): number[] {
+    const explicitGrid = String(process.env.DECISION_SIZE_GRID ?? "").trim();
+    if (explicitGrid) {
+      const xs = explicitGrid.split(",").map(s => Number(s.trim())).filter(x => Number.isFinite(x) && x > 0);
+      return Array.from(new Set(xs)).sort((a, b) => a - b);
+    }
+
+    // Decision floor:
+    // 1) explicit DECISION_MIN_BASE
+    // 2) SIZEOPT_MIN_BASE legacy
+    // 3) dynamic: ensure fixed-cost bps ≤ target (default 1 bps)
+    const floorExplicit = envNum("DECISION_MIN_BASE");
+    const sizeoptMin = envNum("SIZEOPT_MIN_BASE");
+    const targetBps = Math.max(0.1, envNum("DECISION_FIXEDCOST_TARGET_BPS") ?? 1);
+    const dynMin = (this.P.fixedTxCostQuote > 0 && ammMid > 0)
+      ? (10_000 * this.P.fixedTxCostQuote) / (ammMid * targetBps)
+      : 0;
+
+    const floor = Math.max(1e-6, floorExplicit ?? sizeoptMin ?? dynMin ?? this.P.tradeSizeBase);
+
+    // Upper cap:
+    // min(ABS_MAX, poolFracCap)
+    const absMax = envNum("SIZEOPT_ABS_MAX_BASE");
+    const maxFrac = envNum("SIZEOPT_MAX_POOL_FRAC") ?? this.C.cpmmMaxPoolTradeFrac;
+    const poolCap = this.reserves ? this.reserves.base * maxFrac : (absMax ?? floor * 8);
+    const upper = Math.max(floor, Math.min(poolCap, absMax ?? Number.POSITIVE_INFINITY));
+
+    // Geometric-ish grid (covers ~x6–x8 range with 7–9 probes)
+    const steps = Math.max(5, Math.min(15, Number(process.env.SIZEOPT_PROBE_STEPS ?? 9)));
+    const ratio = Math.pow(upper / floor, 1 / Math.max(1, steps - 1));
+    const out: number[] = [];
+    let v = floor;
+    for (let i = 0; i < steps; i++) {
+      out.push(v);
+      v = v * ratio;
+    }
+
+    // Include configured trade size (if between floor and upper)
+    if (this.P.tradeSizeBase > floor && this.P.tradeSizeBase < upper) out.push(this.P.tradeSizeBase);
+
+    // De-dup + sort
+    const uniq = Array.from(new Set(out.map(x => Number(x.toFixed(9))))).filter(x => x > 0 && Number.isFinite(x));
+    uniq.sort((a, b) => a - b);
+    return uniq;
+  }
+
   private async decideAndLog(
     ammMid: number,
     phxBid: number,
@@ -360,129 +523,98 @@ export class EdgeJoiner {
     bookMethod?: string,
     edgeForFeature?: any
   ) {
-    // ---------- Recommended size (before EV/gating) ----------
-    let recommendedSizeBase: number | undefined = undefined;
-    if (
-      this.reserves &&
-      this.phxBook &&
-      Array.isArray((this.phxBook as any).levels_bids) &&
-      Array.isArray((this.phxBook as any).levels_asks)
-    ) {
-      try {
-        const bidsL2 = ((this.phxBook as any).levels_bids as DepthSide[]).filter(l => l && l.px > 0 && l.qty > 0).map(l => ({ px: l.px, qtyBase: l.qty }));
-        const asksL2 = ((this.phxBook as any).levels_asks as DepthSide[]).filter(l => l && l.px > 0 && l.qty > 0).map(l => ({ px: l.px, qtyBase: l.qty }));
+    // Build size grid once per tick
+    const grid = this.buildSizeGrid((phxBid + phxAsk) / 2);
+
+    // Try to seed grid with optimizeSize maxima (gross) for both paths when we have full inputs.
+    let bookOpt: SizePhoenixBook | undefined;
+    let cpmmOpt: SizeCpmmReserves | undefined;
+    try {
+      if (
+        this.reserves &&
+        this.phxBook &&
+        Array.isArray((this.phxBook as any).levels_bids) &&
+        Array.isArray((this.phxBook as any).levels_asks)
+      ) {
+        const bidsL2 = ((this.phxBook as any).levels_bids as DepthSide[])
+          .filter(l => l && l.px > 0 && l.qty > 0)
+          .map(l => ({ px: l.px, qtyBase: l.qty }));
+        const asksL2 = ((this.phxBook as any).levels_asks as DepthSide[])
+          .filter(l => l && l.px > 0 && l.qty > 0)
+          .map(l => ({ px: l.px, qtyBase: l.qty }));
         if (bidsL2.length && asksL2.length) {
-          const bookOpt: SizePhoenixBook = {
-            bids: bidsL2,
-            asks: asksL2,
-            takerFeeBps: this.P.phoenixFeeBps,
-          };
+          bookOpt = { bids: bidsL2, asks: asksL2, takerFeeBps: this.P.phoenixFeeBps };
           const feeBpsCpmm = Number.isFinite(Number(process.env.RAYDIUM_TRADE_FEE_BPS))
             ? Number(process.env.RAYDIUM_TRADE_FEE_BPS)
             : (this.P.ammFeeBps > 0 ? this.P.ammFeeBps : 25);
-          const cpmmOpt: SizeCpmmReserves = {
-            base: this.reserves.base,
-            quote: this.reserves.quote,
-            feeBps: feeBpsCpmm,
-          };
-          const lowerBase = Number.isFinite(Number(process.env.SIZEOPT_MIN_BASE))
-            ? Number(process.env.SIZEOPT_MIN_BASE)
-            : Math.max(1e-6, this.P.tradeSizeBase);
-          const maxFrac = Number.isFinite(Number(process.env.SIZEOPT_MAX_POOL_FRAC))
-            ? Number(process.env.SIZEOPT_MAX_POOL_FRAC)
-            : this.C.cpmmMaxPoolTradeFrac;
-          const upperAbs = Number.isFinite(Number(process.env.SIZEOPT_ABS_MAX_BASE))
-            ? Number(process.env.SIZEOPT_ABS_MAX_BASE)
-            : undefined;
+          cpmmOpt = { base: this.reserves.base, quote: this.reserves.quote, feeBps: feeBpsCpmm };
+
+          const lowerBase = Math.max(grid[0] ?? this.P.tradeSizeBase, 1e-6);
+          const maxFrac = envNum("SIZEOPT_MAX_POOL_FRAC") ?? this.C.cpmmMaxPoolTradeFrac;
+          const upperAbs = envNum("SIZEOPT_ABS_MAX_BASE") ?? undefined;
           const probes = Math.max(5, Math.min(25, Number(process.env.SIZEOPT_PROBE_STEPS ?? 9)));
-          const { bestBase } = optimizeSize(
-            {
-              kind: "PHX->AMM",
-              book: bookOpt,
-              cpmm: cpmmOpt,
-              maxPoolFrac: maxFrac,
-              lowerBase,
-              upperBaseCap: upperAbs,
-            },
-            probes
-          );
-          if (bestBase > 0) recommendedSizeBase = bestBase;
+
+          const a = optimizeSize({ kind: "AMM->PHX", book: bookOpt, cpmm: cpmmOpt, maxPoolFrac: maxFrac, lowerBase, upperBaseCap: upperAbs }, probes);
+          const b = optimizeSize({ kind: "PHX->AMM", book: bookOpt, cpmm: cpmmOpt, maxPoolFrac: maxFrac, lowerBase, upperBaseCap: upperAbs }, probes);
+
+          if (a.bestBase > 0) grid.push(a.bestBase);
+          if (b.bestBase > 0) grid.push(b.bestBase);
         }
-      } catch { }
+      }
+    } catch {
+      // optimizer seeding is best-effort
     }
-    // Evaluation size = recommended (if present) else configured static
-    const evalSize = recommendedSizeBase && recommendedSizeBase > 0 ? recommendedSizeBase : this.P.tradeSizeBase;
 
-    // ---------- Slippage & fee setup ----------
-    const flatSlip = this.P.flatSlippageBps / 10_000;
-    const spreadBps = ((phxAsk / phxBid) - 1) * 10_000;
-    const phxSlipBpsUsed = Math.max(this.C.phoenixSlippageBps, spreadBps * 0.5) + this.C.dynamicSlippageExtraBps;
-    const phxSlip = phxSlipBpsUsed / 10_000;
+    // Clean grid again after seeding
+    const sizes = Array.from(new Set(grid.map(x => Number(x.toFixed(9))))).filter(x => x > 0 && Number.isFinite(x)).sort((a, b) => a - b);
 
-    const phxFee = this.P.phoenixFeeBps / 10_000;
-    const ammFee = this.P.ammFeeBps / 10_000; // do not double-count with CPMM sims
+    // Evaluate both paths across sizes
+    let best:
+      | {
+        path: "AMM->PHX" | "PHX->AMM";
+        side: "buy" | "sell";
+        size: number;
+        buyPx: number;
+        sellPx: number;
+        bpsGross: number;
+        bpsNet: number;
+        pnlNet: number;
+      }
+      | undefined;
 
-    const buyFlat = (px: number, fee: number, slip: number) => px * (1 + slip) * (1 + fee);
-    const sellFlat = (px: number, fee: number, slip: number) => px * (1 - slip) * (1 - fee);
-
-    // CPMM sims at EVALUATION SIZE
-    let ammBuyPxSim: number | undefined;
-    let ammSellPxSim: number | undefined;
-    if ((this.C.activeSlippageMode === "amm_cpmm" || this.C.activeSlippageMode === "adaptive") && this.reserves) {
-      const { base, quote } = this.reserves;
-      const maxDb = base * this.C.cpmmMaxPoolTradeFrac;
-      if (evalSize > 0 && evalSize <= maxDb) {
-        ammBuyPxSim = this.cpmmBuyQuotePerBase(base, quote, evalSize, this.P.ammFeeBps);
-        ammSellPxSim = this.cpmmSellQuotePerBase(base, quote, evalSize, this.P.ammFeeBps);
-        if (ammBuyPxSim != null) ammBuyPxSim *= (1 + this.C.dynamicSlippageExtraBps / 10_000);
-        if (ammSellPxSim != null) ammSellPxSim *= (1 - this.C.dynamicSlippageExtraBps / 10_000);
+    for (const path of ["AMM->PHX", "PHX->AMM"] as const) {
+      for (const s of sizes) {
+        const ev = this.evForSize(path, s, ammMid, phxBid, phxAsk);
+        if (!ev) continue;
+        if (!best || ev.pnlNet > best.pnlNet) {
+          best = { path: ev.path, side: ev.side, size: s, buyPx: ev.buyPx, sellPx: ev.sellPx, bpsGross: ev.bpsGross, bpsNet: ev.bpsNet, pnlNet: ev.pnlNet };
+        }
       }
     }
 
-    // Phoenix depth-aware price at EVALUATION SIZE
-    const phxDepthOn = (String(process.env.PHOENIX_DEPTH_ENABLED ?? "0").toLowerCase() === "1") ||
-      (String(process.env.PHOENIX_DEPTH_ENABLED ?? "").toLowerCase() === "true");
-    const phxSellEffDepth = phxDepthOn ? this.walkPhoenix("sell", evalSize, this.P.phoenixFeeBps) : undefined;
-    const phxBuyEffDepth = phxDepthOn ? this.walkPhoenix("buy", evalSize, this.P.phoenixFeeBps) : undefined;
+    if (!best) {
+      // No feasible size/path under current depth/limits
+      if (this.C.logSimFields) {
+        logger.log("would_not_trade", {
+          symbol: "SOL/USDC",
+          reason: "no_feasible_size_under_limits",
+          decision_min_base: envNum("DECISION_MIN_BASE") ?? envNum("SIZEOPT_MIN_BASE"),
+          grid_count: sizes.length,
+          cpmm_max_pool_trade_frac: this.C.cpmmMaxPoolTradeFrac,
+          phoenix_depth_enabled: envTrue("PHOENIX_DEPTH_ENABLED", false),
+        });
+      }
+      this.onDecision(false, -1e9, -1e9, undefined);
+      return;
+    }
 
-    // ---------- Path A: AMM -> PHX ----------
-    const buyA_flat = buyFlat(ammMid, ammFee, flatSlip);
-    const buyA_used =
-      this.C.activeSlippageMode === "flat" || ammBuyPxSim == null
-        ? buyA_flat
-        : this.C.activeSlippageMode === "amm_cpmm"
-          ? ammBuyPxSim
-          : Math.max(buyA_flat, ammBuyPxSim);
-    const sellA = phxSellEffDepth ?? sellFlat(phxBid, phxFee, phxSlip);
-
-    const bpsNetA = (sellA / buyA_used - 1) * 10_000;
-    const pnlNetA = (sellA - buyA_used) * evalSize - this.P.fixedTxCostQuote;
-    const bpsGrossA = (phxBid / ammMid - 1) * 10_000;
-
-    // ---------- Path B: PHX -> AMM ----------
-    const buyB = phxBuyEffDepth ?? buyFlat(phxAsk, phxFee, phxSlip);
-    const sellB_flat = sellFlat(ammMid, ammFee, flatSlip);
-    const sellB_used =
-      this.C.activeSlippageMode === "flat" || ammSellPxSim == null
-        ? sellB_flat
-        : this.C.activeSlippageMode === "amm_cpmm"
-          ? ammSellPxSim
-          : Math.min(sellB_flat, ammSellPxSim);
-
-    const bpsNetB = (sellB_used / buyB - 1) * 10_000;
-    const pnlNetB = (sellB_used - buyB) * evalSize - this.P.fixedTxCostQuote;
-    const bpsGrossB = (ammMid / phxAsk - 1) * 10_000;
-
-    const chooseA = bpsNetA >= bpsNetB;
-    const best = chooseA
-      ? { path: "AMM->PHX" as const, side: "sell" as const, buyPx: buyA_used, sellPx: sellA, edgeBpsNet: bpsNetA, edgeBpsGross: bpsGrossA, expectedPnl: pnlNetA }
-      : { path: "PHX->AMM" as const, side: "buy" as const, buyPx: buyB, sellPx: sellB_used, edgeBpsNet: bpsNetB, edgeBpsGross: bpsGrossB, expectedPnl: pnlNetB };
-
+    // Compose base log object at the chosen size/path
     const base: any = {
       symbol: "SOL/USDC",
       path: best.path,
       side: best.side,
-      trade_size_base: round(evalSize, 9),               // ← evaluated/execution size
+      trade_size_base: round(best.size, 9),
+      recommended_size_base: round(best.size, 9),
       threshold_bps: round(this.P.thresholdBps, 4),
       slippage_bps: round(this.P.flatSlippageBps, 4),
       phoenix_slippage_bps: round(this.C.phoenixSlippageBps, 4),
@@ -491,37 +623,46 @@ export class EdgeJoiner {
       phoenix_book_method: bookMethod ?? "unknown",
       buy_px: round(best.buyPx),
       sell_px: round(best.sellPx),
-      edge_bps_net: round(best.edgeBpsNet, 4),
-      expected_pnl: round(best.expectedPnl, 6),
+      edge_bps_net: round(best.bpsNet, 4),
+      expected_pnl: round(best.pnlNet, 6),
       fees_bps: { phoenix: this.P.phoenixFeeBps, amm: this.P.ammFeeBps },
       fixed_tx_cost_quote: round(this.P.fixedTxCostQuote, 6),
+      decision_min_base: envNum("DECISION_MIN_BASE") ?? envNum("SIZEOPT_MIN_BASE"),
+      size_grid_count: sizes.length,
     };
-    if (recommendedSizeBase != null) base.recommended_size_base = round(recommendedSizeBase, 9);
 
+    // Diagnostics
     if (this.C.logSimFields) {
       base.phx_spread_bps = round(((phxAsk / phxBid) - 1) * 10_000, 4);
-      base.phx_slippage_bps_used = round(Math.max(this.C.phoenixSlippageBps, (((phxAsk / phxBid) - 1) * 10_000) * 0.5) + this.C.dynamicSlippageExtraBps, 4);
-      if (phxDepthOn) base.phx_depth_used = true;
+      if (envTrue("PHOENIX_DEPTH_ENABLED", false)) base.phx_depth_used = true;
       if (this.C.activeSlippageMode === "amm_cpmm" || this.C.activeSlippageMode === "adaptive") {
-        if (ammBuyPxSim != null) base.amm_buy_px_sim = round(ammBuyPxSim);
-        if (ammSellPxSim != null) base.amm_sell_px_sim = round(ammSellPxSim);
         base.cpmm_max_pool_trade_frac = this.C.cpmmMaxPoolTradeFrac;
         base.dynamic_slippage_extra_bps = this.C.dynamicSlippageExtraBps;
       }
     }
-    const ammEffPx =
-      best.path === "AMM->PHX"
-        ? (this.C.activeSlippageMode === "flat" ? ammMid : (ammBuyPxSim ?? ammMid))
-        : (this.C.activeSlippageMode === "flat" ? ammMid : (ammSellPxSim ?? ammMid));
+
+    // AMM effective px at chosen size (for impact log)
+    let ammEffPx = ammMid;
+    if ((this.C.activeSlippageMode === "amm_cpmm" || this.C.activeSlippageMode === "adaptive") && this.reserves) {
+      const { base: X, quote: Y } = this.reserves;
+      const s = best.size;
+      if (best.path === "AMM->PHX") {
+        const px = this.cpmmBuyQuotePerBase(X, Y, s, this.P.ammFeeBps);
+        if (px != null) ammEffPx = px;
+      } else {
+        const px = this.cpmmSellQuotePerBase(X, Y, s, this.P.ammFeeBps);
+        if (px != null) ammEffPx = px;
+      }
+    }
     base.amm_eff_px = round(ammEffPx);
     base.amm_price_impact_bps = round((ammEffPx / ammMid - 1) * 10_000, 4);
 
-    // Optional RPC sim
+    // Optional RPC sim at chosen size
     if (this.C.useRpcSim && this.rpcSim && this.reserves) {
       try {
         const out = await this.rpcSim({
           path: best.path,
-          sizeBase: evalSize,
+          sizeBase: best.size,
           ammMid,
           reserves: { base: this.reserves.base, quote: this.reserves.quote },
           ammFeeBps: this.P.ammFeeBps,
@@ -561,7 +702,7 @@ export class EdgeJoiner {
         this.onRpcSample?.({ ms: (base as any).rpc_sim_ms ?? 0, blocked: true });
 
         logger.log("would_not_trade", { ...base, reason: `rpc deviation > ${RPC_TOL_BPS} bps` });
-        this.onDecision(false, best.edgeBpsNet, best.expectedPnl, undefined);
+        this.onDecision(false, best.bpsNet, best.pnlNet, undefined);
         return;
       }
       (base as any).guard_deviation_bps = round(delta_bps, 4);
@@ -569,52 +710,52 @@ export class EdgeJoiner {
       this.onRpcSample?.({ ms: (base as any).rpc_sim_ms ?? 0, blocked: false });
     }
 
-    // ---- FINAL gate on EV at EVALUATED SIZE (with safety) ----
+    // ---- FINAL gate on EV at s* (with safety) ----
     const safetyBps = Number(process.env.PNL_SAFETY_BPS ?? "0") || 0;
     const wantBps = this.P.thresholdBps + safetyBps;
 
-    const wouldTrade =
-      best.edgeBpsNet >= wantBps &&
-      best.expectedPnl > 0;
+    const wouldTrade = best.bpsNet >= wantBps && best.pnlNet > 0;
 
-    if (!this.shouldEmit(best.path, best.side, best.edgeBpsNet)) return;
+    if (!this.shouldEmit(best.path, best.side, best.bpsNet)) return;
 
     if (wouldTrade) {
-      const notionalQuote = evalSize * ((best.buyPx + best.sellPx) / 2);
+      const notionalQuote = best.size * ((best.buyPx + best.sellPx) / 2);
       noteDecision(notionalQuote);
       logger.log("would_trade", {
         ...base,
         safety_bps: round(safetyBps, 4),
-        reason: "edge above threshold+safety"
+        reason: "edge above threshold+safety at s*",
       });
     } else {
       const reason =
-        best.expectedPnl <= 0
-          ? "negative expected pnl after fees/slippage"
-          : `edge below threshold+safety (net_bps=${round(best.edgeBpsNet, 4)} < ${wantBps})`;
+        best.pnlNet <= 0
+          ? "negative expected pnl after fees/slippage at s*"
+          : `edge below threshold+safety (net_bps=${round(best.bpsNet, 4)} < ${wantBps})`;
       logger.log("would_not_trade", { ...base, safety_bps: round(safetyBps, 4), reason });
     }
 
-    this.onDecision(wouldTrade, best.edgeBpsNet, best.expectedPnl, {
+    // Decision callback → executor
+    this.onDecision(wouldTrade, best.bpsNet, best.pnlNet, {
       path: best.path,
       side: best.side,
       buy_px: round(best.buyPx),
       sell_px: round(best.sellPx),
-      recommended_size_base: recommendedSizeBase ?? this.P.tradeSizeBase,
+      recommended_size_base: best.size,
     });
 
+    // ML feature row
     if (edgeForFeature) {
       emitFeature(
         featureFromEdgeAndDecision(edgeForFeature, {
           path: best.path,
           side: best.side,
-          edge_bps_gross: round(best.edgeBpsGross, 4),
+          edge_bps_gross: round(best.bpsGross, 4),
           buy_px: round(best.buyPx),
           sell_px: round(best.sellPx),
-          expected_pnl: round(best.expectedPnl, 6),
+          expected_pnl: round(best.pnlNet, 6),
           threshold_bps: this.P.thresholdBps,
           slippage_bps: this.P.flatSlippageBps,
-          trade_size_base: evalSize,
+          trade_size_base: best.size,
           would_trade: wouldTrade,
         })
       );
