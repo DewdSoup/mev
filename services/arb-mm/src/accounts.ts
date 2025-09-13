@@ -33,7 +33,11 @@ export async function initAccounts(conn: Connection): Promise<WalletCtx> {
       conn.getTokenAccountBalance(wsolAta, "processed").then(r => Number(r?.value?.uiAmount ?? 0)).catch(() => 0),
     ]);
     lastBalances = { usdc: usdcBal, wsol: wsolBal };
-  } catch { }
+  } catch {
+    // keep lastBalances undefined
+  }
 
-  return { owner, atas: { wsol: wsolAta, usdc: usdcAta }, lastBalances };
+  // With exactOptionalPropertyTypes, omit optional fields if undefined:
+  const base: WalletCtx = { owner, atas: { wsol: wsolAta, usdc: usdcAta } };
+  return lastBalances ? { ...base, lastBalances } : base;
 }

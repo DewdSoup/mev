@@ -1,32 +1,66 @@
-import type { PublicKey, TransactionInstruction, Connection } from "@solana/web3.js";
+import type {
+  Connection,
+  PublicKey,
+  TransactionInstruction,
+} from "@solana/web3.js";
 
-export type Venue = "raydium" | "orca" | "meteora" | "openbook";
+export type AmmVenue = "raydium" | "orca" | "lifinity" | "meteora" | string;
 
+export type ReserveSnapshot = {
+  base: bigint;
+  quote: bigint;
+  /** REQUIRED so src/reserves.ts can use them as numbers */
+  baseDecimals: number;
+  quoteDecimals: number;
+};
+
+/**
+ * Back-compat with src/reserves.ts:
+ *   - symbol, venue, id, reservesAtoms()
+ *
+ * Forward-compat hooks are optional (publisher/swap).
+ */
 export interface AmmAdapter {
-  id: string;              // e.g. "raydium:<poolId>"
-  venue: Venue;
-  symbol: string;          // "SOL/USDC"
-  mintBase: string;        // base mint
-  mintQuote: string;       // quote mint
+  /** e.g. "SOL/USDC" */
+  symbol: string;
 
-  init?(conn: Connection): Promise<void> | void;
+  /** e.g. "raydium" | "orca" */
+  venue: AmmVenue;
 
-  feeBps(): Promise<number>;
-  mid(): Promise<number>;
+  /** pool id (pubkey string) */
+  id: string;
 
-  reservesAtoms(): Promise<{
-    base: bigint;
-    quote: bigint;
-    baseDecimals: number;
-    quoteDecimals: number;
-  }>;
+  /** Optional one-time initializer */
+  init?(conn: Connection): Promise<void>;
 
-  // Optional: live swap builder (not used by publisher)
-  buildSwapIx?(params: {
+  /** REQUIRED by src/reserves.ts */
+  reservesAtoms(): Promise<ReserveSnapshot>;
+
+  /** Optional helpers */
+  feeBps?(): Promise<number>;
+  mid?(): Promise<number>;
+
+  /** Optional venue-native publisher (not used in baseline) */
+  startPublisher?(args: {
+    connectionUrl: string;
+    poolId: string;
+    baseMint?: string;
+    quoteMint?: string;
+    outJsonl: string;
+    tickMs: number;
+  }): Promise<void>;
+
+  /** Optional venue-native swap builder (not used in AMMs process) */
+  buildSwapIx?(args: {
     user: PublicKey;
+    /** true => BASE->QUOTE, false => QUOTE->BASE */
     baseIn: boolean;
+    /** atoms of the input mint (base if baseIn, else quote) */
     amountInBaseAtoms: bigint;
+    poolId: string;
     slippageBps: number;
-    conn: Connection;
-  }): Promise<TransactionInstruction[]>;
+  }): Promise<
+    | { ok: true; ixs: TransactionInstruction[] }
+    | { ok: false; reason: string }
+  >;
 }

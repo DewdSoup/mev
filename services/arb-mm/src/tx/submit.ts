@@ -1,7 +1,14 @@
 // services/arb-mm/src/tx/submit.ts
+import type {
+    Connection,
+    PublicKey,
+    TransactionInstruction,
+    Signer,
+} from '@solana/web3.js';
 import {
-    Connection, PublicKey, VersionedTransaction, TransactionMessage,
-    ComputeBudgetProgram, TransactionInstruction, Signer
+    VersionedTransaction,
+    TransactionMessage,
+    ComputeBudgetProgram,
 } from '@solana/web3.js';
 
 export function buildPreIxs(

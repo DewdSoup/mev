@@ -1,12 +1,11 @@
 // services/arb-mm/src/execute/maybeExecute.ts
-// Hardened atomic executor: validates instruction shape, probes compile,
-// builds v0 message, sends, and confirms with structured results.
-
 import {
   ComputeBudgetProgram,
   VersionedTransaction,
   TransactionMessage,
   PublicKey,
+} from "@solana/web3.js";
+import type {
   Signer,
   SendOptions,
   Commitment,

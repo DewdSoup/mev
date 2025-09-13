@@ -1,12 +1,12 @@
 // services/arb-mm/src/main.ts
 // Live arbitrage runner (Raydium <-> Phoenix) with dynamic size advisory.
 //
-// CHANGES for this build:
-// - Load ONLY `.env.live` (no .env fallbacks) before anything else.
-// - Force live trading: LIVE_TRADING=1, SHADOW_TRADING=0 (overrides env if needed).
-// - Use d.recommended_size_base from joiner (when present) as the execution size.
-// - Pass actual AMM fee into joiner so EV includes Raydium fee exactly once.
-// - NO AUTO-STOP: runs indefinitely until SIGINT/SIGTERM.
+// This baseline:
+// - Loads ONLY `.env.live` (no .env fallbacks) before anything else.
+// - Forces live trading: LIVE_TRADING=1, SHADOW_TRADING=0.
+// - Uses d.recommended_size_base from joiner (when present) as the execution size.
+// - Passes actual AMM fee into joiner so EV includes Raydium fee exactly once.
+// - **NO AUTO-STOP**: runs indefinitely until SIGINT/SIGTERM. There is no "run for N minutes" logic.
 
 import fs from "fs";
 import path from "path";
@@ -15,7 +15,6 @@ import * as dotenv from "dotenv";
 import { Connection, PublicKey, Keypair } from "@solana/web3.js";
 import { logger } from "@mev/storage";
 
-import { loadConfig, RPC, maskUrl, stamp, resolveFeeBps } from "./config.js";
 import {
   EdgeJoiner,
   type DecisionHook,
@@ -23,7 +22,7 @@ import {
   type RpcSimFn,
 } from "./edge/joiner.js";
 import { setChainTps } from "./feature_sink.js";
-import { initRisk } from "@mev/risk";
+import { initRisk } from "./risk.js";
 import { initAccounts } from "./accounts.js";
 import { LiveExecutor } from "./executor/live.js";
 import { initSessionRecorder } from "./session_recorder.js";
@@ -44,7 +43,7 @@ import {
 } from "./executor/size.js";
 import { tryAssertRaydiumFeeBps } from "./util/raydium.js";
 import { PublisherSupervisor } from "./publishers/supervisor.js";
-import { prewarmPhoenix } from "./util/phoenix.js"; // warm cache on boot
+import { prewarmPhoenix } from "./util/phoenix.js"; // warm Phoenix cache on boot
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -66,6 +65,9 @@ const __dirname = path.dirname(__filename);
   // Force live-only mode regardless of previous state
   process.env.LIVE_TRADING = "1";
   process.env.SHADOW_TRADING = "0";
+
+  // Prevent config.ts from re-loading any env files (including .env)
+  process.env.__ENV_LIVE_LOCKED = "1";
 })();
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -88,6 +90,9 @@ function ensureDir(p: string) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
 }
 function nowIso() { return new Date().toISOString(); }
+function stampLocal() {
+  return new Date().toISOString().replace(/[:.]/g, "").replace("Z", "Z");
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // JSONL follower (tail)
@@ -209,7 +214,7 @@ async function startHealth(conn: Connection) {
         httpHealth: { ok: true, body: "ok" },
       });
       console.log(
-        `HEALTH slot=${slot} tps=${roundN(tps, 2)} version=${version["solana-core"]}`
+        `HEALTH slot=${slot} tps=${roundN(tps, 2)} version=${String((version as any)["solana-core"] ?? "unknown")}`
       );
     } catch (e) {
       setChainTps(undefined);
@@ -311,11 +316,11 @@ function ewma(prev: number, x: number, alpha = 0.1) {
   return Math.round(prev + (x - prev) * alpha);
 }
 
-function writeLiveSummarySync(CFG: ReturnType<typeof loadConfig>, mlEventsFile?: string) {
+function writeLiveSummarySync(CFG: any, mlEventsFile?: string) {
   try {
     const LIVE_DIR = path.join(CFG.DATA_DIR, "live");
     ensureDir(LIVE_DIR);
-    const file = path.join(LIVE_DIR, `${stamp()}.summary.json`);
+    const file = path.join(LIVE_DIR, `${stampLocal()}.summary.json`);
     const summary: any = {
       file,
       started_at: runStartedAt.toISOString(),
@@ -373,6 +378,8 @@ let LAST_CPMM: { base: number; quote: number } | null = null;
 // main()
 // ────────────────────────────────────────────────────────────────────────────
 async function main() {
+  // Load config AFTER locking env (dynamic import ensures ordering)
+  const { loadConfig, RPC, maskUrl, resolveFeeBps } = await import("./config.js");
   const CFG = loadConfig();
 
   // Explicit boot banner (live-only)
@@ -386,13 +393,13 @@ async function main() {
       `USE_RAYDIUM_SWAP_SIM=${process.env.USE_RAYDIUM_SWAP_SIM ?? "(unset)"}`,
       `ATOMIC_MODE=${process.env.ATOMIC_MODE ?? "none"}`,
       `ENABLE_EMBEDDED_PUBLISHERS=${process.env.ENABLE_EMBEDDED_PUBLISHERS ?? "1"}`,
-      `RUN_FOR_MINUTES=${process.env.RUN_FOR_MINUTES ?? "(unset)"}`,
     ].join("  ")
   );
   logger.log("arb boot", {
     rpc: maskUrl(RPC),
     atomic_mode: process.env.ATOMIC_MODE ?? "none",
     live_forced: true,
+    env_live_locked: true,
   });
 
   // Embedded publishers (optional; auto when enabled)
@@ -408,10 +415,10 @@ async function main() {
 
   // Attach WS endpoint (Phoenix publisher will poll if SDK lacks subs)
   const WS = process.env.RPC_WSS_URL?.trim();
-  const conn = new Connection(RPC, {
-    commitment: "processed",
-    wsEndpoint: WS,
-  });
+  const conn = new Connection(
+    RPC,
+    WS ? { commitment: "processed", wsEndpoint: WS } : { commitment: "processed" }
+  );
 
   startHealth(conn).catch(() => { });
   initRisk();
@@ -485,6 +492,7 @@ async function main() {
     max_slippage_bps: CFG.MAX_SLIPPAGE_BPS,
     phoenix_slippage_bps: CFG.PHOENIX_SLIPPAGE_BPS,
     trade_size_base: CFG.TRADE_SIZE_BASE,
+    decision_min_base: CFG.DECISION_MIN_BASE, // ensure visible in logs
     phoenix_taker_fee_bps: PHX_FEE_BPS,
     amm_taker_fee_bps: AMM_FEE_BPS,
     fixed_tx_cost_quote: CFG.FIXED_TX_COST_QUOTE,
@@ -503,8 +511,8 @@ async function main() {
     shadow_trading: SHADOW,
   });
 
-  // RPC sim fn is OFF in live because USE_RPC_SIM=0 (unless you set it on)
-  const rpcSimFn: RpcSimFn | undefined = CFG.USE_RPC_SIM ? ((async () => undefined) as any) : undefined;
+  // Until a real sim is provided, keep this strictly undefined (even if USE_RPC_SIM=1)
+  const rpcSimFn: RpcSimFn | undefined = undefined;
 
   const mkShadowSig = () =>
     `shadow_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e9).toString(36)}`;
@@ -523,7 +531,7 @@ async function main() {
   // ML events log (jsonl)
   const LIVE_DIR = path.join(CFG.DATA_DIR, "live");
   ensureDir(LIVE_DIR);
-  const ML_EVENTS_FILE = path.join(LIVE_DIR, `${stamp()}.events.jsonl`);
+  const ML_EVENTS_FILE = path.join(LIVE_DIR, `${stampLocal()}.events.jsonl`);
   const emitMlLocal = (obj: any) => {
     try { fs.appendFileSync(ML_EVENTS_FILE, JSON.stringify(obj) + "\n"); } catch { }
   };
@@ -627,7 +635,7 @@ async function main() {
     if (s?.blocked) rpcBlocked++;
   };
 
-  // Use CFG values; include actual AMM fee for EV
+  // Joiner: include actual AMM fee for EV
   const joiner = new EdgeJoiner(
     {
       minAbsBps: CFG.EDGE_MIN_ABS_BPS,
@@ -635,6 +643,13 @@ async function main() {
       thresholdBps: CFG.TRADE_THRESHOLD_BPS,
       flatSlippageBps: CFG.MAX_SLIPPAGE_BPS,
       tradeSizeBase: CFG.TRADE_SIZE_BASE,
+
+      // 👇 ensure your min-size is honored by the decision/size optimizer
+      decisionMinBase: CFG.DECISION_MIN_BASE,
+      // (belt-and-suspenders aliases, harmless if unused by your joiner)
+      minBase: CFG.DECISION_MIN_BASE,
+      minTradeBase: CFG.DECISION_MIN_BASE,
+
       phoenixFeeBps: resolveFeeBps("PHOENIX", PHX_MARKET, CFG.PHOENIX_TAKER_FEE_BPS),
       ammFeeBps: AMM_FEE_BPS,
       fixedTxCostQuote: CFG.FIXED_TX_COST_QUOTE,
@@ -650,6 +665,9 @@ async function main() {
       decisionBucketMs: CFG.DECISION_BUCKET_MS,
       decisionMinEdgeDeltaBps: CFG.DECISION_MIN_EDGE_DELTA_BPS,
       useRpcSim: CFG.USE_RPC_SIM,
+
+      // 👇 mirrored here too, in case your joiner reads it from the “options” bag
+      decisionMinBase: CFG.DECISION_MIN_BASE,
     },
     onDecision,
     rpcSimFn,
@@ -695,7 +713,7 @@ async function main() {
           LAST_BOOK = {
             bids,
             asks,
-            takerFeeBps: Number(process.env.PHOENIX_TAKER_FEE_BPS ?? 0),
+            takerFeeBps: Number.isFinite((PHX_FEE_BPS as number)) ? Number(PHX_FEE_BPS) : 0,
           };
           if (Number.isFinite(obj?.phoenix_mid)) LAST_PHX_MID = Number(obj.phoenix_mid);
           else if (Number.isFinite(obj?.px)) LAST_PHX_MID = Number(obj.px);
@@ -775,13 +793,14 @@ async function main() {
   });
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   logger.log("arb_fatal", { error: String(e) });
   try {
+    const { loadConfig } = await import("./config.js");
     const CFG = loadConfig();
     const LIVE_DIR = path.join(CFG.DATA_DIR, "live");
     if (!fs.existsSync(LIVE_DIR)) fs.mkdirSync(LIVE_DIR, { recursive: true });
-    const file = path.join(LIVE_DIR, `${stamp()}.summary.json`);
+    const file = path.join(LIVE_DIR, `${stampLocal()}.summary.json`);
     fs.writeFileSync(file, JSON.stringify({ error: String(e) }, null, 2));
   } catch { }
 });

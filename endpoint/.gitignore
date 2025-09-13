@@ -1,0 +1,5 @@
+# Node data & state (never commit)
+data/
+logs/
+config/keys/
+*.log

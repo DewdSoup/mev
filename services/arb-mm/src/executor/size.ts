@@ -1,140 +1,171 @@
-/* services/arb-mm/src/executor/size.ts */
-import { strict as assert } from 'assert';
+// services/arb-mm/src/executor/size.ts
+// Size optimizer + EV helpers used by the joiner and debug paths.
+// All exports have explicit types for --isolatedDeclarations compatibility.
 
-export type BookLevel = { px: number; qtyBase: number }; // qty in BASE units
+export type DepthLevel = { px: number; qtyBase: number };
+
 export type PhoenixBook = {
-  bids: BookLevel[]; // descending px
-  asks: BookLevel[]; // ascending px
-  takerFeeBps: number; // usually 0 in your config
-  lotSizeBase?: number; // optional: snap sizes to lot multiples if provided
+  bids: DepthLevel[];        // highest px first preferred, but we sort defensively
+  asks: DepthLevel[];        // lowest px first preferred, but we sort defensively
+  takerFeeBps: number;       // applied to QUOTE leg
 };
 
 export type CpmmReserves = {
-  base: number;   // in BASE units (float; we use min sizes so double precision is fine)
-  quote: number;  // in QUOTE units
-  feeBps: number; // e.g. 25
+  base: number;              // BASE reserve (e.g., SOL)
+  quote: number;             // QUOTE reserve (e.g., USDC)
+  feeBps: number;            // taker fee in bps
 };
 
-/** Walk an orderbook side and return total QUOTE for Δ base. */
-function walkBookCost(side: 'ask' | 'bid', book: PhoenixBook, baseQty: number): number {
-  let need = baseQty;
-  let acc = 0;
-  const levels = side === 'ask' ? book.asks : book.bids;
-  for (const { px, qtyBase } of levels) {
-    if (need <= 0) break;
-    const take = Math.min(need, qtyBase);
-    acc += take * px;
-    need -= take;
+// ────────────────────────────────────────────────────────────────────────────
+// Internals (explicit return types for isolated declarations)
+// ────────────────────────────────────────────────────────────────────────────
+
+function sortBids(bids: DepthLevel[]): DepthLevel[] {
+  return [...bids].filter(l => l.px > 0 && l.qtyBase > 0).sort((a, b) => b.px - a.px);
+}
+function sortAsks(asks: DepthLevel[]): DepthLevel[] {
+  return [...asks].filter(l => l.px > 0 && l.qtyBase > 0).sort((a, b) => a.px - b.px);
+}
+
+function phoenixSellAvgPx(book: PhoenixBook, sizeBase: number): number | undefined {
+  if (!(sizeBase > 0)) return undefined;
+  const fee = Math.max(0, book.takerFeeBps) / 10_000;
+  const ladder = sortBids(book.bids);
+  if (ladder.length === 0) return undefined;
+
+  let rem = sizeBase;
+  let notional = 0;
+  for (const { px, qtyBase } of ladder) {
+    const take = Math.min(rem, qtyBase);
+    notional += take * px;
+    rem -= take;
+    if (rem <= 1e-12) break;
   }
-  if (need > 0) return Infinity; // not enough depth under your current slippage window
-  const feeMul = 1 + (book.takerFeeBps / 10_000) * (side === 'ask' ? 1 : -1); // add fee to buys, subtract from sells
-  return acc * feeMul;
+  if (rem > 1e-12) return undefined;      // not enough depth
+  const receivedQuote = notional * (1 - fee);
+  return receivedQuote / sizeBase;         // QUOTE per BASE received
 }
 
-/** CPMM: sell BASE into pool -> receive QUOTE out */
-function cpmmSellBaseGetQuoteOut(r: CpmmReserves, baseIn: number): { quoteOut: number } {
-  if (baseIn <= 0) return { quoteOut: 0 };
-  const gamma = 1 - r.feeBps / 10_000;
-  const x = r.base, y = r.quote;
-  const k = x * y;
-  const xEff = x + baseIn * gamma;
-  const quoteOut = y - k / xEff;
-  if (!Number.isFinite(quoteOut) || quoteOut <= 0) return { quoteOut: 0 };
-  return { quoteOut };
+function phoenixBuyAvgPx(book: PhoenixBook, sizeBase: number): number | undefined {
+  if (!(sizeBase > 0)) return undefined;
+  const fee = Math.max(0, book.takerFeeBps) / 10_000;
+  const ladder = sortAsks(book.asks);
+  if (ladder.length === 0) return undefined;
+
+  let rem = sizeBase;
+  let notional = 0;
+  for (const { px, qtyBase } of ladder) {
+    const take = Math.min(rem, qtyBase);
+    notional += take * px;
+    rem -= take;
+    if (rem <= 1e-12) break;
+  }
+  if (rem > 1e-12) return undefined;      // not enough depth
+  const paidQuote = notional * (1 + fee);
+  return paidQuote / sizeBase;             // QUOTE per BASE paid
 }
 
-/** CPMM: buy BASE from pool (swap QUOTE in) -> target BASE out */
-function cpmmBuyBaseGetQuoteIn(r: CpmmReserves, baseOut: number): { quoteIn: number } {
-  if (baseOut <= 0) return { quoteIn: 0 };
-  const gamma = 1 - r.feeBps / 10_000;
-  const x = r.base, y = r.quote;
-  assert(baseOut < x * 0.999999, 'cpmm: baseOut too large');
-  const k = x * y;
-  const denom = x - baseOut;
-  const qEff = k / denom - y; // effective quote added to pool after fee
-  const quoteIn = qEff / gamma;
-  if (!Number.isFinite(quoteIn) || quoteIn <= 0) return { quoteIn: Infinity };
-  return { quoteIn };
+function cpmmBuyQuotePerBase(xBase: number, yQuote: number, wantBase: number, feeBps: number): number | undefined {
+  if (!(xBase > 0 && yQuote > 0 && wantBase > 0)) return undefined;
+  const fee = Math.max(0, feeBps) / 10_000;
+  if (wantBase >= xBase * (1 - 1e-9)) return undefined;
+  const dqPrime = (wantBase * yQuote) / (xBase - wantBase);
+  const dq = dqPrime / (1 - fee);
+  if (!Number.isFinite(dq)) return undefined;
+  return dq / wantBase; // avg QUOTE per BASE paid
 }
 
-export type PathKind = 'PHX->AMM' | 'AMM->PHX';
+function cpmmSellQuotePerBase(xBase: number, yQuote: number, sellBase: number, feeBps: number): number | undefined {
+  if (!(xBase > 0 && yQuote > 0 && sellBase > 0)) return undefined;
+  const fee = Math.max(0, feeBps) / 10_000;
+  const dbPrime = sellBase * (1 - fee);
+  const dy = (yQuote * dbPrime) / (xBase + dbPrime);
+  if (!Number.isFinite(dy)) return undefined;
+  return dy / sellBase; // avg QUOTE per BASE received
+}
 
-export interface SizeOptInputs {
-  kind: PathKind;
+function calcAtSize(
+  kind: "AMM->PHX" | "PHX->AMM",
+  sizeBase: number,
+  book: PhoenixBook,
+  cpmm: CpmmReserves
+): { buyPx: number; sellPx: number; pnlQuote: number; bpsNet: number } | undefined {
+  if (!(sizeBase > 0)) return undefined;
+
+  if (kind === "AMM->PHX") {
+    const buyPxAmm = cpmmBuyQuotePerBase(cpmm.base, cpmm.quote, sizeBase, cpmm.feeBps);
+    const sellPxPhx = phoenixSellAvgPx(book, sizeBase);
+    if (buyPxAmm == null || sellPxPhx == null) return undefined;
+    const pnl = (sellPxPhx - buyPxAmm) * sizeBase;
+    const bpsNet = (sellPxPhx / buyPxAmm - 1) * 10_000;
+    return { buyPx: buyPxAmm, sellPx: sellPxPhx, pnlQuote: pnl, bpsNet };
+  } else {
+    const buyPxPhx = phoenixBuyAvgPx(book, sizeBase);
+    const sellPxAmm = cpmmSellQuotePerBase(cpmm.base, cpmm.quote, sizeBase, cpmm.feeBps);
+    if (buyPxPhx == null || sellPxAmm == null) return undefined;
+    const pnl = (sellPxAmm - buyPxPhx) * sizeBase;
+    const bpsNet = (sellPxAmm / buyPxPhx - 1) * 10_000;
+    return { buyPx: buyPxPhx, sellPx: sellPxAmm, pnlQuote: pnl, bpsNet };
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Public API
+// ────────────────────────────────────────────────────────────────────────────
+
+export function pnlQuoteForSizeBase(
+  input: {
+    kind: "AMM->PHX" | "PHX->AMM";
+    book: PhoenixBook;
+    cpmm: CpmmReserves;
+    maxPoolFrac: number;    // cap on BASE delta against cpmm.base
+    lowerBase: number;      // unused here but kept for call-site parity
+  },
+  sizeBase: number
+): number {
+  const maxSize = input.cpmm.base * Math.max(0, Math.min(1, input.maxPoolFrac));
+  if (!(sizeBase > 0) || sizeBase > maxSize) return Number.NEGATIVE_INFINITY;
+  const ev = calcAtSize(input.kind, sizeBase, input.book, input.cpmm);
+  return ev ? ev.pnlQuote : Number.NEGATIVE_INFINITY;
+}
+
+export type SizeOptInputs = {
+  kind: "AMM->PHX" | "PHX->AMM";
   book: PhoenixBook;
   cpmm: CpmmReserves;
-  maxPoolFrac: number;      // e.g. 0.02
-  lowerBase: number;        // e.g. 0.0002
-  upperBaseCap?: number;    // optional absolute cap in BASE
-  snapBase?: (v: number) => number; // optional lot snapping
-}
+  maxPoolFrac: number;
+  lowerBase: number;
+  upperBaseCap?: number;    // optional (respect exactOptionalPropertyTypes)
+};
 
-/** Expected PnL in QUOTE for a given BASE size. Positive -> trade. */
-export function pnlQuoteForSizeBase(inp: SizeOptInputs, baseSize: number): number {
-  const { kind, book, cpmm } = inp;
+export function optimizeSize(
+  inp: SizeOptInputs,
+  probes?: number
+): { bestBase: number; bestPnl: number; bestBpsNet: number } {
+  const steps = Math.max(5, Math.min(25, Math.trunc(Number.isFinite(Number(probes)) ? Number(probes) : 9)));
 
-  if (baseSize <= 0) return -Infinity;
+  const poolCap = inp.cpmm.base * Math.max(0, Math.min(1, inp.maxPoolFrac));
+  const floor = Math.max(1e-9, inp.lowerBase);
+  const cap = Math.max(floor, Math.min(poolCap, inp.upperBaseCap != null ? inp.upperBaseCap : poolCap));
 
-  if (kind === 'PHX->AMM') {
-    // Buy BASE on Phoenix (cost), sell BASE into AMM (revenue)
-    const costQuote = walkBookCost('ask', book, baseSize);
-    if (!Number.isFinite(costQuote)) return -Infinity;
-    const { quoteOut } = cpmmSellBaseGetQuoteOut(cpmm, baseSize);
-    if (!Number.isFinite(quoteOut)) return -Infinity;
-    return quoteOut - costQuote;
-  } else {
-    // AMM->PHX: Buy BASE from AMM (cost), sell BASE on Phoenix (revenue)
-    const { quoteIn } = cpmmBuyBaseGetQuoteIn(cpmm, baseSize);
-    if (!Number.isFinite(quoteIn)) return -Infinity;
-    const revenueQuote = walkBookCost('bid', book, baseSize);
-    if (!Number.isFinite(revenueQuote)) return -Infinity;
-    return revenueQuote - quoteIn;
-  }
-}
+  if (!(cap > floor)) return { bestBase: 0, bestPnl: Number.NEGATIVE_INFINITY, bestBpsNet: Number.NEGATIVE_INFINITY };
 
-/** Golden-section search over BASE size in [low, high] maximizing PnL. */
-export function optimizeSize(inp: SizeOptInputs, probes: number): { bestBase: number; bestPnl: number } {
-  const capByPool = inp.cpmm.base * inp.maxPoolFrac;
-  const hi0 = Math.max(inp.lowerBase * 4, Math.min(capByPool, inp.upperBaseCap ?? Number.POSITIVE_INFINITY));
-  let lo = inp.lowerBase;
-  let hi = Math.max(hi0, lo * 2);
+  const ratio = Math.pow(cap / floor, 1 / Math.max(1, steps - 1));
 
-  // snap function if provided (Phoenix lot size)
-  const snap = (v: number) => (inp.snapBase ? inp.snapBase(Math.max(inp.lowerBase, v)) : v);
+  let bestBase = 0;
+  let bestPnl = Number.NEGATIVE_INFINITY;
+  let bestBpsNet = Number.NEGATIVE_INFINITY;
 
-  // Golden section coefficients
-  const phi = (Math.sqrt(5) - 1) / 2;
-  let a = lo, b = hi;
-  let c = b - phi * (b - a);
-  let d = a + phi * (b - a);
-  let fc = pnlQuoteForSizeBase(inp, snap(c));
-  let fd = pnlQuoteForSizeBase(inp, snap(d));
-
-  for (let i = 0; i < probes; i++) {
-    if (fc > fd) {
-      b = d;
-      d = c;
-      fd = fc;
-      c = b - phi * (b - a);
-      fc = pnlQuoteForSizeBase(inp, snap(c));
-    } else {
-      a = c;
-      c = d;
-      fc = fd;
-      d = a + phi * (b - a);
-      fd = pnlQuoteForSizeBase(inp, snap(d));
+  let v = floor;
+  for (let i = 0; i < steps; i++) {
+    const ev = calcAtSize(inp.kind, v, inp.book, inp.cpmm);
+    if (ev && ev.pnlQuote > bestPnl) {
+      bestPnl = ev.pnlQuote;
+      bestBase = v;
+      bestBpsNet = ev.bpsNet;
     }
+    v = v * ratio;
   }
 
-  // pick the better endpoint
-  const cSnap = snap(c), dSnap = snap(d);
-  const candidates: Array<[number, number]> = [
-    [cSnap, pnlQuoteForSizeBase(inp, cSnap)],
-    [dSnap, pnlQuoteForSizeBase(inp, dSnap)],
-    [snap(inp.lowerBase), pnlQuoteForSizeBase(inp, snap(inp.lowerBase))],
-  ];
-  candidates.sort((x, y) => y[1] - x[1]);
-  const [bestBase, bestPnl] = candidates[0];
-
-  return { bestBase, bestPnl };
+  return { bestBase, bestPnl, bestBpsNet };
 }

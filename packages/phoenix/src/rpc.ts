@@ -1,4 +1,5 @@
-import { Connection, Commitment, ConnectionConfig } from "@solana/web3.js";
+import { Connection } from "@solana/web3.js";
+import type { Commitment, ConnectionConfig } from "@solana/web3.js";
 import { logger } from "@mev/storage";
 
 function pickWs(): string | undefined {
@@ -24,22 +25,24 @@ export function makePhoenixConnection(
     if (typeof opts === "string") commitment = opts as Commitment;
     else if (typeof opts === "object" && opts) extra = opts;
 
+    const ws = pickWs();
+
     const conf: ConnectionConfig = {
-        wsEndpoint: pickWs(),
         commitment:
             commitment ||
             (process.env.PHOENIX_COMMITMENT as Commitment) ||
             "confirmed",
         disableRetryOnRateLimit: true,
         ...extra,
+        ...(ws ? { wsEndpoint: ws } as Partial<ConnectionConfig> : {}),
     };
 
     const conn = new Connection(rpcUrl, conf);
 
     // log in phoenix runtime jsonl
     logger.log("phoenix_ws_attach", {
-        ws_attached: !!conf.wsEndpoint,
-        ws_endpoint: conf.wsEndpoint || null,
+        ws_attached: !!ws,
+        ws_endpoint: ws || null,
     });
 
     return conn;

@@ -1,10 +1,11 @@
+// services/arb-mm/src/executor/preflight.ts
 import { Connection, PublicKey } from "@solana/web3.js";
 import {
   getAssociatedTokenAddressSync,
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
-import { AppConfig } from "../config";
+import type { AppConfig } from "../config.js";
 
 export type PreflightCheck =
   | "ok"
@@ -21,7 +22,7 @@ export interface PreflightResult {
   reasons: string[];
 }
 
-function ataFor(mint: PublicKey, owner: PublicKey) {
+function ataFor(mint: PublicKey, owner: PublicKey): PublicKey {
   return getAssociatedTokenAddressSync(mint, owner, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
 }
 
@@ -84,5 +85,13 @@ export async function preflight(
   const ok = !checks.low_sol_balance && !checks.missing_usdc_ata && !checks.missing_wsol_ata;
   checks.ok = ok;
 
-  return { ok, checks, lamports, usdcAta, wsolAta, reasons };
+  // With exactOptionalPropertyTypes, only include usdcAta/wsolAta when defined.
+  return {
+    ok,
+    checks,
+    lamports,
+    reasons,
+    ...(usdcAta ? { usdcAta } : {}),
+    ...(wsolAta ? { wsolAta } : {}),
+  };
 }

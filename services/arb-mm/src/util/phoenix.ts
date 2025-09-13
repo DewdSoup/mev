@@ -1,11 +1,13 @@
 // services/arb-mm/src/util/phoenix.ts
-// Phoenix client/market bootstrap + taker swap ixs with *correct* seeding
-// (connection,seeds) only. Removes bad permutations that spammed errors.
+// Phoenix client/market bootstrap + taker swap ixs with *correct* seeding.
+// Keeps full functionality while removing bad permutations (e.g. "mainnet-beta"
+// URL parsing) that caused noisy runtime errors across SDK versions.
 
 import type { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import { PublicKey as PK } from "@solana/web3.js";
 import { logger } from "../ml_logger.js";
 
+// Loosened surface types to stay SDK-version-agnostic on runtime paths
 type PhoenixModule = any;
 type PhoenixClient = any;
 type PhoenixMarketState = any;
@@ -65,10 +67,10 @@ async function getPhoenixClient(conn: Connection, seedMarkets?: (string | Public
 
     const seeds: PublicKey[] = [];
     for (const m of seedMarkets ?? []) {
-        try { seeds.push(typeof m === "string" ? new PK(m) : m); } catch { }
+        try { seeds.push(typeof m === "string" ? new PK(m) : m); } catch { /* ignore */ }
     }
 
-    // ONLY (conn, seeds). This avoids the “Failed to parse URL from mainnet-beta” spam.
+    // Preferred: strictly (connection, seeds)
     if (seeds.length && typeof Ctor.createWithMarketAddresses === "function") {
         try {
             _phoenixClient = await Ctor.createWithMarketAddresses(conn, seeds);
@@ -79,13 +81,13 @@ async function getPhoenixClient(conn: Connection, seedMarkets?: (string | Public
         }
     }
 
-    // Fallbacks (older SDKs)
+    // Fallbacks for older SDKs (no URL / network strings)
     _phoenixClient = typeof Ctor.create === "function" ? await Ctor.create(conn) : new Ctor(conn);
     logger.log("phoenix_client_unseeded", { note: "Client.create(connection)" });
     return _phoenixClient;
 }
 
-function tryGetMarketState(client: PhoenixClient, pk: PublicKey, idStr: string): any | null {
+function tryGetMarketState(client: PhoenixClient, pk: PublicKey, idStr: string): PhoenixMarketState | null {
     try {
         const ms = client?.marketStates ?? client?.markets;
         if (!ms) return null;
@@ -108,20 +110,23 @@ async function ensureMarketState(client: PhoenixClient, market: string | PublicK
 
     let state: any = tryGetMarketState(client, pk, idStr);
 
-    // Add/refresh via whatever exists
+    // Try to add/refresh/resolve via whatever surfaces the SDK exposes
     if (!state && typeof client?.addMarket === "function") {
-        try { await client.addMarket(pk); } catch { }
+        try { await client.addMarket(pk); } catch { /* ignore */ }
         state = tryGetMarketState(client, pk, idStr);
     }
     if (!state && typeof client?.refreshMarket === "function") {
-        try { await client.refreshMarket(pk, false); } catch { }
+        try { await client.refreshMarket(pk, false); } catch { /* ignore */ }
         state = tryGetMarketState(client, pk, idStr);
     }
     if (!state && typeof client?.getMarketState === "function") {
-        try { state = await client.getMarketState(pk); } catch { }
+        try { state = await client.getMarketState(pk); } catch { /* ignore */ }
     }
     if (!state && typeof client?.getMarket === "function") {
-        try { const m = await client.getMarket(pk); state = (m as any)?.state ?? m ?? null; } catch { }
+        try {
+            const m = await client.getMarket(pk);
+            state = (m as any)?.state ?? m ?? null;
+        } catch { /* ignore */ }
     }
 
     if (!state) {
@@ -137,7 +142,7 @@ async function ensureMarketState(client: PhoenixClient, market: string | PublicK
     return state;
 }
 
-export async function prewarmPhoenix(conn: Connection, markets: (string | PublicKey)[]) {
+export async function prewarmPhoenix(conn: Connection, markets: (string | PublicKey)[]): Promise<void> {
     const client = await getPhoenixClient(conn, markets);
     const results = await Promise.allSettled(markets.map((m) => ensureMarketState(client, m)));
     const ok = results.filter((r) => r.status === "fulfilled").length;
@@ -147,7 +152,7 @@ export async function prewarmPhoenix(conn: Connection, markets: (string | Public
 
 /**
  * Build Phoenix taker swap instructions.
- * side: "buy" (Bid) → inAmount is QUOTE UI (USDC)
+ * side: "buy" (Bid)  → inAmount is QUOTE UI (USDC)
  * side: "sell" (Ask) → inAmount is BASE UI (SOL)
  */
 export async function buildPhoenixSwapIxs(params: {
@@ -161,8 +166,10 @@ export async function buildPhoenixSwapIxs(params: {
 }): Promise<{ ixs: TransactionInstruction[]; reason?: string; debug?: any }> {
     const { connection, owner, market, side, sizeBase, limitPx, slippageBps } = params;
 
-    const ownerPk = (owner as any)?.toBuffer ? owner : (owner as any)?.publicKey;
-    if (!ownerPk || typeof ownerPk.toBuffer !== "function") {
+    const ownerPk: PublicKey | undefined =
+        (owner as any)?.toBuffer ? owner as PublicKey : (owner as any)?.publicKey;
+
+    if (!ownerPk || typeof (ownerPk as any).toBuffer !== "function") {
         const reason = "owner_public_key_missing";
         logger.log("phoenix_build_error", { reason });
         return { ixs: [], reason };
@@ -174,41 +181,42 @@ export async function buildPhoenixSwapIxs(params: {
         const state = await ensureMarketState(client, market);
 
         const Side = Phoenix.Side ?? (Phoenix as any).Side ?? {};
-        const sideEnum = side === "sell" ? (Side.Ask ?? 1) : (Side.Bid ?? 0);
+        const sideEnum: number = side === "sell" ? (Side.Ask ?? 1) : (Side.Bid ?? 0);
 
-        const inAmountUi =
+        // For "buy", most SDKs expect inAmount denominated in QUOTE UI (≈ sizeBase * limitPx).
+        const inAmountUi: number =
             side === "sell"
                 ? Number(sizeBase)
                 : Number(sizeBase) * Math.max(0, Number(limitPx ?? 0));
 
-        const slip = Math.max(0, Number(slippageBps ?? 50)) / 10_000;
+        const slip: number = Math.max(0, Number(slippageBps ?? 50)) / 10_000;
 
         let tx: any | null = null;
 
-        // Preferred: packet → instruction (when exposed on state)
+        // (1) Preferred: packet → instruction (when exposed on state)
         if (typeof state?.getSwapOrderPacket === "function" && typeof state?.createSwapInstruction === "function") {
             try {
                 const packet = state.getSwapOrderPacket({ side: sideEnum, inAmount: inAmountUi, slippage: slip });
                 const ix = state.createSwapInstruction(packet, ownerPk);
                 tx = { instructions: [ix] };
-            } catch (e) { }
+            } catch { /* proceed */ }
         }
 
-        // Market-level getSwapTransaction
+        // (2) Market-level getSwapTransaction
         if (!tx && typeof state?.getSwapTransaction === "function") {
             try {
                 tx = await state.getSwapTransaction({ side: sideEnum, inAmount: inAmountUi, trader: ownerPk });
-            } catch (e) { }
+            } catch { /* proceed */ }
         }
 
-        // Client-level getSwapTransaction(market,args)
+        // (3) Client-level getSwapTransaction(market,args)
         if (!tx && typeof client?.getSwapTransaction === "function") {
             try {
                 tx = await client.getSwapTransaction(new PK(asKey(market)), { side: sideEnum, inAmount: inAmountUi, trader: ownerPk });
-            } catch (e) { }
+            } catch { /* proceed */ }
         }
 
-        // Client-level getSwapIxs
+        // (4) Client-level getSwapIxs
         if (!tx && typeof (client as any)?.getSwapIxs === "function") {
             try {
                 const res = await (client as any).getSwapIxs.call(client, {
@@ -219,13 +227,11 @@ export async function buildPhoenixSwapIxs(params: {
                 });
                 const ixs = Array.isArray(res) ? res : res?.ixs ?? res?.instructions ?? [];
                 if (Array.isArray(ixs) && ixs.length) tx = { instructions: ixs };
-            } catch (e) { }
+            } catch { /* proceed */ }
         }
 
         if (!tx) {
-            const debug = {
-                marketKeys: listLoadedMarketKeys(client),
-            };
+            const debug = { marketKeys: listLoadedMarketKeys(client) };
             return { ixs: [], reason: "phoenix_swap_helper_unavailable_in_sdk", debug };
         }
 
@@ -239,7 +245,7 @@ export async function buildPhoenixSwapIxs(params: {
     }
 }
 
-export function _resetPhoenixCachesForTest() {
+export function _resetPhoenixCachesForTest(): void {
     _phoenixMod = null;
     _phoenixClient = null;
     _marketStateById.clear();

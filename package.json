@@ -31,7 +31,8 @@
     "ts-node-dev": "^2.0.0",
     "tslib": "^2.8.1",
     "tsx": "^4.20.5",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^1.6.0"
   },
   "scripts": {
     "//": "──────────── Dev runners ────────────",
@@ -75,7 +76,7 @@
     "report:live:shadow": "pnpm exec dotenv -e .env.shadow -- tsx services/arb-mm/scripts/live_report.ts",
     "report:live:live": "pnpm exec dotenv -e .env.live -- tsx services/arb-mm/scripts/live_report.ts",
     "//bootstrap": "──────────── Environment bootstrap (Corepack + PNPM) ────────────",
-    "bootstrap": "bash -lc 'set -e; corepack enable >/dev/null 2>&1 || true; corepack prepare pnpm@10.15.0 --activate'",
+    "bootstrap": "bash -lc 'set -e; corepack enable >/dev/null 2>/dev/null || true; corepack prepare pnpm@10.15.0 --activate'",
     "//native": "──────────── Force native bigint-buffer rebuild ────────────",
     "rebuild:bigint": "bash -lc 'set -e; export npm_config_build_from_source=1; MOD=\"node_modules/.pnpm/bigint-buffer@1.1.5/node_modules/bigint-buffer\"; if ( [ -d \"$MOD\" ] ); then echo \"[rebuild:bigint] Rebuilding bigint-buffer native addon\"; cd \"$MOD\" && pnpm dlx node-gyp configure build; else echo \"[rebuild:bigint] bigint-buffer not found; skipping\"; fi'",
     "postinstall": "bash -lc 'set -e; export npm_config_build_from_source=1; MOD=\"node_modules/.pnpm/bigint-buffer@1.1.5/node_modules/bigint-buffer\"; if ( [ -d \"$MOD\" ] ); then echo \"[postinstall] Rebuilding bigint-buffer native addon\"; cd \"$MOD\" && pnpm dlx node-gyp configure build; else echo \"[postinstall] bigint-buffer not found; skipping\"; fi'"
@@ -92,10 +93,14 @@
   "dependencies": {
     "@ellipsis-labs/phoenix-sdk": "^2.0.3",
     "@mev/storage": "workspace:*",
+    "@orca-so/common-sdk": "^0.6.11",
+    "@orca-so/whirlpools-client": "^4.0.0",
+    "@orca-so/whirlpools-sdk": "^0.15.0",
     "@raydium-io/raydium-sdk": "1.3.1-beta.58",
     "@solana/spl-token": "^0.4.13",
     "@solana/web3.js": "^1.98.4",
     "bn.js": "^5.2.2",
+    "decimal.js": "^10.6.0",
     "dotenv": "^17.2.1",
     "node-fetch": "^3.3.2",
     "stream-chain": "^3.4.0",
@@ -114,5 +119,22 @@
       }
     }
   },
-  "packageManager": "pnpm@10.15.0+sha512.486ebc259d3e999a4e8691ce03b5cac4a71cbeca39372a9b762cb500cfdf0873e2cb16abe3d951b1ee2cf012503f027b98b6584e4df22524e0c7450d9ec7aa7b"
+  "packageManager": "pnpm@10.15.0+sha512.486ebc259d3e999a4e8691ce03b5cac4a71cbeca39372a9b762cb500cfdf0873e2cb16abe3d951b1ee2cf012503f027b98b6584e4df22524e0c7450d9ec7aa7b",
+  "version": "1.0.0",
+  "description": "",
+  "main": "quick_usdc_swap.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DewdSoup/mev.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/DewdSoup/mev/issues"
+  },
+  "homepage": "https://github.com/DewdSoup/mev#readme"
 }

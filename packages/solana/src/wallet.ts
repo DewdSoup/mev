@@ -91,7 +91,7 @@ export async function ensureAtas(
     usdcAta: PublicKey;
     wsolAta: PublicKey;
   }
-) {
+): Promise<void> {
   // If no signer or explicit ATAs provided, just verify & log.
   if (!payer) {
     logger.log("atas_ok", {
@@ -106,11 +106,11 @@ export async function ensureAtas(
   try {
     await getAccount(conn, m.usdcAta, "processed");
     have.usdc = true;
-  } catch {}
+  } catch { }
   try {
     await getAccount(conn, m.wsolAta, "processed");
     have.wsol = true;
-  } catch {}
+  } catch { }
 
   const confirm: Parameters<typeof createAssociatedTokenAccountIdempotent>[4] = {
     commitment: "processed",

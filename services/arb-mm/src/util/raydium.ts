@@ -14,13 +14,13 @@ import {
 } from "@solana/web3.js";
 import {
   Liquidity,
-  LiquidityPoolKeys,
   SPL_ACCOUNT_LAYOUT,
   Percent,
   Token,
   TokenAmount,
   LIQUIDITY_STATE_LAYOUT_V4,
 } from "@raydium-io/raydium-sdk";
+import type { LiquidityPoolKeys } from "@raydium-io/raydium-sdk";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -185,7 +185,10 @@ async function derivePoolKeysFromOnchain(
   ammId: PublicKey
 ): Promise<LiquidityPoolKeys> {
   const info = await conn.getAccountInfo(ammId, "processed");
-  if (!info) throw new Error(`raydium_onchain_decode_failed: AMM not found ${ammId.toBase58()}`);
+  if (!info)
+    throw new Error(
+      `raydium_onchain_decode_failed: AMM not found ${ammId.toBase58()}`
+    );
 
   // Note: state layout returns Buffers; cast through PublicKey.
   const s: any = LIQUIDITY_STATE_LAYOUT_V4.decode(info.data);
@@ -252,8 +255,8 @@ async function resolveMintDecimals(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const dec = (info.value?.data as any)?.parsed?.info?.decimals;
     if (typeof dec === "number") return dec;
-  } catch (_) {
-    // ignore
+  } catch {
+    /* ignore */
   }
   return 9;
 }

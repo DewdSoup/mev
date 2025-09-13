@@ -4,6 +4,10 @@
     "target": "ES2022",
     "module": "ES2022",
     "moduleResolution": "Bundler",
+    "lib": [
+      "ES2022"
+    ],
+    "moduleDetection": "force",
     "strict": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
@@ -12,6 +16,10 @@
     "declaration": true,
     "declarationMap": true,
     "composite": true,
+    "isolatedDeclarations": false,
+    "verbatimModuleSyntax": false,
+    "exactOptionalPropertyTypes": false,
+    "noUncheckedIndexedAccess": false,
     "outDir": "dist",
     "rootDir": "src",
     "types": [

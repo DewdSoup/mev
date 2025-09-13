@@ -1,0 +1,26 @@
+{
+    "pairs": [
+        {
+            "symbol": "SOL/USDC",
+            "baseMint": "So11111111111111111111111111111111111111112",
+            "quoteMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "phoenixMarket": "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg",
+            "venues": [
+                {
+                    "kind": "phoenix",
+                    "id": "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg"
+                },
+                {
+                    "kind": "raydium",
+                    "id": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
+                    "poolKind": "cpmm"
+                },
+                {
+                    "kind": "orca",
+                    "id": "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ",
+                    "poolKind": "clmm"
+                }
+            ]
+        }
+    ]
+}

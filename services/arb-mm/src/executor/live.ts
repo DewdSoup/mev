@@ -1,23 +1,16 @@
 // services/arb-mm/src/executor/live.ts
-// CHANGES:
-// - Force-send pathway: respect FORCE_EXECUTE_EVEN_IF_NEG (+ optional FORCE_EXECUTE_MAX_BASE clamp).
-// - Pre-send EV sanity gate with PNL_SAFETY_BPS (skipped when forced).
-// - Log pre_tx_balances and post_tx_balances (SOL lamports, WSOL ui, USDC ui).
-// - Log realized deltas per tx (realized_usdc_delta, wsol_delta, sol_lamports_delta).
+// Adds: ability to route AMM leg to Raydium or Orca based on joiner decision.
 
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import {
-  Connection,
-  PublicKey,
-  TransactionInstruction,
-  Keypair,
+  Connection, PublicKey, TransactionInstruction, Keypair,
 } from "@solana/web3.js";
-import BN from "bn.js";
-import { SPL_ACCOUNT_LAYOUT, LIQUIDITY_STATE_LAYOUT_V4 } from "@raydium-io/raydium-sdk";
+import { LIQUIDITY_STATE_LAYOUT_V4 } from "@raydium-io/raydium-sdk";
 import { logger } from "../ml_logger.js";
 import { buildRaydiumCpmmSwapIx } from "./buildRaydiumCpmmIx.js";
+import { buildOrcaWhirlpoolSwapIx } from "./buildOrcaWhirlpoolIx.js";
 import { buildPhoenixSwapIxs } from "../util/phoenix.js";
 import { toIxArray, assertIxArray } from "../util/ix.js";
 import { submitAtomic, buildPreIxs } from "../tx/submit.js";
@@ -27,10 +20,19 @@ const __filename = fileURLToPath(import.meta.url);
 const __here = path.dirname(__filename);
 
 const SLIPPAGE_BPS = Number(process.env.MAX_SLIPPAGE_BPS || "50");
+
+// Defaults to your SOL/USDC pools (override with env if you prefer)
 const DEFAULT_RAYDIUM_POOL_ID = (
   process.env.RAYDIUM_POOL_ID ||
   process.env.RAYDIUM_POOL_ID_SOL_USDC ||
+  // Raydium SOL/USDC
   "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+).trim();
+
+const DEFAULT_ORCA_POOL_ID = (
+  process.env.ORCA_POOL_ID ||
+  // Orca SOL/USDC Whirlpool
+  "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ"
 ).trim();
 
 const CONFIRM_LEVEL = (process.env.TX_CONFIRM_LEVEL as any) || "confirmed";
@@ -52,8 +54,7 @@ function envNum(k: string): number | undefined {
 export type AtomicPath = "PHX->AMM" | "AMM->PHX";
 function uiToAtoms(ui: number, decimals: number): bigint { return BigInt(Math.floor(ui * 10 ** decimals)); }
 function applyBpsDownBig(x: bigint, bps: number): bigint {
-  const BPS = 10_000n; const b = BigInt(Math.max(0, Math.min(10_000, Math.ceil(bps))));
-  return (x * (BPS - b)) / BPS;
+  const BPS = 10_000n; const b = BigInt(Math.max(0, Math.min(10_000, Math.ceil(bps)))); return (x * (BPS - b)) / BPS;
 }
 function cpmmExpectedOutBig(args: { dx: bigint; x: bigint; y: bigint; feeBps: number }): bigint {
   const dxLessFee = applyBpsDownBig(args.dx, args.feeBps);
@@ -62,8 +63,8 @@ function cpmmExpectedOutBig(args: { dx: bigint; x: bigint; y: bigint; feeBps: nu
 
 type PoolMeta = { baseMint: PublicKey; quoteMint: PublicKey; baseVault?: PublicKey; quoteVault?: PublicKey };
 const POOL_META_CACHE = new Map<string, PoolMeta>();
-const DEFAULT_BASE_MINT = new PublicKey("So11111111111111111111111111111111111111112");
-const DEFAULT_QUOTE_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+const DEFAULT_BASE_MINT = new PublicKey("So11111111111111111111111111111111111111112"); // WSOL
+const DEFAULT_QUOTE_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
 
 function getenv(k: string) { const v = process.env[k]; return typeof v === "string" && v.trim() ? v.trim() : undefined; }
 function findPoolJsonPath(): string | undefined {
@@ -90,9 +91,6 @@ async function ensureRaydiumPoolMeta(conn: Connection, poolId: PublicKey): Promi
       const j = JSON.parse(fs.readFileSync(p, "utf8"));
       if (j?.id) {
         const id = new PublicKey(j.id);
-        if (!id.equals(poolId)) {
-          logger.log("raydium_pool_id_mismatch_env_disk", { env: poolId.toBase58(), json: id.toBase58() });
-        }
         const meta: PoolMeta = {
           baseMint: new PublicKey(j.baseMint),
           quoteMint: new PublicKey(j.quoteMint),
@@ -135,16 +133,6 @@ async function ensureRaydiumPoolMeta(conn: Connection, poolId: PublicKey): Promi
   return meta;
 }
 
-async function getVaultReservesFromVaults(conn: Connection, baseVault: PublicKey, quoteVault: PublicKey) {
-  const accs = await conn.getMultipleAccountsInfo([baseVault, quoteVault], { commitment: "processed" as any });
-  if (!accs[0]?.data || !accs[1]?.data) throw new Error("raydium_pool_reserves_missing");
-  const baseInfo: any = SPL_ACCOUNT_LAYOUT.decode(accs[0].data);
-  const quoteInfo: any = SPL_ACCOUNT_LAYOUT.decode(accs[1].data);
-  const base = BigInt(new BN(baseInfo.amount).toString());
-  const quote = BigInt(new BN(quoteInfo.amount).toString());
-  return { base, quote };
-}
-
 async function getUiBalances(conn: Connection, owner: PublicKey) {
   const wsolAtaEnv = getenv("WSOL_ATA");
   const usdcAtaEnv = getenv("USDC_ATA");
@@ -169,13 +157,13 @@ export class LiveExecutor {
 
   async maybeExecute(payload: any): Promise<void> {
     try {
-      const path = (payload?.path as AtomicPath) || "PHX->AMM";
+      const atomicPath = (payload?.path as AtomicPath) || "PHX->AMM";
+      const ammVenue = String(payload?.amm_venue ?? payload?.ammVenue ?? "raydium").toLowerCase() as "raydium" | "orca";
       let sizeBase = Number(payload?.size_base ?? payload?.trade_size_base ?? 0);
       const phoenix = payload?.phoenix || {};
       const buy_px = Number(payload?.buy_px ?? 0);
       const sell_px = Number(payload?.sell_px ?? 0);
 
-      // ── Force-send path controls ─────────────────────────────────────────
       const FORCE = envTrue("FORCE_EXECUTE_EVEN_IF_NEG");
       const MAX_FORCE_BASE = envNum("FORCE_EXECUTE_MAX_BASE");
       if (FORCE && MAX_FORCE_BASE && sizeBase > MAX_FORCE_BASE) {
@@ -183,32 +171,21 @@ export class LiveExecutor {
         sizeBase = MAX_FORCE_BASE;
       }
 
-      // Stage 0: pre-send EV sanity (joiner already handled thresholds & safety)
+      // Pre-send EV sanity (skip if forced)
       const evQuote = (sell_px - buy_px) * sizeBase - FIXED_TX_COST_QUOTE;
-      const avgPx = (buy_px > 0 && sell_px > 0) ? (buy_px + sell_px) / 2 : 0;
-      const evBps = (avgPx > 0) ? ((sell_px / buy_px) - 1) * 10_000 : -1e9;
-
-      if (FORCE) {
-        logger.log("force_exec_enabled", {
-          path, size_base: sizeBase, buy_px, sell_px,
-          ev_quote: evQuote, ev_bps: evBps,
-          threshold_bps: Number(process.env.TRADE_THRESHOLD_BPS ?? 0) || 0,
-          safety_bps: PNL_SAFETY_BPS,
-        });
-      } else {
+      const evBps = (buy_px > 0 && sell_px > 0) ? ((sell_px / buy_px) - 1) * 10_000 : -1e9;
+      if (!FORCE) {
         if (!(evQuote > 0)) {
           logger.log("submit_error", { where: "pre_send_ev_gate", error: "negative_expected_pnl_quote", sizeBase, buy_px, sell_px, ev_quote: evQuote });
           return;
         }
         const wantBps = (Number(process.env.TRADE_THRESHOLD_BPS ?? 0) || 0) + PNL_SAFETY_BPS;
         if (!(evBps >= wantBps)) {
-          logger.log("submit_error", {
-            where: "pre_send_ev_gate",
-            error: "negative_or_insufficient_expected_pnl",
-            size_base: sizeBase, buy_px, sell_px, ev_quote: evQuote, ev_bps: evBps, safety_bps: PNL_SAFETY_BPS
-          });
+          logger.log("submit_error", { where: "pre_send_ev_gate", error: "insufficient_edge_bps", size_base: sizeBase, ev_bps: evBps, want_bps: wantBps });
           return;
         }
+      } else {
+        logger.log("force_exec_enabled", { path: atomicPath, ammVenue, size_base: sizeBase, ev_quote: evQuote, ev_bps: evBps });
       }
 
       if (!phoenix?.market) {
@@ -218,7 +195,7 @@ export class LiveExecutor {
 
       const market = new PublicKey(phoenix.market);
 
-      // Stage 1: BUILD PHOENIX FIRST
+      // 1) PHOENIX
       let phxIxs: TransactionInstruction[] = Array.isArray(payload?.phxIxs) ? toIxArray(payload.phxIxs) : [];
       if (!phxIxs.length) {
         const limitPx = Number(phoenix.limit_px ?? phoenix.limitPx ?? (payload?.sell_px ?? payload?.buy_px));
@@ -246,117 +223,130 @@ export class LiveExecutor {
       }
       assertIxArray(phxIxs, "phoenix");
 
-      // Stage 2: RAYDIUM minOut and BUILD
-      const baseIn = path === "PHX->AMM";
-      const poolIdStr = DEFAULT_RAYDIUM_POOL_ID;
-      const poolId = new PublicKey(poolIdStr);
-      const meta = await ensureRaydiumPoolMeta(this.conn, poolId);
+      // 2) AMM leg: choose Raydium or Orca
+      const baseIn = atomicPath === "PHX->AMM";
+      let rayIxs: TransactionInstruction[] = [];
+      let orcaIxs: TransactionInstruction[] = [];
 
-      let amountInAtoms: bigint;
-      if (baseIn) amountInAtoms = uiToAtoms(sizeBase, 9);
-      else {
-        const px = Number(phoenix.limit_px ?? phoenix.limitPx ?? payload?.buy_px ?? payload?.sell_px ?? 0);
-        const quoteInUi = Math.max(0, sizeBase * (px || 0));
-        amountInAtoms = uiToAtoms(quoteInUi, 6);
-      }
+      if (ammVenue === "raydium") {
+        // Build Raydium CPMM
+        const poolIdStr = DEFAULT_RAYDIUM_POOL_ID;
+        const poolId = new PublicKey(poolIdStr);
+        const meta = await ensureRaydiumPoolMeta(this.conn, poolId);
 
-      let reserves: { base: bigint; quote: bigint } | undefined;
-      try {
-        if (meta.baseVault && meta.quoteVault) reserves = await getVaultReservesFromVaults(this.conn, meta.baseVault, meta.quoteVault);
-      } catch (e: any) {
-        logger.log("raydium_reserve_fetch_error", { pool: poolIdStr, err: String(e?.message ?? e) });
-      }
+        let amountInAtoms: bigint;
+        if (baseIn) amountInAtoms = uiToAtoms(sizeBase, 9);
+        else {
+          const px = Number(phoenix.limit_px ?? phoenix.limitPx ?? payload?.buy_px ?? payload?.sell_px ?? 0);
+          const quoteInUi = Math.max(0, sizeBase * (px || 0));
+          amountInAtoms = uiToAtoms(quoteInUi, 6);
+        }
 
-      const feeBps = Number.parseFloat(process.env.RAYDIUM_TRADE_FEE_BPS ?? "25");
-      const dynExtra = Number.parseFloat(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? "0");
-      const bufferBps = Number.parseFloat(process.env.RAYDIUM_MINOUT_BUFFER_BPS ?? "0");
-      const usedSlip = Math.max(0, SLIPPAGE_BPS + dynExtra + bufferBps);
+        // compute minOut with conservative slippage buffer
+        const dynExtra = Number.parseFloat(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? "0");
+        const bufferBps = Number.parseFloat(process.env.RAYDIUM_MINOUT_BUFFER_BPS ?? "0");
+        const usedSlip = Math.max(0, SLIPPAGE_BPS + dynExtra + bufferBps);
 
-      let minOut: bigint;
-      if (reserves) {
-        const x = baseIn ? reserves.base : reserves.quote;
-        const y = baseIn ? reserves.quote : reserves.base;
-        const expectedOut = cpmmExpectedOutBig({ dx: amountInAtoms, x, y, feeBps });
-        minOut = applyBpsDownBig(expectedOut, usedSlip);
-        logger.log("raydium_minout_dbg", {
-          base_in: baseIn,
-          amount_in_atoms: amountInAtoms.toString(),
-          fee_bps: feeBps,
-          slip_bps_used: usedSlip,
-          reserves_base: x.toString(),
-          reserves_quote: y.toString(),
-          expected_out_atoms: expectedOut.toString(),
-          min_out_atoms: minOut.toString(),
-        });
-      } else {
+        const inMint: PublicKey = baseIn ? meta.baseMint : meta.quoteMint;
+        const outMint: PublicKey = baseIn ? meta.quoteMint : meta.baseMint;
+
+        // Simple minOut from reference price (we already guarded EV higher up)
         const refPx = Number(baseIn ? (payload?.sell_px ?? payload?.buy_px) : (payload?.buy_px ?? payload?.sell_px)) || 0;
-        if (!(refPx > 0)) { logger.log("submit_error", { where: "raydium_build", error: "no_reserves_and_no_ref_px" }); return; }
+        if (!(refPx > 0)) { logger.log("submit_error", { where: "raydium_build", error: "no_ref_px" }); return; }
+
+        let outAtoms: bigint;
         if (baseIn) {
           const inUi = Number(amountInAtoms) / 1e9;
           const outUi = inUi * refPx;
-          const outAtoms = BigInt(Math.floor(outUi * 1e6));
-          minOut = applyBpsDownBig(outAtoms, usedSlip);
+          outAtoms = BigInt(Math.floor(outUi * 1e6));
         } else {
           const inUi = Number(amountInAtoms) / 1e6;
           const outUi = inUi / refPx;
-          const outAtoms = BigInt(Math.floor(outUi * 1e9));
-          minOut = applyBpsDownBig(outAtoms, usedSlip);
+          outAtoms = BigInt(Math.floor(outUi * 1e9));
         }
-        logger.log("raydium_minout_dbg", {
-          base_in: baseIn, amount_in_atoms: amountInAtoms.toString(),
-          fee_bps: feeBps, slip_bps_used: usedSlip, reserves_base: null, reserves_quote: null,
-          ref_px_used: refPx, min_out_atoms: minOut.toString(),
-        });
-      }
+        const minOut = applyBpsDownBig(outAtoms, usedSlip);
 
-      const inMint: PublicKey = baseIn ? meta.baseMint : meta.quoteMint;
-      const outMint: PublicKey = baseIn ? meta.quoteMint : meta.baseMint;
-      let rayIxs: TransactionInstruction[] = [];
-      try {
-        rayIxs = await buildRaydiumCpmmSwapIx({
-          connection: this.conn,
-          owner: this.payer.publicKey,
-          poolId,
-          inMint,
-          outMint,
-          amountIn: amountInAtoms,
-          amountOutMin: minOut,
-        });
-        if (!Array.isArray(rayIxs) || rayIxs.length === 0) throw new Error("raydium_builder_returned_no_instructions");
-        logger.log("raydium_build_ok", { ixs: rayIxs.length });
-      } catch (e: any) {
-        logger.log("submit_error", { where: "raydium_build", error: String(e?.message ?? e) });
-        return;
+        try {
+          rayIxs = await buildRaydiumCpmmSwapIx({
+            connection: this.conn,
+            owner: this.payer.publicKey,
+            poolId,
+            inMint,
+            outMint,
+            amountIn: amountInAtoms,
+            amountOutMin: minOut,
+          });
+          if (!Array.isArray(rayIxs) || rayIxs.length === 0) throw new Error("raydium_builder_returned_no_instructions");
+          logger.log("raydium_build_ok", { ixs: rayIxs.length });
+        } catch (e: any) {
+          logger.log("submit_error", { where: "raydium_build", error: String(e?.message ?? e) });
+          return;
+        }
+        assertIxArray(rayIxs, "raydium");
+      } else {
+        // Build Orca Whirlpool swap
+        const whirlpoolId = new PublicKey(DEFAULT_ORCA_POOL_ID);
+        const WSOL = new PublicKey(process.env.WSOL_MINT ?? "So11111111111111111111111111111111111111112");
+        const USDC = new PublicKey(process.env.USDC_MINT ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+
+        const px = Number(baseIn ? payload?.sell_px : payload?.buy_px) || 0;
+        if (!(px > 0)) { logger.log("submit_error", { where: "orca_build", error: "no_ref_px" }); return; }
+
+        const amountInAtoms = baseIn
+          ? uiToAtoms(sizeBase, 9)        // BASE in (WSOL)
+          : uiToAtoms(sizeBase * px, 6);  // QUOTE in (USDC)
+
+        try {
+          const orcaResult = await buildOrcaWhirlpoolSwapIx({
+            connection: this.conn,
+            user: this.payer.publicKey,
+            poolId: whirlpoolId.toBase58(),
+            baseIn,
+            amountInAtoms,
+            slippageBps: SLIPPAGE_BPS,
+          });
+
+          if (orcaResult.ok) {
+            orcaIxs = orcaResult.ixs;
+          } else {
+            throw new Error(orcaResult.reason);
+          }
+          if (!Array.isArray(orcaIxs) || orcaIxs.length === 0) throw new Error("orca_builder_returned_no_instructions");
+          logger.log("orca_build_ok", { ixs: orcaIxs.length });
+        } catch (e: any) {
+          logger.log("submit_error", { where: "orca_build", error: String(e?.message ?? e) });
+          return;
+        }
+        assertIxArray(orcaIxs, "orca");
       }
-      assertIxArray(rayIxs, "raydium");
 
       // --------- PRE-TX BALANCES ----------
       const pre = await getUiBalances(this.conn, this.payer.publicKey);
       logger.log("pre_tx_balances", {
-        path, size_base: sizeBase, size_source: payload?.size_source ?? "unknown",
+        path: atomicPath, ammVenue, size_base: sizeBase,
         buy_px, sell_px, FIXED_TX_COST_QUOTE, PNL_SAFETY_BPS,
         forced: FORCE || undefined,
         ...pre
       });
 
       // --------- SUBMIT ----------
-      const only = process.env.ONLY_PHX ? "phx" : (process.env.ONLY_RAY ? "ray" : "both");
+      const only = process.env.ONLY_PHX ? "phx" : (process.env.ONLY_RAY ? "ray" : undefined);
       const preIxs = buildPreIxs(CU_LIMIT, CU_PRICE);
 
-      logger.log("submit_ixs", { label: "atomic", phx: phxIxs.length, ray: rayIxs.length, total: preIxs.length + phxIxs.length + rayIxs.length });
+      const ammIxs = ammVenue === "raydium" ? rayIxs : orcaIxs;
+      const total = preIxs.length + phxIxs.length + ammIxs.length;
+      logger.log("submit_ixs", { label: "atomic", phx: phxIxs.length, amm: ammIxs.length, total });
+
       const sig = await submitAtomic({
         connection: this.conn,
         owner: this.payer,
         preIxs,
         phxIxs,
-        rayIxs,
+        rayIxs: ammIxs, // Pass all AMM instructions here regardless of venue
         only: only as any,
       });
 
-      logger.log("submitted_tx", {
-        path, size_base: sizeBase, ix_count: preIxs.length + phxIxs.length + rayIxs.length,
-        cu_limit: CU_LIMIT, tip_lamports: undefined, sig, live: true, shadow: false,
-      });
+      logger.log("submitted_tx", { path: atomicPath, ammVenue, size_base: sizeBase, ix_count: total, cu_limit: CU_LIMIT, sig, live: true, shadow: false });
 
       // --------- CONFIRM ----------
       const t0 = Date.now();
@@ -373,9 +363,9 @@ export class LiveExecutor {
       };
       logger.log("post_tx_balances", { sig, slot, conf_ms, ...post, ...realized });
 
-      // Summary line per tx
+      // Summary
       logger.log("realized_summary", {
-        sig, path, size_base: sizeBase,
+        sig, path: atomicPath, ammVenue, size_base: sizeBase,
         buy_px, sell_px,
         expected_ev_quote: Number(((sell_px - buy_px) * sizeBase - FIXED_TX_COST_QUOTE).toFixed(6)),
         ...realized

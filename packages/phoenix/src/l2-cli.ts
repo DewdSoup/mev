@@ -8,7 +8,14 @@ const KEYPAIR = process.env.PHOENIX_CLI_KEYPAIR || process.env.SOLANA_KEYPAIR //
 const MARKET = process.env.PHOENIX_MARKET!
 const POLL_MS = Number(process.env.PHOENIX_CLI_POLL_MS ?? 1000)
 
-function parseTopOfBook(stdout: string) {
+type TopOfBook = {
+  best_bid: number
+  best_ask: number
+  bid_size: number
+  ask_size: number
+}
+
+function parseTopOfBook(stdout: string): TopOfBook | null {
   // Expected 2 lines like:
   //         194.501  20.565
   //  20.580 194.357
@@ -16,20 +23,29 @@ function parseTopOfBook(stdout: string) {
   // bid_size  bid_price
   const lines = stdout.trim().split('\n').filter(Boolean)
   if (lines.length < 2) return null
-  const askLine = lines[0].trim().split(/\s+/).map(Number)
-  const bidLine = lines[1].trim().split(/\s+/).map(Number)
-  if (askLine.length < 2 || bidLine.length < 2) return null
 
-  const ask_price = askLine[0]
-  const ask_size = askLine[1]
-  const bid_size = bidLine[0]
-  const bid_price = bidLine[1]
+  // With noUncheckedIndexedAccess, assert we have two strings:
+  const [line0, line1] = lines as [string, string]
+
+  const askParts = line0.trim().split(/\s+/).filter(Boolean)
+  const bidParts = line1.trim().split(/\s+/).filter(Boolean)
+  if (askParts.length < 2 || bidParts.length < 2) return null
+
+  // Assert the first two tokens as tuples to avoid undefined
+  const [askPriceStr, askSizeStr] = askParts as [string, string]
+  const [bidSizeStr, bidPriceStr] = bidParts as [string, string]
+
+  const ask_price = Number(askPriceStr)
+  const ask_size = Number(askSizeStr)
+  const bid_size = Number(bidSizeStr)
+  const bid_price = Number(bidPriceStr)
 
   if (![ask_price, ask_size, bid_price, bid_size].every(Number.isFinite)) return null
+
   return { best_bid: bid_price, best_ask: ask_price, bid_size, ask_size }
 }
 
-export async function pumpPhoenixL2Cli(log: (obj: any) => void) {
+export async function pumpPhoenixL2Cli(log: (obj: any) => void): Promise<void> {
   if (!MARKET) throw new Error('PHOENIX_MARKET missing')
   while (true) {
     try {
