@@ -1,25 +1,17 @@
 // packages/amms/src/adapters/orca.ts
-// Orca Whirlpool adapter: decode Whirlpool account, read vaults, and expose mid/reserves.
+// Orca Whirlpool adapter: decode Whirlpool account, read vaults, and expose mid/reserves/fee.
 // For CLMMs, the true mid must come from sqrtPrice (Q64.64). Vault ratios are NOT price.
 
 import { Connection, PublicKey } from "@solana/web3.js";
 import type { AmmAdapter, ReserveSnapshot } from "./types.js";
-import {
-    WHIRLPOOL_CODER,
-    type WhirlpoolData,
-} from "@orca-so/whirlpools-sdk";
+import { WHIRLPOOL_CODER, type WhirlpoolData } from "@orca-so/whirlpools-sdk";
 
 // Common mints (override via env if needed)
-const WSOL_MINT = new PublicKey(
-    process.env.WSOL_MINT ?? "So11111111111111111111111111111111111111112"
-);
-const USDC_MINT = new PublicKey(
-    process.env.USDC_MINT ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-);
+const WSOL_MINT = new PublicKey(process.env.WSOL_MINT ?? "So11111111111111111111111111111111111111112");
+const USDC_MINT = new PublicKey(process.env.USDC_MINT ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 
 /** Convert Q64.64 sqrt price (as bigint) → atoms ratio (tokenB atoms per tokenA atom). */
 function atomsRatioFromSqrtQ64_64(sqrtX64: bigint): number {
-    // price_atoms = (sqrtX64^2) / 2^128
     const sq = sqrtX64 * sqrtX64; // 256-bit bigint
     const ONE_128 = 1n << 128n;
     const intPart = sq / ONE_128;
@@ -28,10 +20,7 @@ function atomsRatioFromSqrtQ64_64(sqrtX64: bigint): number {
 }
 
 /** Read & decode Whirlpool account via the SDK coder. */
-async function readWhirlpool(
-    conn: Connection,
-    poolPk: PublicKey
-): Promise<WhirlpoolData> {
+async function readWhirlpool(conn: Connection, poolPk: PublicKey): Promise<WhirlpoolData> {
     const acct = await conn.getAccountInfo(poolPk, "processed");
     if (!acct?.data) throw new Error("orca_whirlpool_not_found");
     const decoded = WHIRLPOOL_CODER.decode("Whirlpool", acct.data) as WhirlpoolData;
@@ -51,20 +40,15 @@ async function resolveMintDecimals(conn: Connection, mint: PublicKey): Promise<n
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const dec = (info.value?.data as any)?.parsed?.info?.decimals;
         if (typeof dec === "number") return dec;
-    } catch {
-        /* fall through */
-    }
+    } catch { /* fall through */ }
 
     // Fallback: raw layout — decimals at byte 44 for SPL Mint
     try {
         const raw = await conn.getAccountInfo(mint, "processed");
         if (raw?.data && raw.data.length >= 45) return raw.data.readUInt8(44);
-    } catch {
-        /* ignore */
-    }
+    } catch { /* ignore */ }
 
-    // Last resort
-    return 9;
+    return 9; // last resort
 }
 
 type CachedPoolData = {
@@ -72,23 +56,14 @@ type CachedPoolData = {
     tokenMintB: PublicKey;
     tokenVaultA: PublicKey;
     tokenVaultB: PublicKey;
-    baseIsA: boolean; // true if A==WSOL & B==USDC (or if inferred that A is base)
+    baseIsA: boolean;
     baseDecimals: number;
     quoteDecimals: number;
+    feeBps?: number; // from on-chain feeRate
 };
 
-/**
- * Build an Orca Whirlpool adapter for a given pool.
- * - Keeps symbol "SOL/USDC" for downstream compatibility.
- * - Orients base (WSOL) & quote (USDC) regardless of A/B order on-chain.
- */
-export async function createOrcaAdapter(
-    conn: Connection,
-    poolId: string
-): Promise<AmmAdapter> {
+export async function createOrcaAdapter(conn: Connection, poolId: string): Promise<AmmAdapter> {
     const poolPk = new PublicKey(poolId);
-
-    // Cache immutable pool data and orientation after first fetch
     let cached: CachedPoolData | undefined;
 
     async function ensureCache(): Promise<CachedPoolData> {
@@ -118,6 +93,9 @@ export async function createOrcaAdapter(
             resolveMintDecimals(conn, quoteMint),
         ]);
 
+        // feeRate is hundredths of a basis point (e.g., 3000 -> 30 bps)
+        const feeBps = Number(w.feeRate ?? 0) / 100;
+
         cached = {
             tokenMintA: w.tokenMintA,
             tokenMintB: w.tokenMintB,
@@ -126,6 +104,7 @@ export async function createOrcaAdapter(
             baseIsA,
             baseDecimals,
             quoteDecimals,
+            feeBps: Number.isFinite(feeBps) && feeBps > 0 ? feeBps : undefined,
         };
         return cached;
     }
@@ -135,39 +114,26 @@ export async function createOrcaAdapter(
         venue: "orca",
         id: poolId,
 
-        /** Raw vault balances as atoms (still useful for telemetry but NOT for price). */
+        async feeBps(): Promise<number> {
+            const c = await ensureCache();
+            if (c.feeBps && c.feeBps > 0) return c.feeBps;
+            return Number(process.env.ORCA_TRADE_FEE_BPS ?? process.env.AMM_TAKER_FEE_BPS ?? 30);
+        },
+
+        // For CLMMs: publish vault balances only for telemetry if you really need to.
+        // We’ll still compute price purely from sqrtPrice.
         async reservesAtoms(): Promise<ReserveSnapshot> {
             const c = await ensureCache();
-
-            // Pick vaults in base/quote order for reporting
-            const baseVault = c.baseIsA ? c.tokenVaultA : c.tokenVaultB;
-            const quoteVault = c.baseIsA ? c.tokenVaultB : c.tokenVaultA;
-
-            const accs = await conn.getMultipleAccountsInfo(
-                [baseVault, quoteVault],
-                { commitment: "processed" }
-            );
-            if (!accs[0]?.data || !accs[1]?.data) throw new Error("orca_vaults_missing");
-
-            // SPL Token Account amount at offset 64 (u64 little-endian)
-            const base = accs[0].data.readBigUInt64LE(64);
-            const quote = accs[1].data.readBigUInt64LE(64);
-
+            // Report empty reserves to discourage CPMM usage downstream for Orca (price comes from mid()).
             return {
-                base,
-                quote,
+                base: 0n,
+                quote: 0n,
                 baseDecimals: c.baseDecimals,
                 quoteDecimals: c.quoteDecimals,
             };
         },
 
-        /**
-         * CLMM mid from sqrtPriceX64 (QUOTE per BASE, UI units).
-         * Derivation:
-         *  - atoms ratio  (quote_atoms / base_atoms)  = (sqrt^2) / 2^128
-         *  - UI ratio     (QUOTE per BASE)            = atoms_ratio * 10^(baseDecimals - quoteDecimals)
-         *  - If base == tokenB on-chain, invert atoms_ratio first.
-         */
+        /** CLMM mid from sqrtPriceX64 (QUOTE per BASE, UI units). */
         async mid(): Promise<number> {
             const c = await ensureCache();
             const w = await readWhirlpool(conn, poolPk);

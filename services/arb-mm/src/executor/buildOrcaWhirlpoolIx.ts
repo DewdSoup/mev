@@ -11,11 +11,10 @@ import {
     swapQuoteByInputToken,
 } from "@orca-so/whirlpools-sdk";
 import { Percentage } from "@orca-so/common-sdk";
-import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { getAssociatedTokenAddress, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
 class ReadonlyWallet {
     constructor(public publicKey: PublicKey) { }
-    // Not used for sending; provider only needs a shape.
     get payer(): Keypair { return Keypair.generate(); }
     async signTransaction<T extends Transaction | VersionedTransaction>(tx: T): Promise<T> { return tx; }
     async signAllTransactions<T extends Transaction | VersionedTransaction>(txs: T[]): Promise<T[]> { return txs; }
@@ -41,12 +40,9 @@ export async function buildOrcaWhirlpoolSwapIx(params: {
         const whirlpool = await client.getPool(new PublicKey(params.poolId));
         if (!whirlpool) return { ok: false, reason: "whirlpool_not_found" };
 
-        // Resolve token mints and user ATAs to avoid create-ATA ixs (and extra signers)
         const wpData = whirlpool.getData();
-        const mintA = wpData.tokenMintA;
-        const mintB = wpData.tokenMintB;
-        const ataA = getAssociatedTokenAddressSync(mintA, wallet.publicKey, false, TOKEN_PROGRAM_ID);
-        const ataB = getAssociatedTokenAddressSync(mintB, wallet.publicKey, false, TOKEN_PROGRAM_ID);
+        const ataA = await getAssociatedTokenAddress(wpData.tokenMintA, wallet.publicKey, false, TOKEN_PROGRAM_ID);
+        const ataB = await getAssociatedTokenAddress(wpData.tokenMintB, wallet.publicKey, false, TOKEN_PROGRAM_ID);
 
         const inputTokenType = params.baseIn ? "TokenA" : "TokenB";
         const amountBN = new BN(params.amountInAtoms.toString());
@@ -59,15 +55,13 @@ export async function buildOrcaWhirlpoolSwapIx(params: {
             slippagePercentage,
             wallet.publicKey,
             ctx.fetcher,
-            {} // no ATA creation hints
+            {}
         );
 
-        // Explicitly pass owner token accounts so the builder does not try to create them
         const swapTxBuilder = await whirlpool.swap(quote, {
             tokenAuthority: wallet.publicKey,
             tokenOwnerAccountA: ataA,
             tokenOwnerAccountB: ataB,
-            // do not set payer; keeps owner-only signer in the final ixs
         } as any);
 
         const txPayload = await swapTxBuilder.build();

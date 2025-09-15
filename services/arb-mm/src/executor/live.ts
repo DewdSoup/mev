@@ -1,5 +1,5 @@
 // services/arb-mm/src/executor/live.ts
-// Adds: ability to route AMM leg to Raydium or Orca based on joiner decision.
+// (full file with RPC backoff integrated)
 
 import fs from "fs";
 import path from "path";
@@ -15,6 +15,8 @@ import { buildPhoenixSwapIxs } from "../util/phoenix.js";
 import { toIxArray, assertIxArray } from "../util/ix.js";
 import { submitAtomic, buildPreIxs } from "../tx/submit.js";
 import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+
+import { withRpcBackoff } from "../util/rpc_backoff.js"; // <- NEW
 
 const __filename = fileURLToPath(import.meta.url);
 const __here = path.dirname(__filename);
@@ -102,7 +104,8 @@ async function ensureRaydiumPoolMeta(conn: Connection, poolId: PublicKey): Promi
         return meta;
       }
     }
-  } catch (e: any) {
+  } catch (err) {
+    const e = err as any;
     logger.log("raydium_pool_meta_disk_error", { pool: key, err: String(e?.message ?? e) });
   }
 
@@ -120,7 +123,8 @@ async function ensureRaydiumPoolMeta(conn: Connection, poolId: PublicKey): Promi
       logger.log("raydium_pool_meta_source", { pool: key, source: "onchain" });
       return meta;
     }
-  } catch (e: any) {
+  } catch (err) {
+    const e = err as any;
     logger.log("raydium_pool_meta_onchain_error", { pool: key, err: String(e?.message ?? e) });
   }
 
@@ -151,7 +155,23 @@ async function getUiBalances(conn: Connection, owner: PublicKey) {
 }
 
 export class LiveExecutor {
-  constructor(private conn: Connection, private payer: Keypair) { }
+  constructor(private connRaw: Connection, private payer: Keypair) {
+    // wrap the connection with backoff+concurrency-limiter immediately
+    try {
+      const maxConc = Number(process.env.RPC_BACKOFF_MAX_CONCURRENCY ?? 6);
+      const maxRetries = Number(process.env.RPC_BACKOFF_MAX_RETRIES ?? 5);
+      this.conn = withRpcBackoff(this.connRaw, { maxConcurrency: maxConc, maxRetries });
+    } catch (err) {
+      const e = err as any;
+      logger.log("rpc_backoff_wrap_error", { err: String(e?.message ?? e) });
+      // fallback to the raw connection if wrapper fails
+      // @ts-ignore
+      this.conn = this.connRaw;
+    }
+  }
+
+  // the wrapped connection used by executor methods
+  private conn: Connection;
 
   async startPhoenix(): Promise<void> { /* no-op */ }
 
@@ -159,6 +179,7 @@ export class LiveExecutor {
     try {
       const atomicPath = (payload?.path as AtomicPath) || "PHX->AMM";
       const ammVenue = String(payload?.amm_venue ?? payload?.ammVenue ?? "raydium").toLowerCase() as "raydium" | "orca";
+      const poolFromPayload = String(payload?.amm?.pool ?? "").trim();
       let sizeBase = Number(payload?.size_base ?? payload?.trade_size_base ?? 0);
       const phoenix = payload?.phoenix || {};
       const buy_px = Number(payload?.buy_px ?? 0);
@@ -216,7 +237,8 @@ export class LiveExecutor {
           else if (built && typeof built === "object" && "ok" in built && (built as any).ok && (built as any).ixs) phxIxs = toIxArray((built as any).ixs);
           if (!phxIxs.length) throw new Error("phoenix_build_returned_no_instructions");
           logger.log("phoenix_build_ok", { ixs: phxIxs.length });
-        } catch (e: any) {
+        } catch (err) {
+          const e = err as any;
           logger.log("submit_error", { where: "phoenix_build", error: String(e?.message ?? e) });
           return;
         }
@@ -230,7 +252,7 @@ export class LiveExecutor {
 
       if (ammVenue === "raydium") {
         // Build Raydium CPMM
-        const poolIdStr = DEFAULT_RAYDIUM_POOL_ID;
+        const poolIdStr = poolFromPayload || DEFAULT_RAYDIUM_POOL_ID;     // 👈 NEW
         const poolId = new PublicKey(poolIdStr);
         const meta = await ensureRaydiumPoolMeta(this.conn, poolId);
 
@@ -277,15 +299,16 @@ export class LiveExecutor {
             amountOutMin: minOut,
           });
           if (!Array.isArray(rayIxs) || rayIxs.length === 0) throw new Error("raydium_builder_returned_no_instructions");
-          logger.log("raydium_build_ok", { ixs: rayIxs.length });
-        } catch (e: any) {
+          logger.log("raydium_build_ok", { ixs: rayIxs.length, pool: poolIdStr });
+        } catch (err) {
+          const e = err as any;
           logger.log("submit_error", { where: "raydium_build", error: String(e?.message ?? e) });
           return;
         }
         assertIxArray(rayIxs, "raydium");
       } else {
         // Build Orca Whirlpool swap
-        const whirlpoolId = new PublicKey(DEFAULT_ORCA_POOL_ID);
+        const whirlpoolId = new PublicKey(poolFromPayload || DEFAULT_ORCA_POOL_ID); // 👈 NEW
         const WSOL = new PublicKey(process.env.WSOL_MINT ?? "So11111111111111111111111111111111111111112");
         const USDC = new PublicKey(process.env.USDC_MINT ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 
@@ -312,8 +335,9 @@ export class LiveExecutor {
             throw new Error(orcaResult.reason);
           }
           if (!Array.isArray(orcaIxs) || orcaIxs.length === 0) throw new Error("orca_builder_returned_no_instructions");
-          logger.log("orca_build_ok", { ixs: orcaIxs.length });
-        } catch (e: any) {
+          logger.log("orca_build_ok", { ixs: orcaIxs.length, pool: whirlpoolId.toBase58() });
+        } catch (err) {
+          const e = err as any;
           logger.log("submit_error", { where: "orca_build", error: String(e?.message ?? e) });
           return;
         }
@@ -337,6 +361,7 @@ export class LiveExecutor {
       const total = preIxs.length + phxIxs.length + ammIxs.length;
       logger.log("submit_ixs", { label: "atomic", phx: phxIxs.length, amm: ammIxs.length, total });
 
+      // submitAtomic will use the same wrapped connection (this.conn)
       const sig = await submitAtomic({
         connection: this.conn,
         owner: this.payer,
@@ -372,7 +397,8 @@ export class LiveExecutor {
       });
 
       logger.log("landed", { sig, slot, conf_ms, shadow: false });
-    } catch (e: any) {
+    } catch (err) {
+      const e = err as any;
       logger.log("submit_error", { where: "maybe_execute", error: String(e?.message ?? e) });
     }
   }

@@ -600,6 +600,18 @@ async function main() {
 
     const notional = coalesceRound(6, execSize * ((d.buy_px + d.sell_px) / 2));
 
+    // 👇 NEW: honor joiner’s venue/pool & optional EXEC_AMM_VENUE override
+    const forcing = String(process.env.EXEC_AMM_VENUE ?? "").trim().toLowerCase();
+    const venueFromJoiner = (d.amm_venue ?? "").toLowerCase();
+    const ammVenue = (forcing === "raydium" || forcing === "orca")
+      ? forcing
+      : (venueFromJoiner === "raydium" || venueFromJoiner === "orca" ? venueFromJoiner : "raydium");
+
+    // Pick poolId by venue: use from joiner when available (especially for Orca), else env
+    const rayPoolEnv = (process.env.RAYDIUM_POOL_ID ?? process.env.RAYDIUM_POOL_ID_SOL_USDC ?? "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2").trim();
+    const orcaPoolEnv = (process.env.ORCA_POOL_ID ?? "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ").trim();
+    const poolIdForVenue = ammVenue === "raydium" ? rayPoolEnv : (d.amm_pool_id ?? orcaPoolEnv);
+
     const payload: any = {
       path: d.path,
       size_base: execSize,
@@ -611,7 +623,8 @@ async function main() {
         side: d.side as "buy" | "sell",
         limit_px: d.side === "buy" ? d.buy_px : d.sell_px,
       },
-      amm: { pool: (process.env.RAYDIUM_POOL_ID ?? "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2").trim() },
+      amm_venue: ammVenue,           // 👈 NEW
+      amm: { pool: poolIdForVenue }, // 👈 NEW
       atomic: true,
     };
 

@@ -1,9 +1,8 @@
 // services/arb-mm/src/edge/joiner.ts
 // Multi-venue joiner (Raydium & Orca) with concurrent per-venue route evaluation.
-// Keeps EV math, guards, and logging. Adds CLMM mid-only fallback.
-// NEW:
-//  - consume exact per-pool feeBps from AMM publisher (no venue defaults).
-//  - optional execution candidate for AMM->AMM in addition to tracking.
+// Keeps EV math, guards, and logging. Adds CLMM depth-aware quoting for Orca paths.
+// - Reads per-pool feeBps from AMM payload when available.
+// - Only PHX paths go through RPC-sim to satisfy its typing narrow.
 
 import { logger } from "../ml_logger.js";
 import { synthFromMid, type PhoenixBook } from "../syntheticPhoenix.js";
@@ -16,6 +15,10 @@ import {
   type PhoenixBook as SizePhoenixBook,
   type SizeOptInputs,
 } from "../executor/size.js";
+import {
+  orcaAvgBuyQuotePerBase,
+  orcaAvgSellQuotePerBase,
+} from "../executor/orca_quoter.js";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Production constants (caps/guards)
@@ -24,6 +27,9 @@ const MIN_PROFITABLE_BPS = Number(process.env.MIN_PROFITABLE_BPS ?? 5);
 const MAX_DAILY_TRADES = Number(process.env.MAX_DAILY_TRADES ?? 50);
 const MAX_DAILY_VOLUME_QUOTE = Number(process.env.MAX_DAILY_VOLUME_QUOTE ?? 10000);
 const PRICE_VALIDATION_WINDOW_BPS = Number(process.env.PRICE_VALIDATION_WINDOW_BPS ?? 200);
+
+// Clamp for Orca exact-in/out to ensure SDK never sees 0
+const MIN_ORCA_BASE_SIZE = Number(process.env.MIN_ORCA_BASE_SIZE ?? "0.000001");
 
 // ────────────────────────────────────────────────────────────────────────────
 // Circuit breaker state
@@ -75,7 +81,7 @@ export interface JoinerParams {
   flatSlippageBps: number;
   tradeSizeBase: number;
   phoenixFeeBps: number;
-  ammFeeBps: number;           // fallback only (per-venue fee arrives in payload)
+  ammFeeBps: number;           // fallback only (per-venue/pool fee may arrive in payload)
   fixedTxCostQuote: number;
 
   decisionMinBase?: number;
@@ -97,6 +103,7 @@ export interface JoinerCfg {
   decisionMinBase?: number;
 }
 
+// NB: Keep DecisionHookDetails.path as a superset; callers can ignore AMM->AMM.
 export type DecisionHookDetails = {
   path: "AMM->PHX" | "PHX->AMM" | "AMM->AMM";
   side: "buy" | "sell";
@@ -105,7 +112,8 @@ export type DecisionHookDetails = {
   rpc_eff_px?: number;
   recommended_size_base?: number;
   amm_venue?: string;
-  amm_dst_venue?: string;  // for AMM->AMM
+  amm_pool_id?: string;       // 👈 exact pool to hit
+  amm_dst_venue?: string;     // for AMM->AMM
 };
 
 export type DecisionHook = (
@@ -181,7 +189,7 @@ export class EdgeJoiner {
       }
     }
 
-    // Prefer exact per-pool fee from payload; fall back to env only if missing.
+    // Prefer per-pool fee from payload; env fallback if missing.
     const feeFromPayload =
       nnum(obj?.feeBps) ??
       nnum(obj?.fee_bps) ??
@@ -283,7 +291,7 @@ export class EdgeJoiner {
     return dy / sellBase; // avg QUOTE per BASE received
   }
 
-  // CLMM / mid-only fallback (QUOTE per BASE)
+  // CLMM / mid-only fallback (used only if quoter errs)
   private midBuyQuotePerBase(mid: number, feeBps: number, slipBps: number): number {
     const fee = Math.max(0, feeBps) / 10_000;
     const slip = Math.max(0, slipBps) / 10_000;
@@ -388,6 +396,12 @@ export class EdgeJoiner {
 
   // ──────────────────────────────────────────────────────────────────────────
   private async maybeReport(): Promise<void> {
+    // Reset circuit breakers daily
+    const nowDay = new Date().getUTCDate();
+    if (nowDay !== lastResetDay) {
+      dailyTrades = 0; dailyVolumeQuote = 0; lastResetDay = nowDay;
+    }
+
     const book = this.getFreshBook();
     const now = Date.now();
 
@@ -409,7 +423,7 @@ export class EdgeJoiner {
     const ask = (book as any).best_ask;
     if (!(bid > 0 && ask > 0)) return;
 
-    // Emit a single edge_report snapshot (of the Phoenix vs an arbitrary AMM mid)
+    // Emit a single edge_report snapshot (Phoenix vs latest AMM mid)
     const latestAmm = Array.from(this.amms.values()).sort((a, b) => b.ts - a.ts)[0];
     const ammPx = latestAmm?.px ?? (bid + ask) / 2;
 
@@ -485,40 +499,56 @@ export class EdgeJoiner {
       for (const s of sizes) {
         // AMM->PHX: buy on AMM, sell on Phoenix
         {
-          const buyAmm = hasRes
-            ? this.cpmmBuyQuotePerBase(amm.reserves!.base, amm.reserves!.quote, s, amm.feeBps)
-            : this.midBuyQuotePerBase(amm.px, amm.feeBps, this.P.flatSlippageBps);
-          const sellPhx = bookOpt ? this.walkPhoenix("sell", s, this.P.phoenixFeeBps) : bid * (1 - this.C.phoenixSlippageBps / 10_000);
+          const sEff = amm.venue === "orca" ? Math.max(s, MIN_ORCA_BASE_SIZE) : s;
+          let buyAmm: number | undefined;
+          if (amm.venue === "orca") {
+            const q = await orcaAvgBuyQuotePerBase(amm.ammId, sEff, this.P.flatSlippageBps);
+            buyAmm = q.ok ? q.price : this.midBuyQuotePerBase(amm.px, amm.feeBps, this.P.flatSlippageBps);
+          } else {
+            buyAmm = hasRes
+              ? this.cpmmBuyQuotePerBase(amm.reserves!.base, amm.reserves!.quote, sEff, amm.feeBps)
+              : this.midBuyQuotePerBase(amm.px, amm.feeBps, this.P.flatSlippageBps);
+          }
+
+          const sellPhx = bookOpt ? this.walkPhoenix("sell", sEff, this.P.phoenixFeeBps) : bid * (1 - this.C.phoenixSlippageBps / 10_000);
 
           if (buyAmm != null && sellPhx != null) {
-            const pnl = (sellPhx - buyAmm) * s - this.P.fixedTxCostQuote;
+            const pnl = (sellPhx - buyAmm) * sEff - this.P.fixedTxCostQuote;
             const bpsGross = (bid / amm.px - 1) * 10_000;
             const bpsNet = (sellPhx / buyAmm - 1) * 10_000;
-            const ok = this.validateOpportunity("AMM->PHX", s, buyAmm, sellPhx, pnl, this.P.fixedTxCostQuote);
-            if (ok.valid) candidates.push({ path: "AMM->PHX", amm, size: s, buyPx: buyAmm, sellPx: sellPhx, bpsGross, bpsNet, pnlNet: pnl });
-            else logger.log("opportunity_rejected", { path: "AMM->PHX", venue: amm.venue, size: s, buy_px: buyAmm, sell_px: sellPhx, pnl, reason: ok.reason });
+            const ok = this.validateOpportunity("AMM->PHX", sEff, buyAmm, sellPhx, pnl, this.P.fixedTxCostQuote);
+            if (ok.valid) candidates.push({ path: "AMM->PHX", amm, size: sEff, buyPx: buyAmm, sellPx: sellPhx, bpsGross, bpsNet, pnlNet: pnl });
+            else logger.log("opportunity_rejected", { path: "AMM->PHX", venue: amm.venue, size: sEff, buy_px: buyAmm, sell_px: sellPhx, pnl, reason: ok.reason });
           }
         }
         // PHX->AMM: buy on Phoenix, sell on AMM
         {
-          const buyPhx = bookOpt ? this.walkPhoenix("buy", s, this.P.phoenixFeeBps) : ask * (1 + this.C.phoenixSlippageBps / 10_000);
-          const sellAmm = hasRes
-            ? this.cpmmSellQuotePerBase(amm.reserves!.base, amm.reserves!.quote, s, amm.feeBps)
-            : this.midSellQuotePerBase(amm.px, amm.feeBps, this.P.flatSlippageBps);
+          const sEff = amm.venue === "orca" ? Math.max(s, MIN_ORCA_BASE_SIZE) : s;
+          const buyPhx = bookOpt ? this.walkPhoenix("buy", sEff, this.P.phoenixFeeBps) : ask * (1 + this.C.phoenixSlippageBps / 10_000);
+
+          let sellAmm: number | undefined;
+          if (amm.venue === "orca") {
+            const q = await orcaAvgSellQuotePerBase(amm.ammId, sEff, this.P.flatSlippageBps);
+            sellAmm = q.ok ? q.price : this.midSellQuotePerBase(amm.px, amm.feeBps, this.P.flatSlippageBps);
+          } else {
+            sellAmm = hasRes
+              ? this.cpmmSellQuotePerBase(amm.reserves!.base, amm.reserves!.quote, sEff, amm.feeBps)
+              : this.midSellQuotePerBase(amm.px, amm.feeBps, this.P.flatSlippageBps);
+          }
 
           if (buyPhx != null && sellAmm != null) {
-            const pnl = (sellAmm - buyPhx) * s - this.P.fixedTxCostQuote;
+            const pnl = (sellAmm - buyPhx) * sEff - this.P.fixedTxCostQuote;
             const bpsGross = (amm.px / ask - 1) * 10_000;
             const bpsNet = (sellAmm / buyPhx - 1) * 10_000;
-            const ok = this.validateOpportunity("PHX->AMM", s, buyPhx, sellAmm, pnl, this.P.fixedTxCostQuote);
-            if (ok.valid) candidates.push({ path: "PHX->AMM", amm, size: s, buyPx: buyPhx, sellPx: sellAmm, bpsGross, bpsNet, pnlNet: pnl });
-            else logger.log("opportunity_rejected", { path: "PHX->AMM", venue: amm.venue, size: s, buy_px: buyPhx, sell_px: sellAmm, pnl, reason: ok.reason });
+            const ok = this.validateOpportunity("PHX->AMM", sEff, buyPhx, sellAmm, pnl, this.P.fixedTxCostQuote);
+            if (ok.valid) candidates.push({ path: "PHX->AMM", amm, size: sEff, buyPx: buyPhx, sellPx: sellAmm, bpsGross, bpsNet, pnlNet: pnl });
+            else logger.log("opportunity_rejected", { path: "PHX->AMM", venue: amm.venue, size: sEff, buy_px: buyPhx, sell_px: sellAmm, pnl, reason: ok.reason });
           }
         }
       }
     }
 
-    // Cross-AMM EV
+    // Optional: Cross-AMM tracking/execution (Raydium<->Orca).
     const trackAmmAmm = envTrue("TRACK_AMM_AMM", true);
     const execAmmAmm = envTrue("EXECUTE_AMM_AMM", false);
     let bestAmmAmm: { src: AmmSnap; dst: AmmSnap; size: number; buyPx: number; sellPx: number; bpsNet: number; pnlNet: number } | undefined;
@@ -534,17 +564,35 @@ export class EdgeJoiner {
         const midRef = (bid + ask) / 2;
         const grid = this.buildSizeGrid(midRef, (aHas && bHas) ? { base: Math.min(A.reserves!.base, B.reserves!.base) } : undefined);
         for (const s of grid) {
-          const buyA = aHas
-            ? this.cpmmBuyQuotePerBase(A.reserves!.base, A.reserves!.quote, s, A.feeBps)
-            : this.midBuyQuotePerBase(A.px, A.feeBps, this.P.flatSlippageBps);
-          const sellB = bHas
-            ? this.cpmmSellQuotePerBase(B.reserves!.base, B.reserves!.quote, s, B.feeBps)
-            : this.midSellQuotePerBase(B.px, B.feeBps, this.P.flatSlippageBps);
+          const sEff = Math.max(s, MIN_ORCA_BASE_SIZE);
+
+          // Buy on A
+          let buyA: number | undefined;
+          if (A.venue === "orca") {
+            const q = await orcaAvgBuyQuotePerBase(A.ammId, sEff, this.P.flatSlippageBps);
+            buyA = q.ok ? q.price : this.midBuyQuotePerBase(A.px, A.feeBps, this.P.flatSlippageBps);
+          } else {
+            buyA = aHas
+              ? this.cpmmBuyQuotePerBase(A.reserves!.base, A.reserves!.quote, sEff, A.feeBps)
+              : this.midBuyQuotePerBase(A.px, A.feeBps, this.P.flatSlippageBps);
+          }
+
+          // Sell on B
+          let sellB: number | undefined;
+          if (B.venue === "orca") {
+            const q = await orcaAvgSellQuotePerBase(B.ammId, sEff, this.P.flatSlippageBps);
+            sellB = q.ok ? q.price : this.midSellQuotePerBase(B.px, B.feeBps, this.P.flatSlippageBps);
+          } else {
+            sellB = bHas
+              ? this.cpmmSellQuotePerBase(B.reserves!.base, B.reserves!.quote, sEff, B.feeBps)
+              : this.midSellQuotePerBase(B.px, B.feeBps, this.P.flatSlippageBps);
+          }
+
           if (buyA != null && sellB != null) {
-            const pnl = (sellB - buyA) * s - this.P.fixedTxCostQuote;
+            const pnl = (sellB - buyA) * sEff - this.P.fixedTxCostQuote;
             const bpsNet = (sellB / buyA - 1) * 10_000;
             if (pnl > 0 && (!bestAmmAmm || pnl > bestAmmAmm.pnlNet)) {
-              bestAmmAmm = { src: A, dst: B, size: s, buyPx: buyA, sellPx: sellB, bpsNet, pnlNet: pnl };
+              bestAmmAmm = { src: A, dst: B, size: sEff, buyPx: buyA, sellPx: sellB, bpsNet, pnlNet: pnl };
             }
           }
         }
@@ -571,7 +619,7 @@ export class EdgeJoiner {
             size: bestAmmAmm.size,
             buyPx: bestAmmAmm.buyPx,
             sellPx: bestAmmAmm.sellPx,
-            bpsGross: bestAmmAmm.bpsNet, // gross unavailable => use net proxy
+            bpsGross: bestAmmAmm.bpsNet,
             bpsNet: bestAmmAmm.bpsNet,
             pnlNet: bestAmmAmm.pnlNet,
           });
@@ -592,7 +640,7 @@ export class EdgeJoiner {
       return;
     }
 
-    // RPC sim (optional) — unchanged for PHX paths
+    // RPC sim (optional) — only for PHX paths
     const base: any = {
       symbol: "SOL/USDC",
       path: best.path,
@@ -624,20 +672,24 @@ export class EdgeJoiner {
       validation_enabled: true,
     };
 
-    // AMM effective price (impact) for winner — for AMM->AMM, show src effective buy
     const hasRes = !!best.amm.reserves && best.amm.reserves.base > 0 && best.amm.reserves.quote > 0;
     const ammEffPx = ((): number | undefined => {
-      if (best.path === "AMM->AMM" && best.amm.reserves) {
-        return this.cpmmBuyQuotePerBase(best.amm.reserves.base, best.amm.reserves.quote, best.size, best.amm.feeBps);
+      if (best.amm.venue === "orca") {
+        // already included in buy/sellPx; report impact relative to mid
+        return best.path === "AMM->PHX"
+          ? best.buyPx
+          : best.sellPx;
       }
       if (best.path === "AMM->PHX") {
         return hasRes
           ? this.cpmmBuyQuotePerBase(best.amm.reserves!.base, best.amm.reserves!.quote, best.size, best.amm.feeBps)
           : this.midBuyQuotePerBase(best.amm.px, best.amm.feeBps, this.P.flatSlippageBps);
-      } else { // PHX->AMM
+      } else if (best.path === "PHX->AMM") {
         return hasRes
           ? this.cpmmSellQuotePerBase(best.amm.reserves!.base, best.amm.reserves!.quote, best.size, best.amm.feeBps)
           : this.midSellQuotePerBase(best.amm.px, best.amm.feeBps, this.P.flatSlippageBps);
+      } else {
+        return undefined;
       }
     })();
     if (ammEffPx != null) {
@@ -703,6 +755,7 @@ export class EdgeJoiner {
       logger.log("would_not_trade", { ...base, safety_bps: round(safetyBps, 4), reason });
     }
 
+    // Decision callback (includes AMM->AMM details if present)
     this.onDecision(wouldTrade, best.bpsNet, best.pnlNet, {
       path: best.path,
       side: best.path === "AMM->PHX" ? "sell" : "buy",
@@ -710,32 +763,35 @@ export class EdgeJoiner {
       sell_px: round(best.sellPx),
       recommended_size_base: best.size,
       amm_venue: best.amm.venue,
+      amm_pool_id: best.amm.ammId,
       ...(best.path === "AMM->AMM" ? { amm_dst_venue: best.ammDst?.venue } : {}),
     });
 
-    // Feature emission
-    emitFeature(
-      featureFromEdgeAndDecision({
-        symbol: "SOL/USDC",
-        amm_base_reserve: best.amm.reserves?.base,
-        amm_quote_reserve: best.amm.reserves?.quote,
-        amm_base_decimals: best.amm.reserves?.baseDecimals,
-        amm_quote_decimals: best.amm.reserves?.quoteDecimals,
-        phoenix_source: "book",
-        phoenix_book_method: (book as any).book_method,
-        book_ttl_ms: this.C.bookTtlMs,
-      }, {
-        path: best.path,
-        side: best.path === "AMM->PHX" ? "sell" : "buy",
-        edge_bps_gross: round(best.bpsGross, 4),
-        buy_px: round(best.buyPx),
-        sell_px: round(best.sellPx),
-        expected_pnl: round(best.pnlNet, 6),
-        threshold_bps: this.P.thresholdBps,
-        slippage_bps: this.P.flatSlippageBps,
-        trade_size_base: best.size,
-        would_trade: wouldTrade,
-      })
-    );
+    // Feature emission — ONLY for PHX paths
+    if (best.path === "AMM->PHX" || best.path === "PHX->AMM") {
+      emitFeature(
+        featureFromEdgeAndDecision({
+          symbol: "SOL/USDC",
+          amm_base_reserve: best.amm.reserves?.base,
+          amm_quote_reserve: best.amm.reserves?.quote,
+          amm_base_decimals: best.amm.reserves?.baseDecimals,
+          amm_quote_decimals: best.amm.reserves?.quoteDecimals,
+          phoenix_source: "book",
+          phoenix_book_method: (book as any).book_method,
+          book_ttl_ms: this.C.bookTtlMs,
+        }, {
+          path: best.path as "AMM->PHX" | "PHX->AMM",
+          side: best.path === "AMM->PHX" ? "sell" : "buy",
+          edge_bps_gross: round(best.bpsGross, 4),
+          buy_px: round(best.buyPx),
+          sell_px: round(best.sellPx),
+          expected_pnl: round(best.pnlNet, 6),
+          threshold_bps: this.P.thresholdBps,
+          slippage_bps: this.P.flatSlippageBps,
+          trade_size_base: best.size,
+          would_trade: wouldTrade,
+        })
+      );
+    }
   }
 }
