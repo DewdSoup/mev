@@ -16,9 +16,12 @@ import fs from "fs";
 import path from "path";
 import { logger } from "../ml_logger.js";
 
-export type OrcaQuoteResult = { ok: true; price: number } | { ok: false; reason?: string };
+export type OrcaQuoteResult =
+    | { ok: true; price: number }
+    | { ok: false; reason?: string };
 
-const CACHE_PATH = process.env.ORCA_QUOTER_CACHE?.trim() ||
+const CACHE_PATH =
+    process.env.ORCA_QUOTER_CACHE?.trim() ||
     path.resolve(process.cwd(), "data/orca_quoter_cache.json");
 
 function safeParseJson<T = any>(p: string): T | undefined {
@@ -34,7 +37,12 @@ function safeParseJson<T = any>(p: string): T | undefined {
 }
 
 /** Basic CPMM approx for a CLMM snapshot — conservative fallback */
-function cpmmBuyQuotePerBase(base: number, quote: number, wantBase: number, feeBps: number): number | undefined {
+function cpmmBuyQuotePerBase(
+    base: number,
+    quote: number,
+    wantBase: number,
+    feeBps: number
+): number | undefined {
     if (!(base > 0 && quote > 0 && wantBase > 0)) return undefined;
     const fee = Math.max(0, feeBps) / 10_000;
     if (wantBase >= base * (1 - 1e-9)) return undefined;
@@ -43,7 +51,12 @@ function cpmmBuyQuotePerBase(base: number, quote: number, wantBase: number, feeB
     if (!Number.isFinite(dq)) return undefined;
     return dq / wantBase;
 }
-function cpmmSellQuotePerBase(base: number, quote: number, sellBase: number, feeBps: number): number | undefined {
+function cpmmSellQuotePerBase(
+    base: number,
+    quote: number,
+    sellBase: number,
+    feeBps: number
+): number | undefined {
     if (!(base > 0 && quote > 0 && sellBase > 0)) return undefined;
     const fee = Math.max(0, feeBps) / 10_000;
     const dbPrime = sellBase * (1 - fee);
@@ -64,46 +77,108 @@ function loadCache(): Record<string, any> | undefined {
     return j;
 }
 
-export async function orcaAvgBuyQuotePerBase(ammId: string, sizeBase: number, flatSlippageBps: number): Promise<OrcaQuoteResult> {
+export async function orcaAvgBuyQuotePerBase(
+    ammId: string,
+    sizeBase: number,
+    flatSlippageBps: number
+): Promise<OrcaQuoteResult> {
     if (!ammId || !(sizeBase > 0)) return { ok: false, reason: "invalid_input" };
 
     const cache = loadCache();
     const entry = cache?.[ammId];
-    if (!entry) {
-        // No cached snapshot — be conservative and let caller fallback to mid.
-        return { ok: false, reason: "no_cache" };
-    }
+    if (!entry) return { ok: false, reason: "no_cache" };
 
+    const feeBps = Number.isFinite(Number(entry.feeBps))
+        ? Number(entry.feeBps)
+        : Number(
+            process.env.ORCA_TRADE_FEE_BPS ??
+            process.env.AMM_TAKER_FEE_BPS ??
+            30
+        );
+
+    const extra =
+        Math.max(0, Number(process.env.ORCA_QUOTER_EXTRA_BPS ?? 2)) / 10_000;
+
+    // Prefer CPMM approx when reserves exist (still conservative)
     const base = Number(entry.base);
     const quote = Number(entry.quote);
-    const feeBps = Number.isFinite(Number(entry.feeBps)) ? Number(entry.feeBps) : (Number(process.env.ORCA_TRADE_FEE_BPS ?? 30));
-    if (!(base > 0 && quote > 0)) return { ok: false, reason: "bad_cache_reserves" };
+    if (base > 0 && quote > 0) {
+        const q = cpmmBuyQuotePerBase(
+            base,
+            quote,
+            Math.max(
+                sizeBase,
+                Number(process.env.MIN_ORCA_BASE_SIZE ?? 0.000001)
+            ),
+            feeBps
+        );
+        if (!q || !Number.isFinite(q))
+            return { ok: false, reason: "cant_quote_from_cache" };
+        return { ok: true, price: q * (1 + extra) };
+    }
 
-    const q = cpmmBuyQuotePerBase(base, quote, Math.max(sizeBase, Number(process.env.MIN_ORCA_BASE_SIZE ?? 0.000001)), feeBps);
-    if (!q || !Number.isFinite(q)) return { ok: false, reason: "cant_quote_from_cache" };
-    // Add a small additional slippage buffer (flatSlippageBps is already applied by caller in joiner workflow)
-    const extra = Math.max(0, Number(process.env.ORCA_QUOTER_EXTRA_BPS ?? 2)) / 10_000;
-    const final = q * (1 + extra);
-    return { ok: true, price: final };
+    // Fallback: `px` only (no reserves) → conservative fee-upside on cost
+    const px = Number(entry.px ?? entry.px_str);
+    if (!Number.isFinite(px) || px <= 0)
+        return { ok: false, reason: "bad_cache" };
+
+    // For a BUY on AMM (we receive BASE), cost per BASE ≈ px * (1 + fee + buffer)
+    const fee = Math.max(0, feeBps) / 10_000;
+    const price = px * (1 + fee) * (1 + extra);
+    return Number.isFinite(price) && price > 0
+        ? { ok: true, price }
+        : { ok: false, reason: "px_only_bad" };
 }
 
-export async function orcaAvgSellQuotePerBase(ammId: string, sizeBase: number, flatSlippageBps: number): Promise<OrcaQuoteResult> {
+export async function orcaAvgSellQuotePerBase(
+    ammId: string,
+    sizeBase: number,
+    flatSlippageBps: number
+): Promise<OrcaQuoteResult> {
     if (!ammId || !(sizeBase > 0)) return { ok: false, reason: "invalid_input" };
 
     const cache = loadCache();
     const entry = cache?.[ammId];
-    if (!entry) {
-        return { ok: false, reason: "no_cache" };
-    }
+    if (!entry) return { ok: false, reason: "no_cache" };
 
+    const feeBps = Number.isFinite(Number(entry.feeBps))
+        ? Number(entry.feeBps)
+        : Number(
+            process.env.ORCA_TRADE_FEE_BPS ??
+            process.env.AMM_TAKER_FEE_BPS ??
+            30
+        );
+
+    const extra =
+        Math.max(0, Number(process.env.ORCA_QUOTER_EXTRA_BPS ?? 2)) / 10_000;
+
+    // Prefer CPMM approx when reserves exist
     const base = Number(entry.base);
     const quote = Number(entry.quote);
-    const feeBps = Number.isFinite(Number(entry.feeBps)) ? Number(entry.feeBps) : (Number(process.env.ORCA_TRADE_FEE_BPS ?? 30));
-    if (!(base > 0 && quote > 0)) return { ok: false, reason: "bad_cache_reserves" };
+    if (base > 0 && quote > 0) {
+        const q = cpmmSellQuotePerBase(
+            base,
+            quote,
+            Math.max(
+                sizeBase,
+                Number(process.env.MIN_ORCA_BASE_SIZE ?? 0.000001)
+            ),
+            feeBps
+        );
+        if (!q || !Number.isFinite(q))
+            return { ok: false, reason: "cant_quote_from_cache" };
+        return { ok: true, price: q * (1 - extra) };
+    }
 
-    const q = cpmmSellQuotePerBase(base, quote, Math.max(sizeBase, Number(process.env.MIN_ORCA_BASE_SIZE ?? 0.000001)), feeBps);
-    if (!q || !Number.isFinite(q)) return { ok: false, reason: "cant_quote_from_cache" };
-    const extra = Math.max(0, Number(process.env.ORCA_QUOTER_EXTRA_BPS ?? 2)) / 10_000;
-    const final = q * (1 - extra);
-    return { ok: true, price: final };
+    // Fallback: `px` only → conservative downside from fee
+    const px = Number(entry.px ?? entry.px_str);
+    if (!Number.isFinite(px) || px <= 0)
+        return { ok: false, reason: "bad_cache" };
+
+    // For a SELL on AMM (we give BASE), proceeds per BASE ≈ px * (1 - fee - buffer)
+    const fee = Math.max(0, feeBps) / 10_000;
+    const price = px * (1 - fee) * (1 - extra);
+    return Number.isFinite(price) && price > 0
+        ? { ok: true, price }
+        : { ok: false, reason: "px_only_bad" };
 }

@@ -32,6 +32,29 @@ const PRICE_VALIDATION_WINDOW_BPS = Number(process.env.PRICE_VALIDATION_WINDOW_B
 const MIN_ORCA_BASE_SIZE = Number(process.env.MIN_ORCA_BASE_SIZE ?? "0.000001");
 
 // ────────────────────────────────────────────────────────────────────────────
+// Staleness guard (inline helper)
+function envInt(name: string, def: number) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) ? n : def;
+}
+const AMM_SLOT_MAX_LAG = envInt("AMM_SLOT_MAX_LAG", 8);
+const AMM_SNAPSHOT_MAX_AGE_MS = envInt("AMM_SNAPSHOT_MAX_AGE_MS", envInt("PRICE_STALENESS_MS", 5000));
+
+function staleReason(
+  snap: { ts: number; slot?: number | null; venue: string; ammId: string },
+  phoenixSlot?: number | null,
+  now = Date.now()
+): string | null {
+  const ageMs = Math.max(0, now - (snap.ts || 0));
+  if (ageMs > AMM_SNAPSHOT_MAX_AGE_MS) return `age_ms>${AMM_SNAPSHOT_MAX_AGE_MS}`;
+  if (snap.slot != null && phoenixSlot != null) {
+    const lag = phoenixSlot - snap.slot;
+    if (lag > AMM_SLOT_MAX_LAG) return `slot_lag>${AMM_SLOT_MAX_LAG} (amm=${snap.slot} phoenix=${phoenixSlot})`;
+  }
+  return null;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Circuit breaker state
 let dailyTrades = 0;
 let dailyVolumeQuote = 0;
@@ -69,7 +92,8 @@ type AmmSnap = {
   venue: "raydium" | "orca" | string;
   ammId: string;
   px: number;
-  ts: number;
+  ts: number;            // publisher-provided ts if available; else Date.now()
+  slot?: number | null;  // optional publisher slot
   reserves?: { base: number; quote: number; baseDecimals: number; quoteDecimals: number };
   feeBps: number;
 };
@@ -154,6 +178,8 @@ export class EdgeJoiner {
     levels_asks?: DepthSide[];
   }) | null = null;
 
+  private phxSlot?: number | null; // optional Phoenix slot for staleness guard
+
   private lastWaitLog = 0;
   private lastDecisionAtMs = 0;
   private lastSig?: string;
@@ -202,11 +228,15 @@ export class EdgeJoiner {
           : Number(this.P.ammFeeBps ?? 25);
     const feeBps = feeFromPayload ?? feeFallback;
 
+    const tsFromPayload = nnum(obj?.ts);
+    const slotFromPayload = nnum(obj?.slot);
+
     const snap: AmmSnap = {
       venue: venue as any,
       ammId,
       px,
-      ts: Date.now(),
+      ts: tsFromPayload && tsFromPayload > 0 ? tsFromPayload : Date.now(),
+      slot: slotFromPayload ?? null,
       reserves,
       feeBps,
     };
@@ -220,6 +250,10 @@ export class EdgeJoiner {
   upsertPhoenix(raw: any): void {
     const ev = (raw?.event ?? raw?.name ?? raw?.type ?? "") as string;
     const obj = raw?.data ?? raw;
+
+    // Pick up phoenix slot if present
+    const maybeSlot = nnum(obj?.slot);
+    if (maybeSlot != null) this.phxSlot = maybeSlot;
 
     if (ev === "phoenix_l2") {
       const bid = nnum(obj?.best_bid);
@@ -423,8 +457,39 @@ export class EdgeJoiner {
     const ask = (book as any).best_ask;
     if (!(bid > 0 && ask > 0)) return;
 
-    // Emit a single edge_report snapshot (Phoenix vs latest AMM mid)
-    const latestAmm = Array.from(this.amms.values()).sort((a, b) => b.ts - a.ts)[0];
+    // Filter AMM snapshots by staleness
+    const validAmms: AmmSnap[] = [];
+    for (const a of this.amms.values()) {
+      const reason = staleReason({ ts: a.ts, slot: a.slot ?? null, venue: a.venue, ammId: a.ammId }, this.phxSlot ?? null, now);
+      if (reason) {
+        logger.log("amm_snapshot_ignored", {
+          venue: a.venue,
+          ammId: a.ammId,
+          reason,
+          ts: a.ts,
+          slot: a.slot ?? null,
+          phoenix_slot: this.phxSlot ?? null,
+        });
+        continue;
+      }
+      validAmms.push(a);
+    }
+    if (validAmms.length === 0) {
+      if (now - this.lastWaitLog >= this.P.waitLogMs) {
+        this.lastWaitLog = now;
+        logger.log("edge_waiting", {
+          have_raydium: false,
+          have_orca: false,
+          have_phoenix_mid: !!this.phxMid,
+          have_phoenix_book: !!this.phxBook,
+          reason: "all_amm_snapshots_stale",
+        });
+      }
+      return;
+    }
+
+    // Emit a single edge_report snapshot (Phoenix vs latest valid AMM mid)
+    const latestAmm = validAmms.sort((a, b) => b.ts - a.ts)[0];
     const ammPx = latestAmm?.px ?? (bid + ask) / 2;
 
     const toPhoenixSellBps = (ammPx / bid - 1) * 10_000;
@@ -473,7 +538,7 @@ export class EdgeJoiner {
     };
     const candidates: Candidate[] = [];
 
-    for (const amm of this.amms.values()) {
+    for (const amm of validAmms) {
       const hasRes = !!amm.reserves && amm.reserves.base > 0 && amm.reserves.quote > 0;
 
       // Size grid per AMM (use reserves if present for poolFrac cap)
@@ -554,7 +619,7 @@ export class EdgeJoiner {
     let bestAmmAmm: { src: AmmSnap; dst: AmmSnap; size: number; buyPx: number; sellPx: number; bpsNet: number; pnlNet: number } | undefined;
 
     if (trackAmmAmm || execAmmAmm) {
-      const amms = Array.from(this.amms.values());
+      const amms = validAmms;
       for (let i = 0; i < amms.length; i++) for (let j = 0; j < amms.length; j++) {
         if (i === j) continue;
         const A = amms[i], B = amms[j];

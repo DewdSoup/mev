@@ -30,11 +30,16 @@ import { logger } from "./logger.js";
       for (const rawLine of txt.split(/\r?\n/)) {
         const line = rawLine.trim();
         if (!line || line.startsWith("#")) continue;
-        const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+        const m = line.match(
+          /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/
+        );
         if (!m) continue;
         const key = m[1];
         let val = m[2];
-        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        if (
+          (val.startsWith('"') && val.endsWith('"')) ||
+          (val.startsWith("'") && val.endsWith("'"))
+        ) {
           val = val.slice(1, -1);
         }
         if (!(key in process.env)) process.env[key] = val;
@@ -49,7 +54,9 @@ const RPC_URL = getenv("RPC_URL", getenv("HELIUS_RPC") || getenv("RPC") || "").t
 const TICK_MS = Math.max(250, Number(getenv("AMMS_TICK_MS", "1000")) || 1000);
 
 function resolveOutPath(): string {
-  const p = getenv("EDGE_AMMS_JSONL") || path.resolve(process.cwd(), "logs", "runtime.jsonl");
+  const p =
+    getenv("EDGE_AMMS_JSONL") ||
+    path.resolve(process.cwd(), "logs", "runtime.jsonl");
   fs.mkdirSync(path.dirname(p), { recursive: true });
   return p;
 }
@@ -57,16 +64,25 @@ function resolveOutPath(): string {
 class JsonlWriter {
   private stream: fs.WriteStream;
   constructor(private filePath: string) {
-    this.stream = fs.createWriteStream(filePath, { flags: "a", encoding: "utf8", mode: 0o644 });
+    this.stream = fs.createWriteStream(filePath, {
+      flags: "a",
+      encoding: "utf8",
+      mode: 0o644,
+    });
   }
   writeEnvelope(event: string, data: any) {
-    this.stream.write(JSON.stringify({ t: new Date().toISOString(), event, data }) + "\n");
+    this.stream.write(
+      JSON.stringify({ t: new Date().toISOString(), event, data }) + "\n"
+    );
   }
-  end() { this.stream.end(); }
+  end() {
+    this.stream.end();
+  }
 }
 
 function priceFromReserves(r: ReserveSnapshot): number {
-  const base = Number(r.base), quote = Number(r.quote);
+  const base = Number(r.base),
+    quote = Number(r.quote);
   if (!(base > 0 && quote > 0)) return NaN;
   const baseF = base / 10 ** r.baseDecimals;
   const quoteF = quote / 10 ** r.quoteDecimals;
@@ -90,13 +106,24 @@ async function snapshotToPayload(a: AmmAdapter, r: ReserveSnapshot) {
   try {
     if (typeof (a as any).feeBps === "function") {
       const fb = await (a as any).feeBps();
-      if (Number.isFinite(fb) && fb > 0) { feeBps = fb; feeSource = "onchain"; }
+      if (Number.isFinite(fb) && fb > 0) {
+        feeBps = fb;
+        feeSource = "onchain_or_adapter"; // 👈 renamed
+      }
     }
   } catch { }
   if (!Number.isFinite(feeBps) || feeBps <= 0) {
     const venue = String(a.venue).toLowerCase();
-    if (venue === "raydium") feeBps = Number(process.env.RAYDIUM_TRADE_FEE_BPS ?? process.env.AMM_TAKER_FEE_BPS ?? 25);
-    else if (venue === "orca") feeBps = Number(process.env.ORCA_TRADE_FEE_BPS ?? process.env.AMM_TAKER_FEE_BPS ?? 30);
+    if (venue === "raydium")
+      feeBps = Number(
+        process.env.RAYDIUM_TRADE_FEE_BPS ??
+        process.env.AMM_TAKER_FEE_BPS ??
+        25
+      );
+    else if (venue === "orca")
+      feeBps = Number(
+        process.env.ORCA_TRADE_FEE_BPS ?? process.env.AMM_TAKER_FEE_BPS ?? 30
+      );
     else feeBps = Number(process.env.AMM_TAKER_FEE_BPS ?? 25);
   }
 
@@ -125,11 +152,16 @@ async function snapshotToPayload(a: AmmAdapter, r: ReserveSnapshot) {
 }
 
 async function main() {
-  const conn = new Connection(RPC_URL || "https://api.mainnet-beta.solana.com", { commitment: "confirmed" });
+  const conn = new Connection(
+    RPC_URL || "https://api.mainnet-beta.solana.com",
+    { commitment: "confirmed" }
+  );
   const outPath = resolveOutPath();
   const writer = new JsonlWriter(outPath);
 
-  writer.writeEnvelope("amms_boot", { rpc: RPC_URL || "https://api.mainnet-beta.solana.com" });
+  writer.writeEnvelope("amms_boot", {
+    rpc: RPC_URL || "https://api.mainnet-beta.solana.com",
+  });
   let adapters: AmmAdapter[] = [];
   try {
     adapters = await getEnabledAdapters(conn);
@@ -146,23 +178,39 @@ async function main() {
   for (const a of adapters) (a as any).setConnection?.(conn);
 
   let active = true;
-  process.on("SIGINT", () => { active = false; writer.end(); });
-  process.on("SIGTERM", () => { active = false; writer.end(); });
+  process.on("SIGINT", () => {
+    active = false;
+    writer.end();
+  });
+  process.on("SIGTERM", () => {
+    active = false;
+    writer.end();
+  });
 
   while (active) {
     const t0 = Date.now();
-    await Promise.allSettled(adapters.map(async (a) => {
-      try {
-        const r = await a.reservesAtoms();
-        const payload = await snapshotToPayload(a, r);
-        writer.writeEnvelope("amms_price", payload);
-        if (payload.validation_passed) logger.log("amms_price", payload);
-      } catch (e: any) {
-        logger.log("amms_adapter_error", { venue: a.venue, id: a.id, error: String(e?.message ?? e) });
-      }
-    }));
+    const slotNow = await conn.getSlot("processed").catch(() => undefined);
+    await Promise.allSettled(
+      adapters.map(async (a) => {
+        try {
+          const r = await a.reservesAtoms();
+          const payload = await snapshotToPayload(a, r);
+          if (slotNow != null) (payload as any).slot = slotNow; // 👈 add slot
+          writer.writeEnvelope("amms_price", payload);
+          if (payload.validation_passed) logger.log("amms_price", payload);
+        } catch (e: any) {
+          logger.log("amms_adapter_error", {
+            venue: a.venue,
+            id: a.id,
+            error: String(e?.message ?? e),
+          });
+        }
+      })
+    );
     const sleep = TICK_MS - (Date.now() - t0);
     if (sleep > 0) await new Promise((r) => setTimeout(r, sleep));
   }
 }
-main().catch((e) => console.log("amms_fatal", { err: String(e?.stack || e?.message || e) }));
+main().catch((e) =>
+  console.log("amms_fatal", { err: String(e?.stack || e?.message || e) })
+);

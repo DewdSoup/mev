@@ -1,0 +1,14 @@
+{
+    "name": "@mev/executor",
+    "version": "0.1.0",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "license": "UNLICENSED",
+    "private": true,
+    "scripts": {
+        "build": "tsc -b"
+    },
+    "dependencies": {
+        "@solana/web3.js": "^1.95.0"
+    }
+}

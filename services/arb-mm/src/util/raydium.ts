@@ -304,6 +304,54 @@ function cpmmExpectedOut({
   return numerator.div(denominator);
 }
 
+// ───────── add near other module-level helpers ─────────
+const _rayOnchainFeeBpsCache = new Map<string, { bps: number; ts: number }>();
+const FEE_TTL_MS = Math.max(
+  30_000,
+  Number(process.env.RAYDIUM_FEE_TTL_MS ?? 300_000)
+); // 5m default
+
+async function resolveRaydiumFeeBpsCached(
+  conn: Connection,
+  pool: LiquidityPoolKeys,
+  fallbackEnvBps: number
+): Promise<number> {
+  const key = (pool as any).id?.toBase58?.() ?? "unknown";
+  const now = Date.now();
+  const cached = _rayOnchainFeeBpsCache.get(key);
+  if (cached && now - cached.ts < FEE_TTL_MS && Number.isFinite(cached.bps)) {
+    return cached.bps;
+  }
+
+  let bps = fallbackEnvBps;
+  try {
+    const info = await Liquidity.fetchInfo({ connection: conn, poolKeys: pool });
+    const s: any = (info as any)?.state ?? (info as any) ?? {};
+    // Try common shapes
+    if (typeof s.tradeFeeRate === "number")
+      bps = Math.round(s.tradeFeeRate * 10_000);
+    else if (typeof s.swapFeeRate === "number")
+      bps = Math.round(s.swapFeeRate * 10_000);
+    else if (typeof s.feeRate === "number") bps = Math.round(s.feeRate);
+    else if (
+      typeof s.swapFeeNumerator === "number" &&
+      typeof s.swapFeeDenominator === "number" &&
+      s.swapFeeDenominator > 0
+    ) {
+      bps = Math.round(
+        (s.swapFeeNumerator / s.swapFeeDenominator) * 10_000
+      );
+    }
+  } catch {
+    // keep fallback
+  }
+
+  if (!Number.isFinite(bps) || bps <= 0) bps = fallbackEnvBps;
+  _rayOnchainFeeBpsCache.set(key, { bps, ts: now });
+  return bps;
+}
+
+// ───────── replace the whole computeMinOutBn() with this version ─────────
 async function computeMinOutBn(opts: {
   conn: Connection;
   pool: LiquidityPoolKeys;
@@ -317,9 +365,8 @@ async function computeMinOutBn(opts: {
   usedSlipBps: number;
 }> {
   const { conn, pool, baseIn, amountIn, slippageBps } = opts;
-  const feeBpsEnv = Number.parseFloat(
-    process.env.RAYDIUM_TRADE_FEE_BPS ?? "25"
-  );
+
+  // base slippage budget (adaptive buffers are handled here too)
   const dynamicExtra = Number.parseFloat(
     process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? "0"
   );
@@ -331,15 +378,24 @@ async function computeMinOutBn(opts: {
     : Number(process.env.AMM_MINOUT_BASE_BPS ?? 50);
   const usedSlip = Math.max(0, baseSlip + dynamicExtra + bufferBps);
 
+  // **NEW**: exact feeBps from chain (cached), fallback to env
+  const envFee = Number.parseFloat(process.env.RAYDIUM_TRADE_FEE_BPS ?? "25");
+  const feeBpsEnv = Number.isFinite(envFee) && envFee > 0 ? envFee : 25;
+  const usedFeeBps = await resolveRaydiumFeeBpsCached(conn, pool, feeBpsEnv);
+
   const { base, quote } = await getVaultReserves(conn, pool);
   const x = baseIn ? base : quote;
   const y = baseIn ? quote : base;
 
-  const expectedOut = cpmmExpectedOut({ dx: amountIn, x, y, feeBps: feeBpsEnv });
+  const expectedOut = cpmmExpectedOut({
+    dx: amountIn,
+    x,
+    y,
+    feeBps: usedFeeBps,
+  });
   const minOut = applyBpsDown(expectedOut, usedSlip);
 
   if (LOG_MINOUT) {
-    // eslint-disable-next-line no-console
     console.log("raydium_min_out", {
       pool: (pool as any).id?.toBase58?.() ?? "unknown",
       dir: baseIn ? "BASE->QUOTE" : "QUOTE->BASE",
@@ -347,16 +403,16 @@ async function computeMinOutBn(opts: {
       reserves: { base: base.toString(), quote: quote.toString() },
       expectedOut: expectedOut.toString(),
       minOut: minOut.toString(),
-      fee_bps: feeBpsEnv,
+      fee_bps: usedFeeBps,
       slip_bps: usedSlip,
-      note: "cpmm_reserves+env_fee",
+      note: "cpmm_reserves+onchain_fee",
     });
   }
 
   return {
     expectedOut,
     minOut,
-    usedFeeBps: feeBpsEnv,
+    usedFeeBps,
     usedSlipBps: usedSlip,
   };
 }
@@ -469,8 +525,9 @@ async function tryBuildSwapIxCompat(argsBase: any) {
   }
   return {
     ok: false as const,
-    reason: `raydium_swap_ix_build_failed: ${String((lastErr as any)?.message ?? lastErr)
-      }`,
+    reason: `raydium_swap_ix_build_failed: ${String(
+      (lastErr as any)?.message ?? lastErr
+    )}`,
   };
 }
 
