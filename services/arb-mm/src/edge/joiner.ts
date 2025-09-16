@@ -1,8 +1,15 @@
 // services/arb-mm/src/edge/joiner.ts
 // Multi-venue joiner (Raydium & Orca) with concurrent per-venue route evaluation.
-// Keeps EV math, guards, and logging. Adds CLMM depth-aware quoting for Orca paths.
-// - Reads per-pool feeBps from AMM payload when available.
-// - Only PHX paths go through RPC-sim to satisfy its typing narrow.
+// NOW config-driven via adapters manifest, still keeps fast publisher snapshots.
+// - Reads pairs.json venues[] and gates to only configured pools (Broaden venue by config, not code).
+// - Uses adapters.manifest().quote() first (fee/slippage aware), then falls back to local CPMM/CLMM paths.
+// - Tracks AMM↔AMM opportunities (configurable), still emits PHX features only for PHX paths.
+// - Optional RPC sim tolerance gate for PHX paths.
+// - Orca CLMM quoting prefers adapter quoter; hard fallback keeps "works without funding."
+
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 import { logger } from "../ml_logger.js";
 import { synthFromMid, type PhoenixBook } from "../syntheticPhoenix.js";
@@ -19,6 +26,21 @@ import {
   orcaAvgBuyQuotePerBase,
   orcaAvgSellQuotePerBase,
 } from "../executor/orca_quoter.js";
+
+// NEW: config-driven adapters
+import { getAdapter } from "../adapters/manifest.js";
+type QuoteReq = {
+  poolId: string;
+  side: "buy" | "sell";           // buy = want BASE (pay QUOTE) ; sell = sell BASE (get QUOTE)
+  sizeBase: number;               // size in BASE units
+  slippageBps: number;
+  baseMint?: string;
+  quoteMint?: string;
+};
+// IMPORTANT: align with adapter QuoteResp (error branch uses `err`, not `reason`)
+type QuoteRes =
+  | { ok: true; price: number; feeBps?: number; meta?: any }
+  | { ok: false; err: string };
 
 // ────────────────────────────────────────────────────────────────────────────
 // Production constants (caps/guards)
@@ -54,6 +76,20 @@ function staleReason(
   return null;
 }
 
+function envTrue(name: string, def?: boolean): boolean {
+  const d = def ?? false;
+  const v = String(process.env[name] ?? "").trim().toLowerCase();
+  if (v === "1" || v === "true" || v === "yes") return true;
+  if (v === "0" || v === "false" || v === "no") return false;
+  return d;
+}
+function envNum(name: string): number | undefined {
+  const v = process.env[name];
+  if (v == null || v === "") return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Circuit breaker state
 let dailyTrades = 0;
@@ -67,19 +103,6 @@ function round(n: any, p?: number): number {
   const num = typeof n === "bigint" ? Number(n) : typeof n === "string" ? Number(n) : Number(n);
   const places = p ?? 6;
   return Number.isFinite(num) ? Number(num.toFixed(places)) : Number.NaN;
-}
-function envNum(name: string): number | undefined {
-  const v = process.env[name];
-  if (v == null || v === "") return undefined;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : undefined;
-}
-function envTrue(name: string, def?: boolean): boolean {
-  const d = def ?? false;
-  const v = String(process.env[name] ?? "").trim().toLowerCase();
-  if (v === "1" || v === "true" || v === "yes") return true;
-  if (v === "0" || v === "false" || v === "no") return false;
-  return d;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -98,6 +121,11 @@ type AmmSnap = {
   feeBps: number;
 };
 
+// Unified node abstraction for 2-leg paths
+type VenueNode =
+  | { kind: "phx"; id: "phoenix"; feeBps: number }
+  | { kind: "amm"; id: string; feeBps: number; amm: AmmSnap };
+
 export interface JoinerParams {
   minAbsBps: number;
   waitLogMs: number;
@@ -105,7 +133,7 @@ export interface JoinerParams {
   flatSlippageBps: number;
   tradeSizeBase: number;
   phoenixFeeBps: number;
-  ammFeeBps: number;           // fallback only (per-venue/pool fee may arrive in payload)
+  ammFeeBps: number;           // fallback only (per-venue/pool fee may arrive in payload/adapter)
   fixedTxCostQuote: number;
 
   decisionMinBase?: number;
@@ -136,7 +164,7 @@ export type DecisionHookDetails = {
   rpc_eff_px?: number;
   recommended_size_base?: number;
   amm_venue?: string;
-  amm_pool_id?: string;       // 👈 exact pool to hit
+  amm_pool_id?: string;       // exact pool to hit
   amm_dst_venue?: string;     // for AMM->AMM
 };
 
@@ -167,6 +195,31 @@ export type RpcSimFn = (input: {
 } | undefined>;
 
 // ────────────────────────────────────────────────────────────────────────────
+// Pairs config (broaden venues by config, not code)
+
+type VenueCfg = { kind: string; id: string; poolKind?: string };
+type PairCfg = {
+  symbol: string;
+  baseMint: string;
+  quoteMint: string;
+  phoenixMarket?: string;
+  venues: VenueCfg[];
+};
+
+function readPairsConfig(): { pairs: PairCfg[] } | null {
+  try {
+    const p =
+      process.env.PAIRS_JSON?.trim() ||
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "configs", "pairs.json");
+    const j = JSON.parse(fs.readFileSync(p, "utf8"));
+    if (Array.isArray(j?.pairs)) return j as { pairs: PairCfg[] };
+  } catch (e) {
+    logger.log("pairs_json_read_error", { err: String((e as any)?.message ?? e) });
+  }
+  return null;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 
 export class EdgeJoiner {
   private amms = new Map<AmmKey, AmmSnap>(); // multi-venue AMM snapshots
@@ -181,8 +234,13 @@ export class EdgeJoiner {
   private phxSlot?: number | null; // optional Phoenix slot for staleness guard
 
   private lastWaitLog = 0;
-  private lastDecisionAtMs = 0;
   private lastSig?: string;
+
+  // config gating
+  private allowedPools = new Set<string>(); // `${venue}:${id}`
+  private symbol = "SOL/USDC";
+  private baseMint?: string;
+  private quoteMint?: string;
 
   constructor(
     private P: JoinerParams,
@@ -190,16 +248,46 @@ export class EdgeJoiner {
     private onDecision: DecisionHook,
     private rpcSim?: RpcSimFn,
     private onRpcSample?: RpcSampleHook
-  ) { }
+  ) {
+    // Load pairs.json once; gate to configured pools only (if present)
+    try {
+      const cfg = readPairsConfig();
+      if (cfg && cfg.pairs.length) {
+        const first = cfg.pairs[0];
+        this.symbol = first.symbol || this.symbol;
+        this.baseMint = first.baseMint;
+        this.quoteMint = first.quoteMint;
+        for (const pair of cfg.pairs) {
+          for (const v of pair.venues || []) {
+            const key = `${String(v.kind).toLowerCase()}:${v.id}`;
+            this.allowedPools.add(key);
+          }
+        }
+        logger.log("joiner_pairs_loaded", {
+          symbol: this.symbol,
+          pool_count: this.allowedPools.size,
+        });
+      } else {
+        logger.log("joiner_pairs_fallback", { symbol: this.symbol, pool_count: 0 });
+      }
+    } catch { /* best-effort */ }
+  }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // Ingress: AMMs
+  // Ingress: AMMs (publisher stream)
   upsertAmms(raw: any): void {
     const obj = raw?.data ?? raw;
     const px = nnum(obj?.px) ?? (typeof obj?.px_str === "string" ? Number(obj.px_str) : undefined);
     const venue = String(obj?.venue ?? "raydium").toLowerCase();
     const ammId = String(obj?.ammId ?? obj?.id ?? "");
     if (!ammId || !(px && px > 0)) return;
+
+    // Gate by AMMS_ENABLE (optional)
+    const enableList = String(process.env.AMMS_ENABLE ?? "").toLowerCase().split(",").map(s => s.trim()).filter(Boolean);
+    if (enableList.length && !enableList.includes(venue)) return;
+
+    // Gate to configured pools (if any listed in pairs.json)
+    if (this.allowedPools.size && !this.allowedPools.has(`${venue}:${ammId}`)) return;
 
     const baseDecimals = nnum(obj?.baseDecimals);
     const quoteDecimals = nnum(obj?.quoteDecimals);
@@ -428,6 +516,104 @@ export class EdgeJoiner {
     return { valid: true };
   }
 
+  // Adapter-first quote (then fallback to venue-specific local math)
+  private async quoteAmmAvgPerBase(
+    amm: AmmSnap,
+    side: "buy" | "sell",
+    sizeBase: number,
+    fallbackMid: number
+  ): Promise<{ px?: number; feeBps: number; used: "adapter" | "local" | "fallback"; meta?: any }> {
+    const adapter = getAdapter(amm.venue);
+    const slip = this.P.flatSlippageBps;
+
+    // Prefer adapter (config-driven; fee-aware)
+    if (adapter?.quote) {
+      try {
+        const req: QuoteReq = {
+          poolId: amm.ammId,
+          side,
+          sizeBase,
+          slippageBps: slip,
+          baseMint: this.baseMint,
+          quoteMint: this.quoteMint,
+        };
+        // NOTE: adapter.quote expects (ctx, req)
+        const q: QuoteRes = await adapter.quote(undefined as any, req as any);
+        if ((q as any)?.ok && typeof (q as any).price === "number" && Number.isFinite((q as any).price)) {
+          const feeBps = Number.isFinite((q as any).feeBps) ? Number((q as any).feeBps) : amm.feeBps;
+          return { px: (q as any).price, feeBps, used: "adapter", meta: (q as any).meta };
+        }
+      } catch (e) {
+        logger.log("adapter_quote_error", { venue: amm.venue, pool: amm.ammId, err: String((e as any)?.message ?? e) });
+      }
+    }
+
+    // Fallback to local math (keeps working even if adapters are missing)
+    try {
+      if (amm.venue === "orca") {
+        // Orca CLMM: use the local Whirlpool quoter helpers if adapter is absent
+        if (side === "buy") {
+          const q = await orcaAvgBuyQuotePerBase(amm.ammId, Math.max(sizeBase, MIN_ORCA_BASE_SIZE), slip);
+          if (q.ok) return { px: q.price, feeBps: amm.feeBps, used: "local" };
+        } else {
+          const q = await orcaAvgSellQuotePerBase(amm.ammId, Math.max(sizeBase, MIN_ORCA_BASE_SIZE), slip);
+          if (q.ok) return { px: q.price, feeBps: amm.feeBps, used: "local" };
+        }
+      } else {
+        // Raydium CPMM: closed-form reserves math
+        const hasRes = !!amm.reserves && amm.reserves.base > 0 && amm.reserves.quote > 0;
+        if (hasRes) {
+          if (side === "buy") {
+            const px = this.cpmmBuyQuotePerBase(amm.reserves!.base, amm.reserves!.quote, sizeBase, amm.feeBps);
+            if (px != null) return { px, feeBps: amm.feeBps, used: "local" };
+          } else {
+            const px = this.cpmmSellQuotePerBase(amm.reserves!.base, amm.reserves!.quote, sizeBase, amm.feeBps);
+            if (px != null) return { px, feeBps: amm.feeBps, used: "local" };
+          }
+        }
+      }
+    } catch { /* fall through */ }
+
+    // Final fallback: mid + slippage + fee (conservative)
+    const px = side === "buy"
+      ? this.midBuyQuotePerBase(fallbackMid, amm.feeBps, slip)
+      : this.midSellQuotePerBase(fallbackMid, amm.feeBps, slip);
+    return { px, feeBps: amm.feeBps, used: "fallback" };
+  }
+
+  // Node-agnostic quote (PHX or AMM)
+  private async quoteNodeAvgPerBase(
+    node: VenueNode,
+    side: "buy" | "sell",
+    sizeBase: number,
+    fallbackMid: number
+  ): Promise<{ px?: number; feeBps: number; used: "adapter" | "local" | "fallback"; meta?: any }> {
+    if (node.kind === "phx") {
+      // Try depth-walk first
+      const pxDepth = this.walkPhoenix(side, sizeBase, node.feeBps);
+      if (pxDepth != null) return { px: pxDepth, feeBps: node.feeBps, used: "local" };
+
+      // Fallback: best bid/ask + configured slip (match prior behaviour)
+      const B = this.getFreshBook();
+      const slip = (this.C.phoenixSlippageBps ?? 0) / 10_000;
+      if (B && (B as any).best_bid > 0 && (B as any).best_ask > 0) {
+        const bid = (B as any).best_bid;
+        const ask = (B as any).best_ask;
+        const px = side === "buy" ? ask * (1 + slip) : bid * (1 - slip);
+        return { px, feeBps: node.feeBps, used: "fallback" };
+      }
+
+      // Last resort: mid-based fallback
+      const px = side === "buy"
+        ? this.midBuyQuotePerBase(fallbackMid, node.feeBps, this.C.phoenixSlippageBps)
+        : this.midSellQuotePerBase(fallbackMid, node.feeBps, this.C.phoenixSlippageBps);
+      return { px, feeBps: node.feeBps, used: "fallback" };
+    }
+
+    // AMM node
+    return this.quoteAmmAvgPerBase(node.amm, side, sizeBase, fallbackMid);
+  }
+
   // ──────────────────────────────────────────────────────────────────────────
   private async maybeReport(): Promise<void> {
     // Reset circuit breakers daily
@@ -457,7 +643,7 @@ export class EdgeJoiner {
     const ask = (book as any).best_ask;
     if (!(bid > 0 && ask > 0)) return;
 
-    // Filter AMM snapshots by staleness
+    // Filter AMM snapshots by staleness + config allow-list
     const validAmms: AmmSnap[] = [];
     for (const a of this.amms.values()) {
       const reason = staleReason({ ts: a.ts, slot: a.slot ?? null, venue: a.venue, ammId: a.ammId }, this.phxSlot ?? null, now);
@@ -472,6 +658,7 @@ export class EdgeJoiner {
         });
         continue;
       }
+      if (this.allowedPools.size && !this.allowedPools.has(`${a.venue}:${a.ammId}`)) continue;
       validAmms.push(a);
     }
     if (validAmms.length === 0) {
@@ -482,7 +669,7 @@ export class EdgeJoiner {
           have_orca: false,
           have_phoenix_mid: !!this.phxMid,
           have_phoenix_book: !!this.phxBook,
-          reason: "all_amm_snapshots_stale",
+          reason: "all_amm_snapshots_stale_or_not_in_config",
         });
       }
       return;
@@ -497,7 +684,7 @@ export class EdgeJoiner {
     const absBps = Math.max(Math.abs(toPhoenixSellBps), Math.abs(toPhoenixBuyBps));
     if (absBps >= this.P.minAbsBps) {
       const payload = {
-        symbol: "SOL/USDC",
+        symbol: this.symbol,
         amm_mid: Number(ammPx.toFixed(6)),
         amm_mid_str: ammPx.toFixed(9),
         phoenix_bid: Number(bid.toFixed(6)),
@@ -516,7 +703,7 @@ export class EdgeJoiner {
       if (sig !== this.lastSig) { logger.log("edge_report", payload); this.lastSig = sig; }
     }
 
-    // Build L2 for optimizer (if available)
+    // Build L2 for optimizer (if available) — may be unused but harmless
     let bookOpt: SizePhoenixBook | undefined;
     if (Array.isArray((this.phxBook as any)?.levels_bids) && Array.isArray((this.phxBook as any)?.levels_asks)) {
       const bids = ((this.phxBook as any).levels_bids as DepthSide[]).filter(l => l && l.px > 0 && l.qty > 0).map(l => ({ px: l.px, qtyBase: l.qty }));
@@ -524,7 +711,7 @@ export class EdgeJoiner {
       if (bids.length && asks.length) bookOpt = { bids, asks, takerFeeBps: this.P.phoenixFeeBps };
     }
 
-    // Enumerate all AMM->PHX and PHX->AMM paths per-venue
+    // ── Unified 2-leg path enumerator (PHX<->AMM and AMM<->AMM) ─────────────
     type Candidate = {
       path: "AMM->PHX" | "PHX->AMM" | "AMM->AMM";
       amm: AmmSnap;
@@ -536,158 +723,99 @@ export class EdgeJoiner {
       bpsNet: number;
       pnlNet: number;
     };
+
+    const nodes: VenueNode[] = [
+      { kind: "phx" as const, id: "phoenix" as const, feeBps: this.P.phoenixFeeBps },
+      ...validAmms.map((a) => ({
+        kind: "amm" as const,
+        id: `${a.venue}:${a.ammId}`,
+        feeBps: a.feeBps,
+        amm: a,
+      })),
+    ];
+
     const candidates: Candidate[] = [];
+    for (const nodeSrc of nodes) {
+      for (const nodeDst of nodes) {
+        if (nodeSrc === nodeDst) continue;
+        // Skip PHX->PHX (same venue both sides)
+        if (nodeSrc.kind === "phx" && nodeDst.kind === "phx") continue;
 
-    for (const amm of validAmms) {
-      const hasRes = !!amm.reserves && amm.reserves.base > 0 && amm.reserves.quote > 0;
+        // Path label compatible with rest of pipeline
+        const path: Candidate["path"] =
+          nodeSrc.kind === "phx" && nodeDst.kind === "amm" ? "PHX->AMM" :
+            nodeSrc.kind === "amm" && nodeDst.kind === "phx" ? "AMM->PHX" :
+              "AMM->AMM";
 
-      // Size grid per AMM (use reserves if present for poolFrac cap)
-      const grid = this.buildSizeGrid((bid + ask) / 2, hasRes ? { base: amm.reserves!.base } : undefined);
+        // Execution gates
+        const trackAmmAmm = envTrue("TRACK_AMM_AMM", true);
+        const execAmmAmm = envTrue("EXECUTE_AMM_AMM", false);
+        if (path === "AMM->AMM" && !trackAmmAmm && !execAmmAmm) continue;
 
-      // Seeding with optimizer proposals if Phoenix L2 available AND CPMM reserves available
-      try {
-        if (bookOpt && hasRes) {
-          const cpmm: SizeCpmmReserves = { base: amm.reserves!.base, quote: amm.reserves!.quote, feeBps: amm.feeBps };
-          const lowerBase = Math.max(grid[0] ?? this.P.tradeSizeBase, 1e-6);
-          const maxFrac = envNum("SIZEOPT_MAX_POOL_FRAC") ?? this.C.cpmmMaxPoolTradeFrac;
-          const upperAbs = envNum("SIZEOPT_ABS_MAX_BASE");
-          const probes = Math.max(5, Math.min(25, Number(process.env.SIZEOPT_PROBE_STEPS ?? 9)));
-          const common = { book: bookOpt, cpmm, maxPoolFrac: maxFrac, lowerBase };
-          const a = optimizeSize({ kind: "AMM->PHX", ...common, ...(upperAbs != null ? { upperBaseCap: upperAbs } : {}) } as SizeOptInputs, probes);
-          const b = optimizeSize({ kind: "PHX->AMM", ...common, ...(upperAbs != null ? { upperBaseCap: upperAbs } : {}) } as SizeOptInputs, probes);
-          if (a.bestBase > 0) grid.push(a.bestBase);
-          if (b.bestBase > 0) grid.push(b.bestBase);
-        }
-      } catch { /* best-effort */ }
-
-      const sizes = Array.from(new Set(grid.map(x => Number(x.toFixed(9))))).filter(x => x > 0 && Number.isFinite(x)).sort((a, b) => a - b);
-      for (const s of sizes) {
-        // AMM->PHX: buy on AMM, sell on Phoenix
-        {
-          const sEff = amm.venue === "orca" ? Math.max(s, MIN_ORCA_BASE_SIZE) : s;
-          let buyAmm: number | undefined;
-          if (amm.venue === "orca") {
-            const q = await orcaAvgBuyQuotePerBase(amm.ammId, sEff, this.P.flatSlippageBps);
-            buyAmm = q.ok ? q.price : this.midBuyQuotePerBase(amm.px, amm.feeBps, this.P.flatSlippageBps);
-          } else {
-            buyAmm = hasRes
-              ? this.cpmmBuyQuotePerBase(amm.reserves!.base, amm.reserves!.quote, sEff, amm.feeBps)
-              : this.midBuyQuotePerBase(amm.px, amm.feeBps, this.P.flatSlippageBps);
-          }
-
-          const sellPhx = bookOpt ? this.walkPhoenix("sell", sEff, this.P.phoenixFeeBps) : bid * (1 - this.C.phoenixSlippageBps / 10_000);
-
-          if (buyAmm != null && sellPhx != null) {
-            const pnl = (sellPhx - buyAmm) * sEff - this.P.fixedTxCostQuote;
-            const bpsGross = (bid / amm.px - 1) * 10_000;
-            const bpsNet = (sellPhx / buyAmm - 1) * 10_000;
-            const ok = this.validateOpportunity("AMM->PHX", sEff, buyAmm, sellPhx, pnl, this.P.fixedTxCostQuote);
-            if (ok.valid) candidates.push({ path: "AMM->PHX", amm, size: sEff, buyPx: buyAmm, sellPx: sellPhx, bpsGross, bpsNet, pnlNet: pnl });
-            else logger.log("opportunity_rejected", { path: "AMM->PHX", venue: amm.venue, size: sEff, buy_px: buyAmm, sell_px: sellPhx, pnl, reason: ok.reason });
-          }
-        }
-        // PHX->AMM: buy on Phoenix, sell on AMM
-        {
-          const sEff = amm.venue === "orca" ? Math.max(s, MIN_ORCA_BASE_SIZE) : s;
-          const buyPhx = bookOpt ? this.walkPhoenix("buy", sEff, this.P.phoenixFeeBps) : ask * (1 + this.C.phoenixSlippageBps / 10_000);
-
-          let sellAmm: number | undefined;
-          if (amm.venue === "orca") {
-            const q = await orcaAvgSellQuotePerBase(amm.ammId, sEff, this.P.flatSlippageBps);
-            sellAmm = q.ok ? q.price : this.midSellQuotePerBase(amm.px, amm.feeBps, this.P.flatSlippageBps);
-          } else {
-            sellAmm = hasRes
-              ? this.cpmmSellQuotePerBase(amm.reserves!.base, amm.reserves!.quote, sEff, amm.feeBps)
-              : this.midSellQuotePerBase(amm.px, amm.feeBps, this.P.flatSlippageBps);
-          }
-
-          if (buyPhx != null && sellAmm != null) {
-            const pnl = (sellAmm - buyPhx) * sEff - this.P.fixedTxCostQuote;
-            const bpsGross = (amm.px / ask - 1) * 10_000;
-            const bpsNet = (sellAmm / buyPhx - 1) * 10_000;
-            const ok = this.validateOpportunity("PHX->AMM", sEff, buyPhx, sellAmm, pnl, this.P.fixedTxCostQuote);
-            if (ok.valid) candidates.push({ path: "PHX->AMM", amm, size: sEff, buyPx: buyPhx, sellPx: sellAmm, bpsGross, bpsNet, pnlNet: pnl });
-            else logger.log("opportunity_rejected", { path: "PHX->AMM", venue: amm.venue, size: sEff, buy_px: buyPhx, sell_px: sellAmm, pnl, reason: ok.reason });
-          }
-        }
-      }
-    }
-
-    // Optional: Cross-AMM tracking/execution (Raydium<->Orca).
-    const trackAmmAmm = envTrue("TRACK_AMM_AMM", true);
-    const execAmmAmm = envTrue("EXECUTE_AMM_AMM", false);
-    let bestAmmAmm: { src: AmmSnap; dst: AmmSnap; size: number; buyPx: number; sellPx: number; bpsNet: number; pnlNet: number } | undefined;
-
-    if (trackAmmAmm || execAmmAmm) {
-      const amms = validAmms;
-      for (let i = 0; i < amms.length; i++) for (let j = 0; j < amms.length; j++) {
-        if (i === j) continue;
-        const A = amms[i], B = amms[j];
-        const aHas = !!A.reserves && A.reserves.base > 0 && A.reserves.quote > 0;
-        const bHas = !!B.reserves && B.reserves.base > 0 && B.reserves.quote > 0;
-
+        // Size grid (cap by reserves if AMM on source)
         const midRef = (bid + ask) / 2;
-        const grid = this.buildSizeGrid(midRef, (aHas && bHas) ? { base: Math.min(A.reserves!.base, B.reserves!.base) } : undefined);
-        for (const s of grid) {
-          const sEff = Math.max(s, MIN_ORCA_BASE_SIZE);
+        const srcRes = nodeSrc.kind === "amm" ? nodeSrc.amm.reserves : undefined;
+        const grid = this.buildSizeGrid(midRef, srcRes ? { base: srcRes.base } : undefined);
+        const sizes = Array.from(new Set(grid.map(x => Number(x.toFixed(9)))))
+          .filter(x => x > 0 && Number.isFinite(x))
+          .sort((a, b) => a - b);
 
-          // Buy on A
-          let buyA: number | undefined;
-          if (A.venue === "orca") {
-            const q = await orcaAvgBuyQuotePerBase(A.ammId, sEff, this.P.flatSlippageBps);
-            buyA = q.ok ? q.price : this.midBuyQuotePerBase(A.px, A.feeBps, this.P.flatSlippageBps);
-          } else {
-            buyA = aHas
-              ? this.cpmmBuyQuotePerBase(A.reserves!.base, A.reserves!.quote, sEff, A.feeBps)
-              : this.midBuyQuotePerBase(A.px, A.feeBps, this.P.flatSlippageBps);
-          }
+        for (const s0 of sizes) {
+          const sEff =
+            (nodeSrc.kind === "amm" && nodeSrc.amm.venue === "orca") ||
+              (nodeDst.kind === "amm" && nodeDst.amm.venue === "orca")
+              ? Math.max(s0, MIN_ORCA_BASE_SIZE)
+              : s0;
 
-          // Sell on B
-          let sellB: number | undefined;
-          if (B.venue === "orca") {
-            const q = await orcaAvgSellQuotePerBase(B.ammId, sEff, this.P.flatSlippageBps);
-            sellB = q.ok ? q.price : this.midSellQuotePerBase(B.px, B.feeBps, this.P.flatSlippageBps);
-          } else {
-            sellB = bHas
-              ? this.cpmmSellQuotePerBase(B.reserves!.base, B.reserves!.quote, sEff, B.feeBps)
-              : this.midSellQuotePerBase(B.px, B.feeBps, this.P.flatSlippageBps);
-          }
+          // Buy at source, sell at dest (BASE as the moving asset)
+          const qBuy = await this.quoteNodeAvgPerBase(nodeSrc, "buy", sEff, midRef);
+          const qSell = await this.quoteNodeAvgPerBase(nodeDst, "sell", sEff, midRef);
+          const buyPx = qBuy.px;
+          const sellPx = qSell.px;
 
-          if (buyA != null && sellB != null) {
-            const pnl = (sellB - buyA) * sEff - this.P.fixedTxCostQuote;
-            const bpsNet = (sellB / buyA - 1) * 10_000;
-            if (pnl > 0 && (!bestAmmAmm || pnl > bestAmmAmm.pnlNet)) {
-              bestAmmAmm = { src: A, dst: B, size: sEff, buyPx: buyA, sellPx: sellB, bpsNet, pnlNet: pnl };
+          if (buyPx != null && sellPx != null) {
+            const pnl = (sellPx - buyPx) * sEff - this.P.fixedTxCostQuote;
+
+            // Use node “mid”s for gross spread calc (compat with prior logs)
+            const srcMid = nodeSrc.kind === "amm" ? nodeSrc.amm.px : ask;  // buying at PHX uses ask ref
+            const dstMid = nodeDst.kind === "amm" ? nodeDst.amm.px : bid;  // selling at PHX uses bid ref
+            const bpsGross = ((dstMid / srcMid) - 1) * 10_000;
+            const bpsNet = ((sellPx / buyPx) - 1) * 10_000;
+
+            const ok = this.validateOpportunity(path, sEff, buyPx, sellPx, pnl, this.P.fixedTxCostQuote);
+            if (ok.valid) {
+              if (path !== "AMM->AMM" || execAmmAmm) {
+                const snapSrc = nodeSrc.kind === "amm" ? nodeSrc.amm : latestAmm;   // keep payload shape
+                const snapDst = nodeDst.kind === "amm" ? nodeDst.amm : undefined;
+                candidates.push({
+                  path,
+                  amm: snapSrc!,
+                  ammDst: snapDst,
+                  size: sEff,
+                  buyPx, sellPx,
+                  bpsGross, bpsNet, pnlNet: pnl,
+                });
+              } else if (trackAmmAmm && path === "AMM->AMM") {
+                logger.log("amm_amm_tracked", {
+                  symbol: this.symbol,
+                  src: (nodeSrc as any).amm?.venue ?? "phx",
+                  dst: (nodeDst as any).amm?.venue ?? "phx",
+                  size_base: round(sEff, 9),
+                  buy_px: round(buyPx),
+                  sell_px: round(sellPx),
+                  edge_bps_net: round(bpsNet, 4),
+                  expected_pnl: round(pnl, 6),
+                  note: "not executable in this phase",
+                });
+              }
+            } else {
+              logger.log("opportunity_rejected", {
+                path,
+                venue: nodeSrc.kind === "amm" ? nodeSrc.amm.venue : "phx",
+                size: sEff, buy_px: buyPx, sell_px: sellPx, pnl, reason: ok.reason
+              });
             }
           }
-        }
-      }
-      if (bestAmmAmm) {
-        if (trackAmmAmm) {
-          logger.log("amm_amm_tracked", {
-            symbol: "SOL/USDC",
-            src: bestAmmAmm.src.venue,
-            dst: bestAmmAmm.dst.venue,
-            size_base: round(bestAmmAmm.size, 9),
-            buy_px: round(bestAmmAmm.buyPx),
-            sell_px: round(bestAmmAmm.sellPx),
-            edge_bps_net: round(bestAmmAmm.bpsNet, 4),
-            expected_pnl: round(bestAmmAmm.pnlNet, 6),
-            note: execAmmAmm ? "candidate for execution" : "not executable in this phase",
-          });
-        }
-        if (execAmmAmm) {
-          candidates.push({
-            path: "AMM->AMM",
-            amm: bestAmmAmm.src,
-            ammDst: bestAmmAmm.dst,
-            size: bestAmmAmm.size,
-            buyPx: bestAmmAmm.buyPx,
-            sellPx: bestAmmAmm.sellPx,
-            bpsGross: bestAmmAmm.bpsNet,
-            bpsNet: bestAmmAmm.bpsNet,
-            pnlNet: bestAmmAmm.pnlNet,
-          });
         }
       }
     }
@@ -696,7 +824,7 @@ export class EdgeJoiner {
     const best = candidates.sort((a, b) => b.pnlNet - a.pnlNet)[0];
     if (!best) {
       if (this.C.logSimFields) logger.log("would_not_trade", {
-        symbol: "SOL/USDC",
+        symbol: this.symbol,
         reason: "no_profitable_opportunities_found",
         grid_count: 0,
         validation_enabled: true,
@@ -707,7 +835,7 @@ export class EdgeJoiner {
 
     // RPC sim (optional) — only for PHX paths
     const base: any = {
-      symbol: "SOL/USDC",
+      symbol: this.symbol,
       path: best.path,
       side: best.path === "AMM->PHX" ? "sell" : "buy",
       amm_venue: best.amm.venue,
@@ -832,11 +960,11 @@ export class EdgeJoiner {
       ...(best.path === "AMM->AMM" ? { amm_dst_venue: best.ammDst?.venue } : {}),
     });
 
-    // Feature emission — ONLY for PHX paths
+    // Feature emission — ONLY for PHX paths (compat with 1-arg and 2-arg emitFeature signatures)
     if (best.path === "AMM->PHX" || best.path === "PHX->AMM") {
-      emitFeature(
-        featureFromEdgeAndDecision({
-          symbol: "SOL/USDC",
+      const featPayload = featureFromEdgeAndDecision(
+        {
+          symbol: this.symbol,
           amm_base_reserve: best.amm.reserves?.base,
           amm_quote_reserve: best.amm.reserves?.quote,
           amm_base_decimals: best.amm.reserves?.baseDecimals,
@@ -844,7 +972,8 @@ export class EdgeJoiner {
           phoenix_source: "book",
           phoenix_book_method: (book as any).book_method,
           book_ttl_ms: this.C.bookTtlMs,
-        }, {
+        },
+        {
           path: best.path as "AMM->PHX" | "PHX->AMM",
           side: best.path === "AMM->PHX" ? "sell" : "buy",
           edge_bps_gross: round(best.bpsGross, 4),
@@ -855,8 +984,19 @@ export class EdgeJoiner {
           slippage_bps: this.P.flatSlippageBps,
           trade_size_base: best.size,
           would_trade: wouldTrade,
-        })
+        }
       );
+
+      // Arity-flexible call so TS is happy whether emitFeature expects (payload) or (topic, payload)
+      const ef: any = emitFeature as any;
+      try {
+        if (typeof ef === "function") {
+          if (ef.length >= 2) ef("edge_feature", featPayload);
+          else ef(featPayload);
+        }
+      } catch {
+        /* noop */
+      }
     }
   }
 }

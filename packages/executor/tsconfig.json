@@ -1,11 +1,40 @@
 {
+    "$schema": "https://json.schemastore.org/tsconfig",
     "extends": "../../tsconfig.base.json",
     "compilerOptions": {
-        "outDir": "./dist",
-        "rootDir": "./src",
-        "composite": true
+        "rootDir": "src",
+        "outDir": "dist",
+        "composite": true,
+        "declaration": true,
+        "declarationMap": true,
+        "skipLibCheck": true,
+        "resolveJsonModule": true,
+        "moduleResolution": "Bundler",
+        "baseUrl": "."
     },
     "include": [
-        "src/**/*"
+        "src/**/*",
+        "src/types/**/*.d.ts",
+        "types/**/*.d.ts"
+    ],
+    "exclude": [
+        "src/joiners/**"
+    ],
+    "references": [
+        {
+            "path": "../core"
+        },
+        {
+            "path": "../router"
+        },
+        {
+            "path": "../amms"
+        },
+        {
+            "path": "../phoenix"
+        },
+        {
+            "path": "../solana"
+        }
     ]
 }

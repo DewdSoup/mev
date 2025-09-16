@@ -1,3 +1,9 @@
+// packages/executor/src/joiners/single_tx.ts (ONLY if you really need it compiled)
+import { PublicKey, ComputeBudgetProgram } from "@solana/web3.js";
+import type { AmmAdapter } from "@mev/amms";           // ensure @mev/amms re-exports this
+import type { PhoenixCtx } from "@mev/router";         // ensure @mev/router re-exports this
+import { quoteLeg, buildLegIxs } from "../wherever/they/are"; // point to the real module
+
 type Leg =
     | { kind: 'amm', venue: AmmAdapter, side: 'buy' | 'sell', baseSize: number }
     | { kind: 'phoenix', market: PhoenixCtx, side: 'buy' | 'sell', baseSize: number };

@@ -1,11 +1,12 @@
 // services/arb-mm/src/executor/live.ts
-// (full file with RPC backoff integrated)
+// (full file with RPC backoff + tx simulation + send gate integrated)
 
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import {
   Connection, PublicKey, TransactionInstruction, Keypair,
+  VersionedTransaction, TransactionMessage,
 } from "@solana/web3.js";
 import { LIQUIDITY_STATE_LAYOUT_V4 } from "@raydium-io/raydium-sdk";
 import { logger } from "../ml_logger.js";
@@ -16,7 +17,9 @@ import { toIxArray, assertIxArray } from "../util/ix.js";
 import { submitAtomic, buildPreIxs } from "../tx/submit.js";
 import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
-import { withRpcBackoff } from "../util/rpc_backoff.js"; // <- NEW
+import { withRpcBackoff } from "../util/rpc_backoff.js";
+import { rpcSimFn as rpcSimTx } from "../tx/rpcSim.js";            // <- NEW
+import { canActuallySendNow } from "../tx/sendGate.js";           // <- NEW
 
 const __filename = fileURLToPath(import.meta.url);
 const __here = path.dirname(__filename);
@@ -27,13 +30,11 @@ const SLIPPAGE_BPS = Number(process.env.MAX_SLIPPAGE_BPS || "50");
 const DEFAULT_RAYDIUM_POOL_ID = (
   process.env.RAYDIUM_POOL_ID ||
   process.env.RAYDIUM_POOL_ID_SOL_USDC ||
-  // Raydium SOL/USDC
   "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
 ).trim();
 
 const DEFAULT_ORCA_POOL_ID = (
   process.env.ORCA_POOL_ID ||
-  // Orca SOL/USDC Whirlpool
   "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ"
 ).trim();
 
@@ -57,10 +58,6 @@ export type AtomicPath = "PHX->AMM" | "AMM->PHX";
 function uiToAtoms(ui: number, decimals: number): bigint { return BigInt(Math.floor(ui * 10 ** decimals)); }
 function applyBpsDownBig(x: bigint, bps: number): bigint {
   const BPS = 10_000n; const b = BigInt(Math.max(0, Math.min(10_000, Math.ceil(bps)))); return (x * (BPS - b)) / BPS;
-}
-function cpmmExpectedOutBig(args: { dx: bigint; x: bigint; y: bigint; feeBps: number }): bigint {
-  const dxLessFee = applyBpsDownBig(args.dx, args.feeBps);
-  return (dxLessFee * args.y) / (args.x + dxLessFee);
 }
 
 type PoolMeta = { baseMint: PublicKey; quoteMint: PublicKey; baseVault?: PublicKey; quoteVault?: PublicKey };
@@ -92,7 +89,6 @@ async function ensureRaydiumPoolMeta(conn: Connection, poolId: PublicKey): Promi
     if (p) {
       const j = JSON.parse(fs.readFileSync(p, "utf8"));
       if (j?.id) {
-        const id = new PublicKey(j.id);
         const meta: PoolMeta = {
           baseMint: new PublicKey(j.baseMint),
           quoteMint: new PublicKey(j.quoteMint),
@@ -156,7 +152,6 @@ async function getUiBalances(conn: Connection, owner: PublicKey) {
 
 export class LiveExecutor {
   constructor(private connRaw: Connection, private payer: Keypair) {
-    // wrap the connection with backoff+concurrency-limiter immediately
     try {
       const maxConc = Number(process.env.RPC_BACKOFF_MAX_CONCURRENCY ?? 6);
       const maxRetries = Number(process.env.RPC_BACKOFF_MAX_RETRIES ?? 5);
@@ -164,13 +159,11 @@ export class LiveExecutor {
     } catch (err) {
       const e = err as any;
       logger.log("rpc_backoff_wrap_error", { err: String(e?.message ?? e) });
-      // fallback to the raw connection if wrapper fails
       // @ts-ignore
       this.conn = this.connRaw;
     }
   }
 
-  // the wrapped connection used by executor methods
   private conn: Connection;
 
   async startPhoenix(): Promise<void> { /* no-op */ }
@@ -251,8 +244,7 @@ export class LiveExecutor {
       let orcaIxs: TransactionInstruction[] = [];
 
       if (ammVenue === "raydium") {
-        // Build Raydium CPMM
-        const poolIdStr = poolFromPayload || DEFAULT_RAYDIUM_POOL_ID;     // 👈 NEW
+        const poolIdStr = poolFromPayload || DEFAULT_RAYDIUM_POOL_ID;
         const poolId = new PublicKey(poolIdStr);
         const meta = await ensureRaydiumPoolMeta(this.conn, poolId);
 
@@ -264,7 +256,6 @@ export class LiveExecutor {
           amountInAtoms = uiToAtoms(quoteInUi, 6);
         }
 
-        // compute minOut with conservative slippage buffer
         const dynExtra = Number.parseFloat(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? "0");
         const bufferBps = Number.parseFloat(process.env.RAYDIUM_MINOUT_BUFFER_BPS ?? "0");
         const usedSlip = Math.max(0, SLIPPAGE_BPS + dynExtra + bufferBps);
@@ -272,7 +263,6 @@ export class LiveExecutor {
         const inMint: PublicKey = baseIn ? meta.baseMint : meta.quoteMint;
         const outMint: PublicKey = baseIn ? meta.quoteMint : meta.baseMint;
 
-        // Simple minOut from reference price (we already guarded EV higher up)
         const refPx = Number(baseIn ? (payload?.sell_px ?? payload?.buy_px) : (payload?.buy_px ?? payload?.sell_px)) || 0;
         if (!(refPx > 0)) { logger.log("submit_error", { where: "raydium_build", error: "no_ref_px" }); return; }
 
@@ -307,17 +297,14 @@ export class LiveExecutor {
         }
         assertIxArray(rayIxs, "raydium");
       } else {
-        // Build Orca Whirlpool swap
-        const whirlpoolId = new PublicKey(poolFromPayload || DEFAULT_ORCA_POOL_ID); // 👈 NEW
-        const WSOL = new PublicKey(process.env.WSOL_MINT ?? "So11111111111111111111111111111111111111112");
-        const USDC = new PublicKey(process.env.USDC_MINT ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+        const whirlpoolId = new PublicKey(poolFromPayload || DEFAULT_ORCA_POOL_ID);
 
         const px = Number(baseIn ? payload?.sell_px : payload?.buy_px) || 0;
         if (!(px > 0)) { logger.log("submit_error", { where: "orca_build", error: "no_ref_px" }); return; }
 
         const amountInAtoms = baseIn
-          ? uiToAtoms(sizeBase, 9)        // BASE in (WSOL)
-          : uiToAtoms(sizeBase * px, 6);  // QUOTE in (USDC)
+          ? uiToAtoms(sizeBase, 9)
+          : uiToAtoms(sizeBase * px, 6);
 
         try {
           const orcaResult = await buildOrcaWhirlpoolSwapIx({
@@ -353,21 +340,52 @@ export class LiveExecutor {
         ...pre
       });
 
+      // --------- BUILD ATOMIC (for simulation) ----------
+      const preIxs = buildPreIxs(CU_LIMIT, CU_PRICE);
+      const ammIxs = ammVenue === "raydium" ? rayIxs : orcaIxs;
+      const ixs = [...preIxs, ...phxIxs, ...ammIxs];
+
+      const latest = await this.conn.getLatestBlockhash("processed");
+      const msg = new TransactionMessage({
+        payerKey: this.payer.publicKey,
+        recentBlockhash: latest.blockhash,
+        instructions: ixs,
+      }).compileToV0Message();
+      const tx = new VersionedTransaction(msg);
+      tx.sign([this.payer]);
+
+      // --------- RPC SIM ----------
+      const sim = await rpcSimTx(this.conn, tx, { sigVerify: true, commitment: "processed" });
+      logger.log("rpc_sim", {
+        ok: sim.ok,
+        units: sim.unitsConsumed,
+        logs_tail: sim.logs?.slice?.(-6),
+        err: sim.err,
+      });
+
+      // Send gate: block when unfunded or sim-only mode on
+      const gate = await canActuallySendNow(this.conn, { env: process.env, owner: this.payer.publicKey });
+      if (!gate) {
+        logger.log("send_gate_off", { reason: "sim_only_or_unfunded", sim_ok: sim.ok, err: sim.err });
+        return;
+      }
+
+      if (!sim.ok) {
+        logger.log("submit_error", { where: "rpc_sim", error: sim.err ?? "simulation_failed" });
+        return;
+      }
+
       // --------- SUBMIT ----------
       const only = process.env.ONLY_PHX ? "phx" : (process.env.ONLY_RAY ? "ray" : undefined);
-      const preIxs = buildPreIxs(CU_LIMIT, CU_PRICE);
-
-      const ammIxs = ammVenue === "raydium" ? rayIxs : orcaIxs;
       const total = preIxs.length + phxIxs.length + ammIxs.length;
       logger.log("submit_ixs", { label: "atomic", phx: phxIxs.length, amm: ammIxs.length, total });
 
-      // submitAtomic will use the same wrapped connection (this.conn)
       const sig = await submitAtomic({
         connection: this.conn,
         owner: this.payer,
         preIxs,
         phxIxs,
-        rayIxs: ammIxs, // Pass all AMM instructions here regardless of venue
+        rayIxs: ammIxs, // pass AMM ixs regardless of venue
         only: only as any,
       });
 
@@ -388,7 +406,6 @@ export class LiveExecutor {
       };
       logger.log("post_tx_balances", { sig, slot, conf_ms, ...post, ...realized });
 
-      // Summary
       logger.log("realized_summary", {
         sig, path: atomicPath, ammVenue, size_base: sizeBase,
         buy_px, sell_px,
@@ -403,4 +420,3 @@ export class LiveExecutor {
     }
   }
 }
-

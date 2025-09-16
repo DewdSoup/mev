@@ -1,9 +1,9 @@
 import { Connection, Keypair, PublicKey, VersionedTransaction, AddressLookupTableAccount } from '@solana/web3.js';
-import { env } from '../../core/src/env';
+import { env } from '../../core/dist/env.js';
 import { canActuallySendNow } from './funding';
 import { simulateAtomicTx } from './rpcSim';
 import { buildAtomicVtx } from './joiner.single_tx';
-import type { Path, PathQuote } from '../../router/src/types';
+import type { Path, PathQuote } from '../../router/dist/types.js';
 
 // assume you already have a way to build quotes; wire it here
 export async function tryExecutePath(

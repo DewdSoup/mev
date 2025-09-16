@@ -1,11 +1,12 @@
 // services/arb-mm/src/main.ts
-// Live arbitrage runner (Raydium <-> Phoenix) with dynamic size advisory.
+// Live arbitrage runner (Raydium/Orca <-> Phoenix) with dynamic size advisory, RPC-sim awareness, and config-driven venues.
 //
 // This baseline:
 // - Loads ONLY `.env.live` (no .env fallbacks) before anything else.
 // - Forces live trading: LIVE_TRADING=1, SHADOW_TRADING=0.
 // - Uses d.recommended_size_base from joiner (when present) as the execution size.
-// - Passes actual AMM fee into joiner so EV includes Raydium fee exactly once.
+// - Passes actual AMM fee into joiner so EV includes taker fees exactly once.
+// - Executor handles tx-level RPC simulation + send-gate; joiner can run without sim.
 // - **NO AUTO-STOP**: runs indefinitely until SIGINT/SIGTERM. There is no "run for N minutes" logic.
 
 import fs from "fs";
@@ -511,7 +512,8 @@ async function main() {
     shadow_trading: SHADOW,
   });
 
-  // Until a real sim is provided, keep this strictly undefined (even if USE_RPC_SIM=1)
+  // Joiner does not need tx-level rpcSim: executor handles full TX sim + gate.
+  // Keep undefined here to avoid mismatched signatures.
   const rpcSimFn: RpcSimFn | undefined = undefined;
 
   const mkShadowSig = () =>
@@ -600,14 +602,14 @@ async function main() {
 
     const notional = coalesceRound(6, execSize * ((d.buy_px + d.sell_px) / 2));
 
-    // 👇 NEW: honor joiner’s venue/pool & optional EXEC_AMM_VENUE override
+    // 👇 Honor joiner’s venue/pool & optional EXEC_AMM_VENUE override
     const forcing = String(process.env.EXEC_AMM_VENUE ?? "").trim().toLowerCase();
     const venueFromJoiner = (d.amm_venue ?? "").toLowerCase();
     const ammVenue = (forcing === "raydium" || forcing === "orca")
       ? forcing
       : (venueFromJoiner === "raydium" || venueFromJoiner === "orca" ? venueFromJoiner : "raydium");
 
-    // Pick poolId by venue: use from joiner when available (especially for Orca), else env
+    // Pick poolId by venue: use from joiner when available (esp. for Orca), else env
     const rayPoolEnv = (process.env.RAYDIUM_POOL_ID ?? process.env.RAYDIUM_POOL_ID_SOL_USDC ?? "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2").trim();
     const orcaPoolEnv = (process.env.ORCA_POOL_ID ?? "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ").trim();
     const poolIdForVenue = ammVenue === "raydium" ? rayPoolEnv : (d.amm_pool_id ?? orcaPoolEnv);
@@ -623,14 +625,16 @@ async function main() {
         side: d.side as "buy" | "sell",
         limit_px: d.side === "buy" ? d.buy_px : d.sell_px,
       },
-      amm_venue: ammVenue,           // 👈 NEW
-      amm: { pool: poolIdForVenue }, // 👈 NEW
+      amm_venue: ammVenue,               // 👈 carry venue choice
+      amm_pool_id: poolIdForVenue,       // 👈 explicit pool id (executor checks this first)
+      amm: { pool: poolIdForVenue },     // 👈 backward-compat payload
+      amm_meta: (d as any).amm_meta,     // 👈 pass-through meta if joiner provided it
       atomic: true,
     };
 
     console.log(
       `EXEC (EV>0) ${payload.path} base=${roundN(payload.size_base, 6)} ` +
-      `notional≈${roundN(notional, 4)} mid=${roundN(LAST_PHX_MID ?? 0, 3)}`
+      `notional≈${roundN(notional, 4)} mid=${roundN(LAST_PHX_MID ?? 0, 3)} venue=${ammVenue}`
     );
 
     // Live-only execution
@@ -677,13 +681,13 @@ async function main() {
       enforceDedupe: CFG.ENFORCE_DEDUPE,
       decisionBucketMs: CFG.DECISION_BUCKET_MS,
       decisionMinEdgeDeltaBps: CFG.DECISION_MIN_EDGE_DELTA_BPS,
-      useRpcSim: CFG.USE_RPC_SIM,
+      useRpcSim: CFG.USE_RPC_SIM, // executor will actually simulate the tx
 
       // 👇 mirrored here too, in case your joiner reads it from the “options” bag
       decisionMinBase: CFG.DECISION_MIN_BASE,
     },
     onDecision,
-    rpcSimFn,
+    rpcSimFn,       // keep undefined; tx-level sim is executed in the executor
     onRpcSample
   );
 

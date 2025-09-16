@@ -1,5 +1,5 @@
 import { Connection, VersionedTransaction, Commitment } from '@solana/web3.js';
-import { env } from '../../core/src/env';
+import { env } from '../../core/dist/env.js';
 
 export type SimResult = {
     ok: boolean;

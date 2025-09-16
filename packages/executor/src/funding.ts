@@ -1,5 +1,5 @@
 import { Connection, PublicKey } from '@solana/web3.js';
-import { env } from '../../core/src/env';
+import { env } from '../../core/dist/env.js';
 
 export async function canActuallySendNow(conn: Connection, wallet: PublicKey, usdcAta: PublicKey): Promise<boolean> {
     if (env.SEND_WITHOUT_FUNDS) return true;

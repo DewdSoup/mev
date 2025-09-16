@@ -1,37 +1,36 @@
-import type { Connection, PublicKey, TransactionInstruction, AddressLookupTableAccount } from '@solana/web3.js';
+// services/arb-mm/src/adapters/types.ts
+// Canonical adapter interfaces for quoting and building swap ix.
 
-export type VenueKind = 'raydium' | 'orca' | 'phoenix';
-export type PoolKind = 'cpmm' | 'clmm' | 'orderbook';
+import type { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 
-export type Direction = 'baseToQuote' | 'quoteToBase';
+export type Direction = "baseToQuote" | "quoteToBase";
 
 export type QuoteReq = {
-    inBase: number;         // size in BASE units (UI)
-    direction: Direction;
-    slippageBps: number;
-    poolId: string;
-    baseMint: string;
-    quoteMint: string;
+    poolId: string;              // concrete pool/whirlpool id
+    inBase: number;              // input size in BASE units (ui)
+    direction: Direction;        // flow of the leg
+    slippageBps: number;         // caller's slippage target
+    baseMint?: string;           // optional hints
+    quoteMint?: string;
 };
 
-export type QuoteRes = {
-    ok: boolean;
-    outQuote?: number;      // UI
-    feeBps?: number;
-    minOut?: number;        // UI (after slippage/fee buffer)
-    reason?: string;
-    // opaque details adapter may pass to builder:
-    meta?: Record<string, any>;
-};
-
-export type BuildIxRes = {
-    ixs: TransactionInstruction[];
-    alts?: AddressLookupTableAccount[];
-};
+export type QuoteResp =
+    | { ok: true; price: number; feeBps?: number; minOut?: number; meta?: any }
+    | { ok: false; err: string };
 
 export interface AmmAdapter {
-    kind: VenueKind;
-    supports(poolKind?: PoolKind): boolean;
-    quote(conn: Connection, req: QuoteReq): Promise<QuoteRes>;
-    buildSwapIxs(conn: Connection, req: QuoteReq, meta?: any): Promise<BuildIxRes>;
+    kind: string;
+
+    // Return an *average* QUOTE-per-BASE effective price for the req.
+    // (Optional) feeBps/minOut/meta may be supplied if the venue/quoter can provide them.
+    quote(conn: Connection, req: QuoteReq): Promise<QuoteResp>;
+
+    // Build swap Ixs for the req (direction=inBase units). `userB58` is the payer.
+    // Implementations should throw on failure; callers handle and log.
+    buildSwapIxs(
+        conn: Connection,
+        userB58: string,
+        req: QuoteReq,
+        meta?: any
+    ): Promise<TransactionInstruction[]>;
 }

@@ -1,4 +1,4 @@
-import { AmmAdapter, QuoteResult, Side } from '../../amms/src/adapters/base';
+import { AmmAdapter, QuoteResult, Side } from '../../amms/dist/adapters/base';
 
 export type Leg =
     | { kind: 'amm', adapter: AmmAdapter, side: Side, baseSize: number, maxSlippageBps: number }

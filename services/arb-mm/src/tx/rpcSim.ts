@@ -1,45 +1,46 @@
 // services/arb-mm/src/tx/rpcSim.ts
-import {
-    Connection,
-    VersionedTransaction,
-    TransactionMessage,
-    PublicKey,
-} from '@solana/web3.js';
+// RPC simulation for fully-built VersionedTransactions.
+// Returns CU usage, logs, and error (if any).
 
-export type RpcSimResult = {
+import { Connection, VersionedTransaction } from "@solana/web3.js";
+
+export type RpcTxSimResult = {
     ok: boolean;
     err?: string;
-    logs?: string[];
     unitsConsumed?: number;
+    logs?: string[];
+    returnData?: { programId: string; data: string } | null;
 };
 
-export async function rpcSimFn(
+export async function rpcSimTx(
     conn: Connection,
-    tx: VersionedTransaction
-): Promise<RpcSimResult> {
-    // IMPORTANT: we do NOT require signatures/funding to simulate
-    // - use current blockhash
-    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('processed');
-    (tx.message as any).recentBlockhash = blockhash;
+    tx: VersionedTransaction,
+    opts?: { commitment?: "processed" | "confirmed" | "finalized"; sigVerify?: boolean }
+): Promise<RpcTxSimResult> {
+    try {
+        const commitment = opts?.commitment ?? "processed";
+        const sigVerify = opts?.sigVerify ?? true;
+        const res = await conn.simulateTransaction(tx, { commitment, sigVerify });
 
-    // Empty signatures, disable sigVerify => wallet can be unfunded
-    const res = await conn.simulateTransaction(tx, {
-        sigVerify: false,
-        commitment: 'processed',
-        replaceRecentBlockhash: true,
-    });
+        const value: any = res?.value ?? {};
+        const ok = !value?.err;
+        const err = value?.err ? (typeof value.err === "string" ? value.err : JSON.stringify(value.err)) : undefined;
+        const unitsConsumed = Number(value?.unitsConsumed ?? undefined);
+        const logs = Array.isArray(value?.logs) ? value.logs : undefined;
 
-    if (res.value.err) {
-        return {
-            ok: false,
-            err: JSON.stringify(res.value.err),
-            logs: res.value.logs ?? [],
-            unitsConsumed: res.value.unitsConsumed,
-        };
+        let returnData: RpcTxSimResult["returnData"] = null;
+        if (value?.returnData?.data && value?.returnData?.programId) {
+            returnData = {
+                programId: String(value.returnData.programId),
+                data: Array.isArray(value.returnData.data) ? value.returnData.data.join(",") : String(value.returnData.data),
+            };
+        }
+
+        return { ok, err, unitsConsumed: Number.isFinite(unitsConsumed) ? unitsConsumed : undefined, logs, returnData };
+    } catch (e: any) {
+        return { ok: false, err: String(e?.message ?? e) };
     }
-    return {
-        ok: true,
-        logs: res.value.logs ?? [],
-        unitsConsumed: res.value.unitsConsumed,
-    };
 }
+
+// Named export used by executor per earlier wiring note
+export const rpcSimFn = rpcSimTx;

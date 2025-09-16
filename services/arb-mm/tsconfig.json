@@ -5,18 +5,24 @@
     "rootDir": "src",
     "outDir": "dist",
     "composite": true,
+    "incremental": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
     "types": [
       "node"
     ],
     "typeRoots": [
       "../../node_modules/@types"
-    ],
-    "skipLibCheck": true,
-    "resolveJsonModule": true,
-    "moduleResolution": "Bundler"
+    ]
   },
   "include": [
-    "src",
+    "src/**/*",
     "src/types/**/*.d.ts",
     "types/**/*.d.ts"
   ],
