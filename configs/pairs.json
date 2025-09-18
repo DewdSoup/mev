@@ -13,12 +13,26 @@
                 {
                     "kind": "raydium",
                     "id": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
-                    "poolKind": "cpmm"
+                    "poolKind": "cpmm",
+                    "feeBps": 25
                 },
                 {
                     "kind": "orca",
                     "id": "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ",
-                    "poolKind": "clmm"
+                    "poolKind": "clmm",
+                    "feeBps": 30
+                },
+                {
+                    "kind": "orca",
+                    "id": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
+                    "poolKind": "clmm",
+                    "feeBps": 4
+                },
+                {
+                    "kind": "raydium",
+                    "id": "2QdhepnKRTLjjSqPL1PtKNwqrUkoLee5Gqs8bvZhRdMv",
+                    "poolKind": "clmm",
+                    "feeBps": 5
                 }
             ]
         }

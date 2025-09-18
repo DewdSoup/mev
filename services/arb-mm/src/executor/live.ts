@@ -11,6 +11,7 @@ import {
 import { LIQUIDITY_STATE_LAYOUT_V4 } from "@raydium-io/raydium-sdk";
 import { logger } from "../ml_logger.js";
 import { buildRaydiumCpmmSwapIx } from "./buildRaydiumCpmmIx.js";
+import { buildRaydiumClmmSwapIx } from "./buildRaydiumClmmIx.js";
 import { buildOrcaWhirlpoolSwapIx } from "./buildOrcaWhirlpoolIx.js";
 import { buildPhoenixSwapIxs } from "../util/phoenix.js";
 import { toIxArray, assertIxArray } from "../util/ix.js";
@@ -173,6 +174,9 @@ export class LiveExecutor {
       const atomicPath = (payload?.path as AtomicPath) || "PHX->AMM";
       const ammVenue = String(payload?.amm_venue ?? payload?.ammVenue ?? "raydium").toLowerCase() as "raydium" | "orca";
       const poolFromPayload = String(payload?.amm?.pool ?? "").trim();
+      const poolKind = String(payload?.amm_meta?.poolKind ?? payload?.amm_pool_kind ?? "")
+        .trim()
+        .toLowerCase();
       let sizeBase = Number(payload?.size_base ?? payload?.trade_size_base ?? 0);
       const phoenix = payload?.phoenix || {};
       const buy_px = Number(payload?.buy_px ?? 0);
@@ -243,7 +247,39 @@ export class LiveExecutor {
       let rayIxs: TransactionInstruction[] = [];
       let orcaIxs: TransactionInstruction[] = [];
 
-      if (ammVenue === "raydium") {
+      if (ammVenue === "raydium" && poolKind === "clmm") {
+        const clmmPoolId = poolFromPayload || getenv("RAYDIUM_CLMM_POOL_ID");
+        if (!clmmPoolId) {
+          logger.log("submit_error", { where: "raydium_clmm_build", error: "missing_pool_id" });
+          return;
+        }
+
+        const refPx = Number(baseIn ? payload?.sell_px : payload?.buy_px) || 0;
+        if (!(refPx > 0)) { logger.log("submit_error", { where: "raydium_clmm_build", error: "no_ref_px" }); return; }
+
+        const amountInAtoms = baseIn
+          ? uiToAtoms(sizeBase, 9)
+          : uiToAtoms(sizeBase * refPx, 6);
+
+        const expectedOutAtoms = baseIn
+          ? uiToAtoms(sizeBase * refPx, 6)
+          : uiToAtoms(sizeBase, 9);
+
+        const clmm = await buildRaydiumClmmSwapIx({
+          connection: this.conn,
+          user: this.payer.publicKey,
+          poolId: clmmPoolId,
+          baseIn,
+          amountInAtoms,
+          expectedOutAtoms,
+          slippageBps: SLIPPAGE_BPS,
+        });
+
+        if (!clmm.ok) { logger.log("submit_error", { where: "raydium_clmm_build", error: clmm.reason }); return; }
+        rayIxs = clmm.ixs;
+        assertIxArray(rayIxs, "raydium_clmm");
+        logger.log("raydium_clmm_build_ok", { ixs: rayIxs.length, pool: clmmPoolId });
+      } else if (ammVenue === "raydium") {
         const poolIdStr = poolFromPayload || DEFAULT_RAYDIUM_POOL_ID;
         const poolId = new PublicKey(poolIdStr);
         const meta = await ensureRaydiumPoolMeta(this.conn, poolId);

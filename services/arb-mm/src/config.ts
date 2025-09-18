@@ -14,6 +14,7 @@ export type SlipMode = "flat" | "amm_cpmm" | "adaptive";
 const __filename: string = fileURLToPath(import.meta.url);
 const __dirname: string = path.dirname(__filename);
 const SVC_ROOT: string = path.resolve(__dirname, "..");
+const DEFAULT_DATA_DIR: string = path.resolve(SVC_ROOT, "..", "..", "data", "arb");
 
 // Load .env.live with highest precedence, then .env
 function loadRootEnv(): void {
@@ -251,8 +252,8 @@ export function stamp(): string {
 }
 
 export function loadConfig(): AppConfig {
-  const AMMS_JSONL: string = firstExistingPathOrDefault(process.env.EDGE_AMMS_JSONL ?? "packages/amms/logs/runtime.jsonl");
-  const PHOENIX_JSONL: string = firstExistingPathOrDefault(process.env.EDGE_PHOENIX_JSONL ?? "packages/phoenix/logs/runtime.jsonl");
+  const AMMS_JSONL: string = firstExistingPathOrDefault(process.env.EDGE_AMMS_JSONL ?? "data/amms/runtime.jsonl");
+  const PHOENIX_JSONL: string = firstExistingPathOrDefault(process.env.EDGE_PHOENIX_JSONL ?? "data/phoenix/runtime.jsonl");
 
   const EDGE_MIN_ABS_BPS: number = parseFloatEnv(process.env.EDGE_MIN_ABS_BPS, 0);
   const EDGE_WAIT_LOG_MS: number = parseMsEnv(process.env.EDGE_WAIT_LOG_MS, 5000, 100, 60000);
@@ -265,7 +266,7 @@ export function loadConfig(): AppConfig {
   const DATA_ENV: string | undefined = DATA_ENV_RAW?.trim();
   const DATA_DIR: string = DATA_ENV
     ? (path.isAbsolute(DATA_ENV) ? DATA_ENV : path.resolve(SVC_ROOT, DATA_ENV))
-    : path.resolve(SVC_ROOT, "data");
+    : DEFAULT_DATA_DIR;
   const PARAMS_DIR: string = path.join(DATA_DIR, "params");
   const AUTO_APPLY_PARAMS: boolean = parseBoolEnv(process.env.AUTO_APPLY_PARAMS, false);
 

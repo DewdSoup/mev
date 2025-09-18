@@ -10,8 +10,13 @@ type RuntimeLine = { t?: string; event?: string; data?: any };
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const SRC = path.resolve(__dirname, "../logs/runtime.jsonl");
-const OUT_DIR = path.resolve(__dirname, "../data/ml");
+const SRC = (() => {
+  const hinted = process.env.LOG_FILE?.trim();
+  if (hinted) return path.resolve(process.cwd(), hinted);
+  return path.resolve(__dirname, "../../data/arb/logs/arb-runtime.log");
+})();
+
+const OUT_DIR = path.resolve(__dirname, "../../data/arb/ml");
 
 function dayStr(ts: number) {
   const d = new Date(ts);

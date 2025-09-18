@@ -6,16 +6,24 @@
  * - Falls back to `would_not_trade` if `would_not` missing.
  * - Computes win_rate if both would_trade and would_not_trade exist.
  * - Counts yesterday's feature rows.
- * - Writes services/arb-mm/data/reports/<YYYY-MM-DD>.md
+ * - Writes data/arb/reports/<YYYY-MM-DD>.md
  */
 import fs from "fs";
 import path from "path";
 
-const repoRoot = process.cwd();
-const dataDir = process.env.DATA_DIR?.trim() || "services/arb-mm/data";
-const featuresDir = path.join(repoRoot, dataDir, "features", "sol_usdc", "v1");
-const replayDir = path.join(repoRoot, dataDir, "replay");
-const reportsDir = path.join(repoRoot, dataDir, "reports");
+const cwd = process.cwd();
+const repoRoot = cwd.includes(`${path.sep}services${path.sep}arb-mm`)
+  ? path.resolve(cwd, "..")
+  : cwd;
+
+const dataEnv = process.env.DATA_DIR?.trim();
+const dataDir = dataEnv
+  ? (path.isAbsolute(dataEnv) ? dataEnv : path.join(repoRoot, dataEnv))
+  : path.join(repoRoot, "data", "arb");
+
+const featuresDir = path.join(dataDir, "features", "sol_usdc", "v1");
+const replayDir = path.join(dataDir, "replay");
+const reportsDir = path.join(dataDir, "reports");
 
 function ensureDir(p: string) { fs.mkdirSync(p, { recursive: true }); }
 function ydayUtcStart(): Date { const d = new Date(); d.setUTCDate(d.getUTCDate()-1); d.setUTCHours(0,0,0,0); return d; }

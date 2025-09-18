@@ -15,7 +15,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const ROOT = path.resolve(__dirname, "..");
-const DATA = path.join(ROOT, "data");
+const REPO_ROOT = path.resolve(ROOT, "..");
+const dataEnv = process.env.DATA_DIR?.trim();
+const DATA = dataEnv
+  ? (path.isAbsolute(dataEnv) ? dataEnv : path.join(REPO_ROOT, dataEnv))
+  : path.join(REPO_ROOT, "data", "arb");
 const REPLAY_DIR = path.join(DATA, "replay");
 const REPORTS_DIR = path.join(DATA, "reports");
 const PARAMS_DIR = path.join(DATA, "params");

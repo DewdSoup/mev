@@ -321,7 +321,7 @@ function writeLiveSummarySync(CFG: any, mlEventsFile?: string) {
   try {
     const LIVE_DIR = path.join(CFG.DATA_DIR, "live");
     ensureDir(LIVE_DIR);
-    const file = path.join(LIVE_DIR, `${stampLocal()}.summary.json`);
+    const file = path.join(LIVE_DIR, `arb-summary-${stampLocal()}.json`);
     const summary: any = {
       file,
       started_at: runStartedAt.toISOString(),
@@ -817,7 +817,7 @@ main().catch(async (e) => {
     const CFG = loadConfig();
     const LIVE_DIR = path.join(CFG.DATA_DIR, "live");
     if (!fs.existsSync(LIVE_DIR)) fs.mkdirSync(LIVE_DIR, { recursive: true });
-    const file = path.join(LIVE_DIR, `${stampLocal()}.summary.json`);
+    const file = path.join(LIVE_DIR, `arb-summary-${stampLocal()}.json`);
     fs.writeFileSync(file, JSON.stringify({ error: String(e) }, null, 2));
   } catch { }
 });

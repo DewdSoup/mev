@@ -1,6 +1,11 @@
 // services/arb-mm/src/executor/buildOrcaWhirlpoolIx.ts
 import {
-    Connection, PublicKey, TransactionInstruction, Transaction, VersionedTransaction, Keypair,
+    Connection,
+    PublicKey,
+    TransactionInstruction,
+    Transaction,
+    VersionedTransaction,
+    Keypair,
 } from "@solana/web3.js";
 import { AnchorProvider } from "@coral-xyz/anchor";
 import BN from "bn.js";
@@ -37,23 +42,27 @@ export async function buildOrcaWhirlpoolSwapIx(params: {
         const ctx = WhirlpoolContext.withProvider(provider, programId);
         const client = buildWhirlpoolClient(ctx);
 
-        const whirlpool = await client.getPool(new PublicKey(params.poolId));
+        const poolPk = new PublicKey(params.poolId);
+        const whirlpool = await client.getPool(poolPk);
         if (!whirlpool) return { ok: false, reason: "whirlpool_not_found" };
 
         const wpData = whirlpool.getData();
-        const ataA = await getAssociatedTokenAddress(wpData.tokenMintA, wallet.publicKey, false, TOKEN_PROGRAM_ID);
-        const ataB = await getAssociatedTokenAddress(wpData.tokenMintB, wallet.publicKey, false, TOKEN_PROGRAM_ID);
+        const tokenMintA = new PublicKey(wpData.tokenMintA);
+        const tokenMintB = new PublicKey(wpData.tokenMintB);
 
-        const inputTokenType = params.baseIn ? "TokenA" : "TokenB";
+        const ataA = await getAssociatedTokenAddress(tokenMintA, wallet.publicKey, false, TOKEN_PROGRAM_ID);
+        const ataB = await getAssociatedTokenAddress(tokenMintB, wallet.publicKey, false, TOKEN_PROGRAM_ID);
+
+        const inputMint = params.baseIn ? tokenMintA : tokenMintB;
         const amountBN = new BN(params.amountInAtoms.toString());
         const slippagePercentage = Percentage.fromFraction(params.slippageBps, 10_000);
 
         const quote = await swapQuoteByInputToken(
             whirlpool,
-            inputTokenType as any,
+            inputMint,
             amountBN,
             slippagePercentage,
-            wallet.publicKey,
+            programId,
             ctx.fetcher,
             {}
         );

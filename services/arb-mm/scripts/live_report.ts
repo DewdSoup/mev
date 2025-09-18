@@ -10,15 +10,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const SVC_ROOT = path.resolve(__dirname, "..");
-const PRIMARY = path.join(SVC_ROOT, "data", "live");
-const ALT = path.join(SVC_ROOT, "services", "arb-mm", "data", "live"); // legacy nested
+const PRIMARY = path.join(SVC_ROOT, "..", "data", "arb", "live");
+const ALT = path.join(SVC_ROOT, "data", "live"); // legacy nested
 
 function listSummaries(dir: string): string[] {
   try {
     if (!fs.existsSync(dir)) return [];
     return fs
       .readdirSync(dir)
-      .filter((f) => f.endsWith(".summary.json"))
+      .filter((f) => f.endsWith(".summary.json") || (f.startsWith("arb-summary-") && f.endsWith(".json")))
       .map((f) => path.join(dir, f));
   } catch {
     return [];

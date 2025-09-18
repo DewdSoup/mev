@@ -1,7 +1,8 @@
 // packages/amms/src/adapters/types.ts
 import type { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 
-export type AmmVenue = "raydium" | "orca" | "lifinity" | "meteora" | string;
+export type AmmVenue = "raydium" | "raydium_clmm" | "orca" | (string & {}); // allow future venues
+export type PoolKind = "cpmm" | "clmm" | "hybrid";
 
 export type ReserveSnapshot = {
     /** raw atom balances (BigInt) */
@@ -21,11 +22,14 @@ export interface AmmAdapter {
     /** e.g. "SOL/USDC" */
     symbol: string;
 
-    /** e.g. "raydium" | "orca" */
+    /** e.g. "raydium" | "raydium_clmm" | "orca" */
     venue: AmmVenue;
 
     /** pool id (pubkey string) */
     id: string;
+
+    /** optional: lets the publisher label cpmm/clmm/hybrid */
+    poolKind?: PoolKind;
 
     /** Optional one-time initializer */
     init?(conn: Connection): Promise<void>;

@@ -12,7 +12,7 @@ function readLastN(file: string, n = 40): string[] {
   return lines.slice(-n);
 }
 
-function newestFile(dir: string, prefix = "", ext = ".summary.json"): string | null {
+function newestFile(dir: string, prefix = "", ext = ".json"): string | null {
   if (!fs.existsSync(dir)) return null;
   const files = fs.readdirSync(dir)
     .filter(f => f.startsWith(prefix) && f.endsWith(ext))
@@ -25,14 +25,18 @@ function getenv(k: string, d?: string) {
   return process.env[k] ?? d ?? "";
 }
 
-const ROOT = process.cwd();
-const AMMS_LOG = getenv("EDGE_AMMS_JSONL") || path.join(ROOT, "packages/amms/logs/runtime.jsonl");
-const PHX_LOG  = getenv("EDGE_PHOENIX_JSONL") || path.join(ROOT, "packages/phoenix/logs/runtime.jsonl");
-const ARB_LIVE_DIR = path.join(ROOT, "services/arb-mm/data/live");
-const HANDOFF_DIR  = path.join(ROOT, "services/arb-mm/data/handoff");
+const cwd = process.cwd();
+const repoRoot = cwd.includes(`${path.sep}services${path.sep}arb-mm`)
+  ? path.resolve(cwd, "..")
+  : cwd;
+
+const AMMS_LOG = getenv("EDGE_AMMS_JSONL") || path.join(repoRoot, "data", "amms", "runtime.jsonl");
+const PHX_LOG  = getenv("EDGE_PHOENIX_JSONL") || path.join(repoRoot, "data", "phoenix", "runtime.jsonl");
+const ARB_LIVE_DIR = path.join(repoRoot, "data", "arb", "live");
+const HANDOFF_DIR  = path.join(repoRoot, "data", "arb", "handoff");
 fs.mkdirSync(HANDOFF_DIR, { recursive: true });
 
-const latestSummaryPath = newestFile(ARB_LIVE_DIR, "", ".summary.json");
+const latestSummaryPath = newestFile(ARB_LIVE_DIR, "arb-summary-", ".json");
 let summary: any = null;
 if (latestSummaryPath && fs.existsSync(latestSummaryPath)) {
   try { summary = JSON.parse(fs.readFileSync(latestSummaryPath, "utf8")); } catch {}

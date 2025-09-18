@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -u
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-PHX_DIR="$ROOT/services/arb-mm/data/reports/phoenix"
-LIVE_DIR="$ROOT/services/arb-mm/data/live"
+PHX_DIR="$ROOT/data/phoenix"
+LIVE_DIR="$ROOT/data/arb/live"
 
-PHX_LAST="$(ls -1t "$PHX_DIR"/runtime*.jsonl 2>/dev/null | head -1 || true)"
-LAST_EVENTS="$(ls -1t "$LIVE_DIR"/*.events.jsonl 2>/dev/null | head -1 || true)"
+PHX_LAST=$(ls -1t "$PHX_DIR"/runtime*.jsonl 2>/dev/null | head -1 || true)
+LAST_EVENTS=$(ls -1t "$LIVE_DIR"/arb-events-*.jsonl 2>/dev/null | head -1 || true)
 
 echo "== WS STATUS =="
 if [[ -n "${PHX_LAST}" ]]; then

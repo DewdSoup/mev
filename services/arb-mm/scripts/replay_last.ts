@@ -9,13 +9,13 @@ import { spawnSync } from "child_process";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const LIVE_DIR = path.resolve(__dirname, "..", "data", "live");
+const LIVE_DIR = path.resolve(__dirname, "..", "..", "data", "arb", "live");
 
 function latestSummary(): string | undefined {
   try {
     const files = fs
       .readdirSync(LIVE_DIR)
-      .filter((f) => f.endsWith(".summary.json"))
+      .filter((f) => f.endsWith(".summary.json") || (f.startsWith("arb-summary-") && f.endsWith(".json")))
       .map((f) => path.join(LIVE_DIR, f));
     if (!files.length) return;
     files.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
@@ -27,7 +27,7 @@ function latestSummary(): string | undefined {
 
 const latest = latestSummary();
 if (!latest) {
-  console.error("replay_last: no live summaries found in data/live/");
+  console.error("replay_last: no live summaries found in data/arb/live/");
   process.exit(1);
 }
 

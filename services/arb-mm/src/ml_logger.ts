@@ -4,6 +4,7 @@
 
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import { logger as base } from "@mev/storage";
 import { writeMlEvent } from "./ml_events.js";
 
@@ -12,16 +13,26 @@ function stamp() {
   return new Date().toISOString().replace(/[:.]/g, "").replace("Z", "Z");
 }
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
+
 const SESSION_ID =
   (process.env.SESSION_ID?.trim() || `sess_${stamp()}`) as string;
 const SESSION_LOGS_ENABLE = getBool("SESSION_LOGS_ENABLE", true);
-const SESSION_LOGS_DIR =
-  process.env.SESSION_LOGS_DIR?.trim() || "services/arb-mm/data/sessions";
-const SESSION_FILE = path.resolve(
-  process.cwd(),
-  SESSION_LOGS_DIR,
-  `${SESSION_ID}.events.jsonl`,
-);
+
+const dataHint = process.env.ARB_DATA_DIR?.trim();
+const defaultDataDir = path.join(REPO_ROOT, "data", "arb");
+const resolvedDataDir = dataHint
+  ? (path.isAbsolute(dataHint) ? dataHint : path.resolve(REPO_ROOT, dataHint))
+  : defaultDataDir;
+
+const sessionDirHint = process.env.SESSION_LOGS_DIR?.trim();
+const SESSION_LOGS_DIR = sessionDirHint
+  ? (path.isAbsolute(sessionDirHint) ? sessionDirHint : path.resolve(REPO_ROOT, sessionDirHint))
+  : path.join(resolvedDataDir, "sessions");
+
+const SESSION_FILE = path.join(SESSION_LOGS_DIR, `${SESSION_ID}.events.jsonl`);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // small io helpers

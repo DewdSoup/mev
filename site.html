@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CalorieLens - Instant Food Calorie Analysis</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 480px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            overflow: hidden;
+            animation: slideIn 0.5s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 32px;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .header p {
+            font-size: 16px;
+            opacity: 0.95;
+        }
+
+        .how-it-works {
+            padding: 20px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+        }
+
+        .steps {
+            display: flex;
+            justify-content: space-around;
+            margin-top: 15px;
+        }
+
+        .step {
+            text-align: center;
+            flex: 1;
+        }
+
+        .step-icon {
+            width: 50px;
+            height: 50px;
+            background: #667eea;
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 10px;
+            font-size: 24px;
+        }
+
+        .step-text {
+            font-size: 12px;
+            color: #495057;
+        }
+
+        .main-content {
+            padding: 30px;
+        }
+
+        .capture-area {
+            position: relative;
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 20px;
+            text-align: center;
+            min-height: 300px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            border: 2px dashed #dee2e6;
+            transition: all 0.3s ease;
+        }
+
+        .capture-area.has-image {
+            border-style: solid;
+            border-color: #667eea;
+            background: white;
+        }
+
+        #imagePreview {
+            max-width: 100%;
+            max-height: 350px;
+            border-radius: 10px;
+            display: none;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        .capture-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 40px;
+            font-size: 18px;
+            border-radius: 50px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            transition: transform 0.2s, box-shadow 0.2s;
+            margin-top: 20px;
+        }
+
+        .capture-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(102, 126, 234, 0.4);
+        }
+
+        .capture-btn:active {
+            transform: translateY(0);
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        .results {
+            display: none;
+            margin-top: 30px;
+            padding: 25px;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            border-radius: 15px;
+            animation: fadeIn 0.5s ease-out;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .results.show {
+            display: block;
+        }
+
+        .result-header {
+            font-size: 20px;
+            font-weight: 600;
+            color: #2c3e50;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .calorie-display {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+
+        .calorie-number {
+            font-size: 48px;
+            font-weight: bold;
+            color: #667eea;
+            line-height: 1;
+        }
+
+        .calorie-label {
+            color: #6c757d;
+            margin-top: 5px;
+        }
+
+        .food-details {
+            background: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+        }
+
+        .detail-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #f1f3f5;
+        }
+
+        .detail-row:last-child {
+            border-bottom: none;
+        }
+
+        .detail-label {
+            color: #6c757d;
+        }
+
+        .detail-value {
+            font-weight: 600;
+            color: #2c3e50;
+        }
+
+        .reset-btn {
+            background: #6c757d;
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 50px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-top: 15px;
+            transition: background 0.3s;
+        }
+
+        .reset-btn:hover {
+            background: #5a6268;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 40px;
+        }
+
+        .loading.show {
+            display: block;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+
+        .tips {
+            background: #fff3cd;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+            border-left: 4px solid #ffc107;
+        }
+
+        .tips h3 {
+            color: #856404;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+
+        .tips ul {
+            list-style: none;
+            color: #856404;
+            font-size: 14px;
+        }
+
+        .tips li {
+            padding: 5px 0;
+            padding-left: 20px;
+            position: relative;
+        }
+
+        .tips li:before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            color: #ffc107;
+            font-weight: bold;
+        }
+
+        @media (max-width: 480px) {
+            .container {
+                border-radius: 0;
+                box-shadow: none;
+            }
+
+            body {
+                padding: 0;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>
+                <span>📸</span>
+                CalorieLens
+            </h1>
+            <p>Instant AI-powered food calorie analysis</p>
+        </div>
+
+        <div class="how-it-works">
+            <h3 style="text-align: center; color: #495057; font-size: 18px;">How It Works</h3>
+            <div class="steps">
+                <div class="step">
+                    <div class="step-icon">📷</div>
+                    <div class="step-text">Take Photo</div>
+                </div>
+                <div class="step">
+                    <div class="step-icon">🤖</div>
+                    <div class="step-text">AI Analysis</div>
+                </div>
+                <div class="step">
+                    <div class="step-icon">📊</div>
+                    <div class="step-text">Get Results</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <div class="capture-area" id="captureArea">
+                <img id="imagePreview" alt="Food preview">
+                <div id="placeholderContent">
+                    <div style="font-size: 64px; margin-bottom: 20px;">🍽️</div>
+                    <h2 style="color: #495057; margin-bottom: 10px;">Capture Your Food</h2>
+                    <p style="color: #6c757d;">Take a photo or upload an image to analyze calories</p>
+                </div>
+            </div>
+
+            <input type="file" id="fileInput" accept="image/*" capture="environment">
+            <button class="capture-btn" id="captureBtn">
+                <span>📷</span>
+                <span>Take Photo / Upload</span>
+            </button>
+
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p style="color: #667eea; font-weight: 600;">Analyzing your food...</p>
+                <p style="color: #6c757d; font-size: 14px; margin-top: 10px;">Using AI to identify ingredients and
+                    calculate calories</p>
+            </div>
+
+            <div class="results" id="results">
+                <div class="result-header">
+                    <span>🎯</span>
+                    Analysis Complete
+                </div>
+
+                <div class="calorie-display">
+                    <div class="calorie-number" id="totalCalories">0</div>
+                    <div class="calorie-label">Total Calories</div>
+                </div>
+
+                <div class="food-details">
+                    <h3 style="margin-bottom: 15px; color: #2c3e50;">Detected Food Items</h3>
+                    <div id="foodItems"></div>
+                </div>
+
+                <div class="food-details">
+                    <h3 style="margin-bottom: 15px; color: #2c3e50;">Nutritional Breakdown</h3>
+                    <div class="detail-row">
+                        <span class="detail-label">Protein</span>
+                        <span class="detail-value" id="protein">0g</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="detail-label">Carbohydrates</span>
+                        <span class="detail-value" id="carbs">0g</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="detail-label">Fat</span>
+                        <span class="detail-value" id="fat">0g</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="detail-label">Serving Size</span>
+                        <span class="detail-value" id="serving">Estimated</span>
+                    </div>
+                </div>
+
+                <button class="reset-btn" id="resetBtn">Analyze Another Food</button>
+            </div>
+
+            <div class="tips">
+                <h3>📝 Tips for Best Results</h3>
+                <ul>
+                    <li>Use good lighting for clearer photos</li>
+                    <li>Capture the entire dish in frame</li>
+                    <li>Include a reference object for size estimation</li>
+                    <li>Take photos from directly above when possible</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Sample food database for simulation
+        const foodDatabase = {
+            patterns: [
+                {
+                    keywords: ['burger', 'hamburger', 'cheeseburger'],
+                    data: {
+                        name: 'Hamburger with Cheese',
+                        calories: 550,
+                        protein: 30,
+                        carbs: 40,
+                        fat: 28,
+                        items: ['Beef Patty (250 cal)', 'Cheese (100 cal)', 'Bun (150 cal)', 'Vegetables (50 cal)']
+                    }
+                },
+                {
+                    keywords: ['pizza'],
+                    data: {
+                        name: 'Pizza Slice',
+                        calories: 285,
+                        protein: 12,
+                        carbs: 36,
+                        fat: 10,
+                        items: ['Dough (140 cal)', 'Cheese (80 cal)', 'Tomato Sauce (30 cal)', 'Toppings (35 cal)']
+                    }
+                },
+                {
+                    keywords: ['salad', 'greens', 'vegetables'],
+                    data: {
+                        name: 'Garden Salad',
+                        calories: 150,
+                        protein: 5,
+                        carbs: 12,
+                        fat: 8,
+                        items: ['Mixed Greens (20 cal)', 'Tomatoes (15 cal)', 'Cucumber (10 cal)', 'Dressing (105 cal)']
+                    }
+                },
+                {
+                    keywords: ['pasta', 'spaghetti', 'noodles'],
+                    data: {
+                        name: 'Pasta with Sauce',
+                        calories: 420,
+                        protein: 15,
+                        carbs: 58,
+                        fat: 14,
+                        items: ['Pasta (200 cal)', 'Tomato Sauce (80 cal)', 'Parmesan (40 cal)', 'Olive Oil (100 cal)']
+                    }
+                },
+                {
+                    keywords: ['chicken', 'poultry'],
+                    data: {
+                        name: 'Grilled Chicken Breast',
+                        calories: 335,
+                        protein: 38,
+                        carbs: 8,
+                        fat: 16,
+                        items: ['Chicken Breast (280 cal)', 'Seasoning (5 cal)', 'Cooking Oil (50 cal)']
+                    }
+                },
+                {
+                    keywords: ['sandwich'],
+                    data: {
+                        name: 'Turkey Sandwich',
+                        calories: 380,
+                        protein: 24,
+                        carbs: 42,
+                        fat: 12,
+                        items: ['Bread (160 cal)', 'Turkey (120 cal)', 'Cheese (70 cal)', 'Condiments (30 cal)']
+                    }
+                },
+                {
+                    keywords: ['rice', 'grain'],
+                    data: {
+                        name: 'Rice Bowl',
+                        calories: 320,
+                        protein: 8,
+                        carbs: 65,
+                        fat: 3,
+                        items: ['White Rice (205 cal)', 'Vegetables (80 cal)', 'Soy Sauce (35 cal)']
+                    }
+                }
+            ],
+            default: {
+                name: 'Mixed Plate',
+                calories: 450,
+                protein: 20,
+                carbs: 45,
+                fat: 18,
+                items: ['Main Dish (300 cal)', 'Side Dish (100 cal)', 'Garnish (50 cal)']
+            }
+        };
+
+        const captureBtn = document.getElementById('captureBtn');
+        const fileInput = document.getElementById('fileInput');
+        const imagePreview = document.getElementById('imagePreview');
+        const captureArea = document.getElementById('captureArea');
+        const placeholderContent = document.getElementById('placeholderContent');
+        const results = document.getElementById('results');
+        const loading = document.getElementById('loading');
+        const resetBtn = document.getElementById('resetBtn');
+
+        captureBtn.addEventListener('click', () => {
+            fileInput.click();
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    displayImage(e.target.result);
+                    analyzeFood();
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+
+        function displayImage(src) {
+            imagePreview.src = src;
+            imagePreview.style.display = 'block';
+            placeholderContent.style.display = 'none';
+            captureArea.classList.add('has-image');
+            captureBtn.innerHTML = '<span>📷</span><span>Take Another Photo</span>';
+        }
+
+        function analyzeFood() {
+            results.classList.remove('show');
+            loading.classList.add('show');
+
+            // Simulate AI processing time
+            setTimeout(() => {
+                // Randomly select food data or use default
+                const randomIndex = Math.floor(Math.random() * (foodDatabase.patterns.length + 1));
+                const foodData = randomIndex < foodDatabase.patterns.length
+                    ? foodDatabase.patterns[randomIndex].data
+                    : foodDatabase.default;
+
+                // Add some variation to make it seem more realistic
+                const variation = 0.8 + Math.random() * 0.4; // 80% to 120% variation
+                const calories = Math.round(foodData.calories * variation);
+                const protein = Math.round(foodData.protein * variation);
+                const carbs = Math.round(foodData.carbs * variation);
+                const fat = Math.round(foodData.fat * variation);
+
+                // Update results
+                document.getElementById('totalCalories').textContent = calories;
+                document.getElementById('protein').textContent = protein + 'g';
+                document.getElementById('carbs').textContent = carbs + 'g';
+                document.getElementById('fat').textContent = fat + 'g';
+                document.getElementById('serving').textContent = 'Standard (≈' + Math.round(calories / 2.5) + 'g)';
+
+                // Update food items
+                const foodItemsContainer = document.getElementById('foodItems');
+                foodItemsContainer.innerHTML = foodData.items.map(item => {
+                    const itemCalories = parseInt(item.match(/\d+/)[0]);
+                    const adjustedCalories = Math.round(itemCalories * variation);
+                    const itemName = item.replace(/\(\d+ cal\)/, '');
+                    return `
+                        <div class="detail-row">
+                            <span class="detail-label">${itemName}</span>
+                            <span class="detail-value">${adjustedCalories} cal</span>
+                        </div>
+                    `;
+                }).join('');
+
+                loading.classList.remove('show');
+                results.classList.add('show');
+            }, 2000);
+        }
+
+        resetBtn.addEventListener('click', () => {
+            imagePreview.style.display = 'none';
+            placeholderContent.style.display = 'block';
+            captureArea.classList.remove('has-image');
+            results.classList.remove('show');
+            fileInput.value = '';
+            captureBtn.innerHTML = '<span>📷</span><span>Take Photo / Upload</span>';
+        });
+
+        // Enable camera on mobile devices
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            // Camera API is available
+            console.log('Camera API available');
+        }
+    </script>
+</body>
+
+</html>

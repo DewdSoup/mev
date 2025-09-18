@@ -5,15 +5,23 @@
  *  - Prefer <YYYY-MM-DD=yesterday>.jsonl
  *  - Else try today's file
  *  - Else pick the latest by mtime in the features dir
- * Writes: services/arb-mm/data/params/<YYYY-MM-DD>.json (date = logical "yesterday")
+ * Writes: data/arb/params/<YYYY-MM-DD>.json (date = logical "yesterday")
  */
 import fs from "fs";
 import path from "path";
 
-const repoRoot = process.cwd();
-const dataDir = process.env.DATA_DIR?.trim() || "services/arb-mm/data";
-const featuresDir = path.join(repoRoot, dataDir, "features", "sol_usdc", "v1");
-const paramsDir = path.join(repoRoot, dataDir, "params");
+const cwd = process.cwd();
+const repoRoot = cwd.includes(`${path.sep}services${path.sep}arb-mm`)
+  ? path.resolve(cwd, "..")
+  : cwd;
+
+const dataEnv = process.env.DATA_DIR?.trim();
+const dataDir = dataEnv
+  ? (path.isAbsolute(dataEnv) ? dataEnv : path.join(repoRoot, dataEnv))
+  : path.join(repoRoot, "data", "arb");
+
+const featuresDir = path.join(dataDir, "features", "sol_usdc", "v1");
+const paramsDir = path.join(dataDir, "params");
 
 type Feature = Partial<{
   absBps: number;

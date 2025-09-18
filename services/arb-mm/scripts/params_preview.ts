@@ -2,9 +2,17 @@
 import fs from "fs";
 import path from "path";
 
-const repoRoot = process.cwd();
-const dataDir = process.env.DATA_DIR?.trim() || "services/arb-mm/data";
-const paramsDir = path.join(repoRoot, dataDir, "params");
+const cwd = process.cwd();
+const repoRoot = cwd.includes(`${path.sep}services${path.sep}arb-mm`)
+  ? path.resolve(cwd, "..")
+  : cwd;
+
+const dataEnv = process.env.DATA_DIR?.trim();
+const dataDir = dataEnv
+  ? (path.isAbsolute(dataEnv) ? dataEnv : path.join(repoRoot, dataEnv))
+  : path.join(repoRoot, "data", "arb");
+
+const paramsDir = path.join(dataDir, "params");
 
 type Best = Partial<{
   TRADE_THRESHOLD_BPS: number;
