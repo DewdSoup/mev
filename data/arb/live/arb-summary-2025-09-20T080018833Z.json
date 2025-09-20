@@ -1,13 +1,13 @@
 {
-  "file": "/home/dudesoup/code/mev/data/arb/live/arb-summary-2025-09-19T233835680Z.json",
-  "started_at": "2025-09-19T23:38:20.460Z",
-  "stopped_at": "2025-09-19T23:38:35.680Z",
-  "considered": 0,
+  "file": "/home/dudesoup/code/mev/data/arb/live/arb-summary-2025-09-20T080018833Z.json",
+  "started_at": "2025-09-20T07:59:44.098Z",
+  "stopped_at": "2025-09-20T08:00:18.833Z",
+  "considered": 37,
   "would_trade": 0,
-  "would_not_trade": 0,
+  "would_not_trade": 37,
   "pnl_sum": 0,
-  "best_edge_bps": 0,
-  "worst_edge_bps": 0,
+  "best_edge_bps": -1000000000,
+  "worst_edge_bps": -1000000000,
   "threshold_bps": "0.3",
   "slippage_bps": "3",
   "trade_size_base": "0.03",
@@ -21,7 +21,7 @@
     "wsol": 0,
     "usdc": 0
   },
-  "ml_events_file": "/home/dudesoup/code/mev/data/arb/live/2025-09-19T233822815Z.events.jsonl",
+  "ml_events_file": "/home/dudesoup/code/mev/data/arb/live/2025-09-20T075947190Z.events.jsonl",
   "exec_guard": {
     "allowed_path": "both",
     "atomic_preferred": true

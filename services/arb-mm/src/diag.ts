@@ -1,9 +1,11 @@
 /* eslint-disable no-console */
-import { Connection, PublicKey, clusterApiUrl } from "@solana/web3.js";
+import type { Connection } from "@solana/web3.js";
+import { PublicKey, clusterApiUrl } from "@solana/web3.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as process from "node:process";
 import dotenv from "dotenv";
+import { rpcClient } from "@mev/rpc-facade";
 
 // Load env (prefer .env.live, fall back to .env); supports ESM
 (function loadEnv() {
@@ -110,7 +112,7 @@ async function main() {
     const PHOENIX_MARKET =
         process.env.PHOENIX_MARKET ?? (process.argv[2] || "").trim();
 
-    const connection = new Connection(RPC_URL, { commitment: "confirmed" });
+    const connection = rpcClient;
 
     const phoenixNs = await import("@ellipsis-labs/phoenix-sdk");
     const phoenix = (phoenixNs as any)?.default ?? phoenixNs;

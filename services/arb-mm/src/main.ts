@@ -13,7 +13,8 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as dotenv from "dotenv";
-import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { PublicKey, Keypair } from "@solana/web3.js";
+import type { Connection } from "@solana/web3.js";
 import { logger } from "@mev/storage";
 
 import {
@@ -45,6 +46,9 @@ import {
 import { tryAssertRaydiumFeeBps } from "./util/raydium.js";
 import { PublisherSupervisor } from "./publishers/supervisor.js";
 import { prewarmPhoenix } from "./util/phoenix.js"; // warm Phoenix cache on boot
+import { MarketStateProvider } from "./market/index.js";
+import { loadPairsFromEnvOrDefault } from "./registry/pairs.js";
+import { rpcClient, rpc } from "@mev/rpc-facade";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -415,11 +419,56 @@ async function main() {
   sup.start();
 
   // Attach WS endpoint (Phoenix publisher will poll if SDK lacks subs)
-  const WS = process.env.RPC_WSS_URL?.trim();
-  const conn = new Connection(
-    RPC,
-    WS ? { commitment: "processed", wsEndpoint: WS } : { commitment: "processed" }
-  );
+const conn = rpcClient;
+
+const ENABLE_MARKET_PROVIDER = String(process.env.ENABLE_MARKET_PROVIDER ?? "0").trim() === "1";
+let marketProvider: MarketStateProvider | null = null;
+if (ENABLE_MARKET_PROVIDER) {
+  try {
+    marketProvider = new MarketStateProvider(conn, loadPairsFromEnvOrDefault());
+    await marketProvider.start();
+    logger.log("market_provider_started", {
+      pools: marketProvider.getTrackedPools().length,
+      markets: marketProvider.getPhoenixMarkets().length,
+      refresh_ms: Number(process.env.MARKET_PROVIDER_REFRESH_MS ?? 900),
+    });
+  } catch (err) {
+    logger.log("market_provider_start_error", { err: String((err as any)?.message ?? err) });
+    marketProvider = null;
+  }
+}
+
+  const warmupKeys = new Set<string>();
+  const tryPush = (value: string | undefined) => {
+    if (!value) return;
+    const trimmed = value.trim();
+    if (trimmed) warmupKeys.add(trimmed);
+  };
+  tryPush(process.env.PHOENIX_MARKET);
+  tryPush(process.env.PHOENIX_MARKET_ID);
+  if (String(process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0") {
+    tryPush(process.env.RAYDIUM_POOL_ID);
+    tryPush(process.env.RAYDIUM_POOL_ID_SOL_USDC);
+  }
+  tryPush(process.env.ORCA_POOL_ID);
+  tryPush(process.env.RAYDIUM_CLMM_POOL_ID);
+
+  const warmupPubkeys: PublicKey[] = [];
+  for (const key of warmupKeys) {
+    try {
+      warmupPubkeys.push(new PublicKey(key));
+    } catch (err) {
+      logger.log("rpc_warmup_skip", { key, err: String((err as any)?.message ?? err) });
+    }
+  }
+  if (warmupPubkeys.length) {
+    try {
+      await rpc.warmupAccounts(warmupPubkeys, "processed");
+      logger.log("rpc_warmup_complete", { count: warmupPubkeys.length });
+    } catch (err) {
+      logger.log("rpc_warmup_error", { count: warmupPubkeys.length, err: String((err as any)?.message ?? err) });
+    }
+  }
 
   startHealth(conn).catch(() => { });
   initRisk();
@@ -764,6 +813,7 @@ async function main() {
       try { ammsFollower.stop(); } catch { }
       try { phxFollower.stop(); } catch { }
       try { sup.stop(); } catch { }
+      try { await marketProvider?.stop(); } catch { }
 
       try {
         if (accounts) {
@@ -798,19 +848,31 @@ async function main() {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("beforeExit", () => { if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE); });
   process.on("exit", () => { if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE); });
-  process.on("uncaughtException", (e) => {
-    logger.log("arb_fatal", { error: String(e) });
-    if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
-    process.exit(1);
-  });
-  process.on("unhandledRejection", (e) => {
-    logger.log("arb_fatal", { error: String(e) });
-    if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
-    process.exit(1);
-  });
+process.on("uncaughtException", (e) => {
+  if (isRateLimitError(e)) {
+    logger.log("arb_rate_limit", { error: String(e) });
+    return;
+  }
+  logger.log("arb_fatal", { error: String(e) });
+  if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
+  process.exit(1);
+});
+process.on("unhandledRejection", (e) => {
+  if (isRateLimitError(e)) {
+    logger.log("arb_rate_limit", { error: String(e) });
+    return;
+  }
+  logger.log("arb_fatal", { error: String(e) });
+  if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
+  process.exit(1);
+});
 }
 
 main().catch(async (e) => {
+  if (isRateLimitError(e)) {
+    logger.log("arb_rate_limit", { error: String(e) });
+    return;
+  }
   logger.log("arb_fatal", { error: String(e) });
   try {
     const { loadConfig } = await import("./config.js");
@@ -821,3 +883,11 @@ main().catch(async (e) => {
     fs.writeFileSync(file, JSON.stringify({ error: String(e) }, null, 2));
   } catch { }
 });
+
+function isRateLimitError(err: unknown): boolean {
+  if (!err) return false;
+  const code = (err as any)?.code;
+  if (code === -32429) return true;
+  const msg = String((err as any)?.message ?? err ?? "").toLowerCase();
+  return msg.includes("429") || msg.includes("rate limited");
+}

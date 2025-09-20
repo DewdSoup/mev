@@ -6,10 +6,11 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { Connection } from "@solana/web3.js";
+import type { Connection } from "@solana/web3.js";
 import { getEnabledAdapters } from "./adapters/registry.js";
 import type { AmmAdapter, ReserveSnapshot } from "./adapters/types.js";
 import { logger } from "./logger.js";
+import { rpcClient } from "@mev/rpc-facade";
 
 const __filename = fileURLToPath(import.meta.url);
 const __here = path.dirname(__filename);
@@ -175,10 +176,7 @@ async function snapshotToPayload(a: AmmAdapter, r: ReserveSnapshot) {
 }
 
 async function main() {
-  const conn = new Connection(
-    RPC_URL || "https://api.mainnet-beta.solana.com",
-    { commitment: "confirmed" }
-  );
+  const conn: Connection = rpcClient;
 
   const outPath = resolveOutPath();
   const writer = new JsonlWriter(outPath);

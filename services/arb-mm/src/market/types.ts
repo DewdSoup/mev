@@ -1,0 +1,71 @@
+export type AmmVenue = "raydium" | "orca";
+export type PoolKind = "cpmm" | "clmm";
+
+export interface AmmSnapshot {
+  poolId: string;
+  venue: AmmVenue;
+  poolKind: PoolKind;
+  price: number | null;
+  feeBps: number | null;
+  baseDecimals: number;
+  quoteDecimals: number;
+  /** optional raw vault pubkeys for CPMM pools */
+  baseVault?: string;
+  quoteVault?: string;
+  baseReserve?: number | null;
+  quoteReserve?: number | null;
+  lastUpdateTs: number;
+  ageMs?: number;
+  slot?: number | null;
+  stale?: boolean;
+  degraded?: boolean;
+  degradedReason?: string | null;
+}
+
+export interface PhoenixLevel {
+  px: number;
+  qty: number;
+}
+
+export interface PhoenixSnapshot {
+  market: string;
+  symbol: string;
+  bestBid: number | null;
+  bestAsk: number | null;
+  mid: number | null;
+  levelsBids: PhoenixLevel[];
+  levelsAsks: PhoenixLevel[];
+  lastUpdateTs: number;
+  ageMs?: number;
+  slot?: number | null;
+  stale?: boolean;
+  degraded?: boolean;
+  degradedReason?: string | null;
+}
+
+export interface MarketProviderState {
+  amms: AmmSnapshot[];
+  phoenix: PhoenixSnapshot[];
+}
+
+export interface MarketProviderSnapshot extends MarketProviderState {}
+
+export type MarketStateListener = (state: MarketProviderState) => void;
+
+export interface TrackedPoolMeta {
+  poolId: string;
+  venue: AmmVenue;
+  poolKind: PoolKind;
+  feeHint?: number;
+}
+
+export interface MarketProviderConfig {
+  refreshMs?: number;
+  phoenixRefreshMs?: number;
+  staleMs?: number;
+  phoenixDepthLevels?: number;
+  refreshDebounceMs?: number;
+  batchMax?: number;
+  snapshotTtlMs?: number;
+  telemetryMs?: number;
+}

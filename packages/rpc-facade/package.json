@@ -1,0 +1,16 @@
+{
+  "name": "@mev/rpc-facade",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@mev/storage": "workspace:*",
+    "@solana/web3.js": "^1.95.7"
+  }
+}

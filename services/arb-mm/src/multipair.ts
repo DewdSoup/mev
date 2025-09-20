@@ -11,7 +11,8 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as dotenv from "dotenv";
-import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { PublicKey, Keypair } from "@solana/web3.js";
+import type { Connection } from "@solana/web3.js";
 import { logger } from "@mev/storage";
 
 import {
@@ -30,6 +31,8 @@ import { tryAssertRaydiumFeeBps } from "./util/raydium.js";
 import { PublisherSupervisor } from "./publishers/supervisor.js";
 import { prewarmPhoenix } from "./util/phoenix.js";
 import { loadPairsFromEnvOrDefault, type PairSpec } from "./registry/pairs.js";
+import { MarketStateProvider } from "./market/index.js";
+import { rpcClient, rpc } from "@mev/rpc-facade";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -115,6 +118,7 @@ class PairPipeline {
         private resolveFeeBps: (kind: "AMM" | "PHOENIX", id: string | undefined, fallback: number) => number,
         private liveExec: LiveExecutor | null,
     ) {
+        const enableRaydiumClmm = String(process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0";
         // Resolve fees (pair overrides -> JSON/ENV -> defaults)
         const ammFeeInit = this.resolveFeeBps("AMM", pair.ammPool, cfg.AMM_TAKER_FEE_BPS);
         const phxFeeInit = this.resolveFeeBps("PHOENIX", pair.phoenixMarket, cfg.PHOENIX_TAKER_FEE_BPS);
@@ -130,6 +134,8 @@ class PairPipeline {
         this._phxFeeBps = phxFeeInit;
 
         for (const venue of pair.ammVenues ?? []) {
+            if (venue?.enabled === false) continue;
+            if (!enableRaydiumClmm && String(venue.venue).toLowerCase() === "raydium" && String(venue.poolKind).toLowerCase() === "clmm") continue;
             const poolId = String(venue.poolId ?? "").trim();
             if (!poolId) continue;
             if (!this.ammVenueByPool.has(poolId)) {
@@ -316,11 +322,52 @@ async function main() {
     sup.start();
 
     // Network + health
-    const WS = process.env.RPC_WSS_URL?.trim();
-    const conn = new Connection(
-        RPC,
-        WS ? { commitment: "processed", wsEndpoint: WS } : { commitment: "processed" }
-    );
+    const conn = rpcClient;
+
+    const ENABLE_MARKET_PROVIDER = String(process.env.ENABLE_MARKET_PROVIDER ?? "0").trim() === "1";
+    let marketProvider: MarketStateProvider | null = null;
+    if (ENABLE_MARKET_PROVIDER) {
+        try {
+            marketProvider = new MarketStateProvider(conn, loadPairsFromEnvOrDefault());
+            await marketProvider.start();
+            logger.log("market_provider_started", {
+                pools: marketProvider.getTrackedPools().length,
+                markets: marketProvider.getPhoenixMarkets().length,
+                refresh_ms: Number(process.env.MARKET_PROVIDER_REFRESH_MS ?? 900),
+            });
+        } catch (err) {
+            logger.log("market_provider_start_error", { err: String((err as any)?.message ?? err) });
+            marketProvider = null;
+        }
+    }
+
+    const warmupKeys = new Set<string>();
+    const enableRaydiumClmm = String(process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0";
+    for (const pair of PAIRS) {
+        warmupKeys.add(pair.phoenixMarket);
+        warmupKeys.add(pair.ammPool);
+        for (const venue of pair.ammVenues ?? []) {
+            if (venue?.enabled === false) continue;
+            if (!enableRaydiumClmm && String(venue.venue).toLowerCase() === "raydium" && String(venue.poolKind).toLowerCase() === "clmm") continue;
+            if (venue.poolId) warmupKeys.add(venue.poolId);
+        }
+    }
+    const warmupPubkeys: PublicKey[] = [];
+    for (const key of warmupKeys) {
+        try {
+            warmupPubkeys.push(new PublicKey(key));
+        } catch (err) {
+            logger.log("rpc_warmup_skip", { key, err: String((err as any)?.message ?? err) });
+        }
+    }
+    if (warmupPubkeys.length) {
+        try {
+            await rpc.warmupAccounts(warmupPubkeys, "processed");
+            logger.log("rpc_warmup_complete", { count: warmupPubkeys.length });
+        } catch (err) {
+            logger.log("rpc_warmup_error", { count: warmupPubkeys.length, err: String((err as any)?.message ?? err) });
+        }
+    }
 
     initRisk();
     (async function startHealth() {
@@ -379,6 +426,7 @@ async function main() {
             try { ammsFollower.stop(); } catch { }
             try { phxFollower.stop(); } catch { }
             try { sup.stop(); } catch { }
+            try { await marketProvider?.stop(); } catch { }
             logger.log("arb-multipair_shutdown", { ok: true, signal });
             process.exit(0);
         })().catch(() => process.exit(0));

@@ -10,11 +10,13 @@ export type PairAmmVenue = {
     poolId: string;
     poolKind?: string;
     feeBps?: number;
+    enabled?: boolean;
 };
 
 export type PairSpec = {
     /** Human-friendly id; must be unique. */
     id: string; // e.g., "SOL/USDC:raydium<->phoenix"
+    symbol?: string;
     baseMint: string; // e.g., WSOL mint
     quoteMint: string; // e.g., USDC mint
     phoenixMarket: string; // phoenix market pubkey
@@ -79,14 +81,18 @@ function normalizePairsJson(raw: any): PairSpec[] | undefined {
                 poolId,
                 poolKind: typeof v.poolKind === "string" ? v.poolKind : typeof v.pool_kind === "string" ? v.pool_kind : undefined,
                 feeBps: typeof v.feeBps === "number" ? v.feeBps : typeof v.fee_bps === "number" ? v.fee_bps : undefined,
+                enabled: typeof v.enabled === "boolean" ? v.enabled : undefined,
             });
         }
 
         const primary = venues[0];
         if (!baseMint || !quoteMint || !phoenixMarket || !primary) continue;
 
+        const id = String(entry.id ?? entry.symbol ?? `${phoenixMarket}:${primary.poolId}`);
+        const symbol = String(entry.symbol ?? id).trim();
         out.push({
-            id: String(entry.id ?? entry.symbol ?? `${phoenixMarket}:${primary.poolId}`),
+            id,
+            symbol,
             baseMint,
             quoteMint,
             phoenixMarket,
@@ -142,6 +148,7 @@ export function loadPairsFromEnvOrDefault(): PairSpec[] {
     return [
         {
             id: "SOL/USDC:raydium<->phoenix",
+            symbol: "SOL/USDC",
             baseMint,
             quoteMint,
             phoenixMarket,

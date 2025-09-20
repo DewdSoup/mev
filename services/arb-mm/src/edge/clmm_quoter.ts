@@ -19,24 +19,15 @@ import { Keypair } from "@solana/web3.js";
 import { TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 
 import { logger } from "../ml_logger.js";
+import { rpcClient } from "@mev/rpc-facade";
 
-const DEFAULT_RPC = String(
-  process.env.CLMM_QUOTE_RPC_URL ??
-    process.env.RPC_URL ??
-    process.env.SOLANA_RPC_URL ??
-    ""
-).trim();
-
-if (!DEFAULT_RPC) {
-  throw new Error("clmm_quoter_missing_rpc_endpoint");
-}
+const ENABLE_RAYDIUM_CLMM = String(process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0";
 
 const RAYDIUM_CLMM_API = String(
   process.env.RAYDIUM_CLMM_API_URL ??
     "https://api.raydium.io/v2/ammV3/ammPools"
 );
-
-const raydiumConn = new Connection(DEFAULT_RPC, { commitment: "confirmed" });
+const raydiumConn = rpcClient;
 const orcaConn = raydiumConn; // reuse the same transport for now
 
 Decimal.set({ precision: 40, rounding: Decimal.ROUND_HALF_EVEN });
@@ -66,6 +57,7 @@ type QuoteArgs = {
   baseMint?: string;
   quoteMint?: string;
   feeBpsHint?: number;
+  venue?: string;
 };
 
 type QuoteOk = { ok: true; price: number; feeBps: number; meta?: Record<string, unknown> };
@@ -343,6 +335,9 @@ function resolveOrientation(poolInfo: ClmmPoolInfo, baseMint?: string, quoteMint
 
 export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
   try {
+    if (!ENABLE_RAYDIUM_CLMM && args.venue === "raydium") {
+      return { ok: false, err: "raydium_clmm_disabled" };
+    }
     if (!(args.sizeBase > 0)) return { ok: false, err: "size_not_positive" };
     const poolInfo = await fetchPoolInfo(args.poolId);
     const tickArrays = await fetchTickArrays(args.poolId, poolInfo);

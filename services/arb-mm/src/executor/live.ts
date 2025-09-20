@@ -200,7 +200,12 @@ export class LiveExecutor {
     try {
       const maxConc = Number(process.env.RPC_BACKOFF_MAX_CONCURRENCY ?? 6);
       const maxRetries = Number(process.env.RPC_BACKOFF_MAX_RETRIES ?? 5);
-      this.conn = withRpcBackoff(this.connRaw, { maxConcurrency: maxConc, maxRetries });
+      const isFacade = (this.connRaw as any)?.__rpc_facade__;
+      if (isFacade) {
+        this.conn = this.connRaw;
+      } else {
+        this.conn = withRpcBackoff(this.connRaw, { maxConcurrency: maxConc, maxRetries });
+      }
     } catch (err) {
       const e = err as any;
       logger.log("rpc_backoff_wrap_error", { err: String(e?.message ?? e) });

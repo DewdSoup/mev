@@ -32,7 +32,8 @@
                     "kind": "raydium",
                     "id": "2QdhepnKRTLjjSqPL1PtKNwqrUkoLee5Gqs8bvZhRdMv",
                     "poolKind": "clmm",
-                    "feeBps": 5
+                    "feeBps": 5,
+                    "enabled": false
                 }
             ]
         }

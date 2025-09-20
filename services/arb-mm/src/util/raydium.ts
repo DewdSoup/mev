@@ -22,6 +22,7 @@ import {
 } from "@raydium-io/raydium-sdk";
 import type { LiquidityPoolKeys } from "@raydium-io/raydium-sdk";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { rpcClient } from "@mev/rpc-facade";
 
 // ───────────────────────────────────────────────────────────────────────────────
 // ESM-safe dirname
@@ -539,7 +540,7 @@ export async function buildRaydiumSwapIx(params: {
 }): Promise<CpmmIxBuildResult> {
   try {
     const rpc = resolveRpc();
-    const conn = new Connection(rpc, { commitment: "processed" });
+    const conn = rpcClient;
 
     const envAmmStr = (
       process.env.RAYDIUM_POOL_ID ??

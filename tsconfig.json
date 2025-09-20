@@ -12,6 +12,9 @@
       "path": "./packages/storage"
     },
     {
+      "path": "./packages/rpc-facade"
+    },
+    {
       "path": "./packages/phoenix"
     },
     {

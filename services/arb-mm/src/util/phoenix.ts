@@ -58,7 +58,7 @@ async function loadPhoenixModule(): Promise<PhoenixModule> {
     return _phoenixMod;
 }
 
-async function getPhoenixClient(conn: Connection, seedMarkets?: (string | PublicKey)[]): Promise<PhoenixClient> {
+export async function getPhoenixClient(conn: Connection, seedMarkets?: (string | PublicKey)[]): Promise<PhoenixClient> {
     if (_phoenixClient) return _phoenixClient;
 
     const Phoenix = await loadPhoenixModule();
@@ -141,6 +141,8 @@ async function ensureMarketState(client: PhoenixClient, market: string | PublicK
     _marketStateById.set(idStr, state);
     return state;
 }
+
+export { ensureMarketState as ensurePhoenixMarketState };
 
 export async function prewarmPhoenix(conn: Connection, markets: (string | PublicKey)[]): Promise<void> {
     const client = await getPhoenixClient(conn, markets);

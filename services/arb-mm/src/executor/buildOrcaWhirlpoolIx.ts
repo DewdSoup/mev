@@ -17,6 +17,7 @@ import {
 } from "@orca-so/whirlpools-sdk";
 import { Percentage } from "@orca-so/common-sdk";
 import { getAssociatedTokenAddress, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { rpcClient } from "@mev/rpc-facade";
 
 class ReadonlyWallet {
     constructor(public publicKey: PublicKey) { }
@@ -34,7 +35,7 @@ export async function buildOrcaWhirlpoolSwapIx(params: {
     slippageBps: number;
 }): Promise<{ ok: true; ixs: TransactionInstruction[] } | { ok: false; reason: string }> {
     try {
-        const conn = params.connection ?? new Connection(String(process.env.RPC_URL ?? process.env.SOLANA_RPC_URL), "confirmed");
+        const conn = params.connection ?? rpcClient;
         const programId = new PublicKey(process.env.ORCA_WHIRLPOOL_PROGRAM_ID ?? ORCA_WHIRLPOOL_PROGRAM_ID);
         const wallet = new ReadonlyWallet(params.user);
 
