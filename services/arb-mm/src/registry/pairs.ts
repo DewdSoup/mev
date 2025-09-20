@@ -5,13 +5,29 @@
 import fs from "fs";
 import path from "path";
 
+export type PairAmmVenue = {
+    venue: string;
+    poolId: string;
+    poolKind?: string;
+    feeBps?: number;
+};
+
 export type PairSpec = {
     /** Human-friendly id; must be unique. */
     id: string; // e.g., "SOL/USDC:raydium<->phoenix"
     baseMint: string; // e.g., WSOL mint
     quoteMint: string; // e.g., USDC mint
     phoenixMarket: string; // phoenix market pubkey
-    ammPool: string; // AMM pool id (Raydium CPMM for now)
+    /**
+     * Primary AMM pool id maintained for backwards compatibility with
+     * single-venue flows. Always mirrors the first entry in `ammVenues`.
+     */
+    ammPool: string;
+    /**
+     * All AMM venues allowed for this pair. The first element represents
+     * the legacy/default venue.
+     */
+    ammVenues: PairAmmVenue[];
     /** Optional overrides / tunables per pair */
     fees?: {
         phoenixTakerBps?: number;
@@ -28,7 +44,7 @@ export type PairSpec = {
     };
     /** Future: adapter names when you add Orca/Jupiter etc. */
     adapters?: {
-        amm?: "raydium"; // future: "orca", "jupiter", ...
+        amm?: "raydium" | "orca" | string;
         phoenix?: "phoenix"; // keep for symmetry
     };
 };
@@ -42,12 +58,63 @@ function readJsonMaybe(absPath: string): any | undefined {
     }
 }
 
+function normalizePairsJson(raw: any): PairSpec[] | undefined {
+    const arr = Array.isArray(raw?.pairs) ? raw.pairs : Array.isArray(raw) ? raw : undefined;
+    if (!arr || !arr.length) return undefined;
+
+    const out: PairSpec[] = [];
+    for (const entry of arr) {
+        if (!entry) continue;
+        const baseMint = String(entry.baseMint ?? "").trim();
+        const quoteMint = String(entry.quoteMint ?? "").trim();
+        const phoenixMarket = String(entry.phoenixMarket ?? entry.phoenix?.market ?? "").trim();
+        const venues: PairAmmVenue[] = [];
+        const venusArr = Array.isArray(entry.venues) ? entry.venues : [];
+        for (const v of venusArr) {
+            if (!v || String(v.kind ?? "").toLowerCase() === "phoenix") continue;
+            const poolId = String(v.id ?? v.poolId ?? "").trim();
+            if (!poolId) continue;
+            venues.push({
+                venue: String(v.kind ?? v.venue ?? "").toLowerCase(),
+                poolId,
+                poolKind: typeof v.poolKind === "string" ? v.poolKind : typeof v.pool_kind === "string" ? v.pool_kind : undefined,
+                feeBps: typeof v.feeBps === "number" ? v.feeBps : typeof v.fee_bps === "number" ? v.fee_bps : undefined,
+            });
+        }
+
+        const primary = venues[0];
+        if (!baseMint || !quoteMint || !phoenixMarket || !primary) continue;
+
+        out.push({
+            id: String(entry.id ?? entry.symbol ?? `${phoenixMarket}:${primary.poolId}`),
+            baseMint,
+            quoteMint,
+            phoenixMarket,
+            ammPool: primary.poolId,
+            ammVenues: venues,
+            fees: entry.fees,
+            sizing: entry.sizing,
+            adapters: { amm: primary.venue, phoenix: "phoenix" },
+        });
+    }
+
+    return out.length ? out : undefined;
+}
+
 export function loadPairsFromEnvOrDefault(): PairSpec[] {
-    const p = process.env.PAIRS_JSON?.trim();
-    if (p && fs.existsSync(p)) {
-        const abs = path.isAbsolute(p) ? p : path.resolve(process.cwd(), p);
-        const j = readJsonMaybe(abs);
-        if (Array.isArray(j) && j.length > 0) return j as PairSpec[];
+    const fromEnv = process.env.PAIRS_JSON?.trim();
+    if (fromEnv && fs.existsSync(fromEnv)) {
+        const abs = path.isAbsolute(fromEnv) ? fromEnv : path.resolve(process.cwd(), fromEnv);
+        const parsed = readJsonMaybe(abs);
+        const normalized = normalizePairsJson(parsed);
+        if (normalized && normalized.length) return normalized;
+    }
+
+    const defaultPath = path.resolve(process.cwd(), "configs", "pairs.json");
+    if (fs.existsSync(defaultPath)) {
+        const parsed = readJsonMaybe(defaultPath);
+        const normalized = normalizePairsJson(parsed);
+        if (normalized && normalized.length) return normalized;
     }
 
     // Fallback: single SOL/USDC via env (your current baseline)
@@ -67,6 +134,11 @@ export function loadPairsFromEnvOrDefault(): PairSpec[] {
         process.env.USDC_MINT?.trim() ||
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
+    const defaultVenue: PairAmmVenue = {
+        venue: String(process.env.DEFAULT_AMM_VENUE ?? "raydium").toLowerCase(),
+        poolId: ammPool,
+    };
+
     return [
         {
             id: "SOL/USDC:raydium<->phoenix",
@@ -74,6 +146,7 @@ export function loadPairsFromEnvOrDefault(): PairSpec[] {
             quoteMint,
             phoenixMarket,
             ammPool,
+            ammVenues: [defaultVenue],
             fees: {
                 phoenixTakerBps: Number(process.env.PHOENIX_TAKER_FEE_BPS ?? 2),
                 ammTakerBps: Number(process.env.AMM_TAKER_FEE_BPS ?? 25),
@@ -84,7 +157,7 @@ export function loadPairsFromEnvOrDefault(): PairSpec[] {
                 tradeSizeBase: Number(process.env.TRADE_SIZE_BASE ?? 0.03),
                 cpmmMaxPoolTradeFrac: Number(process.env.CPMM_MAX_POOL_TRADE_FRAC ?? 0.02),
             },
-            adapters: { amm: "raydium", phoenix: "phoenix" },
+            adapters: { amm: defaultVenue.venue, phoenix: "phoenix" },
         },
     ];
 }

@@ -5,8 +5,13 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import {
-  Connection, PublicKey, TransactionInstruction, Keypair,
-  VersionedTransaction, TransactionMessage,
+  Connection,
+  PublicKey,
+  TransactionInstruction,
+  Keypair,
+  VersionedTransaction,
+  TransactionMessage,
+  AddressLookupTableAccount,
 } from "@solana/web3.js";
 import { LIQUIDITY_STATE_LAYOUT_V4 } from "@raydium-io/raydium-sdk";
 import { logger } from "../ml_logger.js";
@@ -55,7 +60,7 @@ function envNum(k: string): number | undefined {
 }
 
 // Types / helpers
-export type AtomicPath = "PHX->AMM" | "AMM->PHX";
+export type AtomicPath = "PHX->AMM" | "AMM->PHX" | "AMM->AMM";
 function uiToAtoms(ui: number, decimals: number): bigint { return BigInt(Math.floor(ui * 10 ** decimals)); }
 function applyBpsDownBig(x: bigint, bps: number): bigint {
   const BPS = 10_000n; const b = BigInt(Math.max(0, Math.min(10_000, Math.ceil(bps)))); return (x * (BPS - b)) / BPS;
@@ -134,7 +139,38 @@ async function ensureRaydiumPoolMeta(conn: Connection, poolId: PublicKey): Promi
   return meta;
 }
 
-async function getUiBalances(conn: Connection, owner: PublicKey) {
+type BalanceSnapshot = {
+  solLamports: number;
+  wsolUi: number;
+  usdcUi: number;
+  wsolAta: string;
+  usdcAta: string;
+};
+
+const BALANCE_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? 3_000);
+let balanceCache: { ts: number; data: BalanceSnapshot | null } = { ts: 0, data: null };
+const missingAtas = new Set<string>();
+
+async function safeTokenBalance(conn: Connection, pubkey: PublicKey): Promise<number> {
+  const key = pubkey.toBase58();
+  if (missingAtas.has(key)) return 0;
+  try {
+    const res = await conn.getTokenAccountBalance(pubkey, "confirmed");
+    return Number(res.value.uiAmount ?? 0);
+  } catch (err) {
+    const msg = String((err as any)?.message ?? err ?? "");
+    if (msg.includes("could not find account") || msg.includes("Account does not exist")) {
+      missingAtas.add(key);
+    }
+    return 0;
+  }
+}
+
+async function getUiBalances(conn: Connection, owner: PublicKey): Promise<BalanceSnapshot> {
+  const now = Date.now();
+  const cached = balanceCache.data;
+  if (cached && now - balanceCache.ts <= BALANCE_CACHE_MS) return cached;
+
   const wsolAtaEnv = getenv("WSOL_ATA");
   const usdcAtaEnv = getenv("USDC_ATA");
   const WSOL_MINT = new PublicKey(getenv("WSOL_MINT") ?? "So11111111111111111111111111111111111111112");
@@ -145,10 +181,18 @@ async function getUiBalances(conn: Connection, owner: PublicKey) {
 
   const [lamports, wsolBal, usdcBal] = await Promise.all([
     conn.getBalance(owner, "confirmed"),
-    conn.getTokenAccountBalance(wsolAta, "confirmed").then(r => Number(r.value.uiAmount ?? 0)).catch(() => 0),
-    conn.getTokenAccountBalance(usdcAta, "confirmed").then(r => Number(r.value.uiAmount ?? 0)).catch(() => 0),
+    safeTokenBalance(conn, wsolAta),
+    safeTokenBalance(conn, usdcAta),
   ]);
-  return { solLamports: lamports, wsolUi: wsolBal, usdcUi: usdcBal, wsolAta: wsolAta.toBase58(), usdcAta: usdcAta.toBase58() };
+  const snapshot: BalanceSnapshot = {
+    solLamports: lamports,
+    wsolUi: wsolBal,
+    usdcUi: usdcBal,
+    wsolAta: wsolAta.toBase58(),
+    usdcAta: usdcAta.toBase58(),
+  };
+  balanceCache = { ts: now, data: snapshot };
+  return snapshot;
 }
 
 export class LiveExecutor {
@@ -166,15 +210,96 @@ export class LiveExecutor {
   }
 
   private conn: Connection;
+  private lutCache = new Map<string, AddressLookupTableAccount>();
+
+  private async getLookupTableAccounts(pubkeys: PublicKey[]): Promise<AddressLookupTableAccount[]> {
+    const uniq = new Map<string, PublicKey>();
+    for (const pk of pubkeys) {
+      if (!pk) continue;
+      uniq.set(pk.toBase58(), pk);
+    }
+    const want = Array.from(uniq.values());
+    if (!want.length) return [];
+
+    const out: AddressLookupTableAccount[] = [];
+    const misses: PublicKey[] = [];
+    for (const pk of want) {
+      const key = pk.toBase58();
+      const hit = this.lutCache.get(key);
+      if (hit) {
+        out.push(hit);
+      } else {
+        misses.push(pk);
+      }
+    }
+
+    if (misses.length) {
+      const fetched = await Promise.all(misses.map(async (pk) => {
+        try {
+          const res = await this.conn.getAddressLookupTable(pk);
+          const value = res.value ?? null;
+          if (!value) {
+            logger.log("lookup_table_missing", { address: pk.toBase58() });
+            return null;
+          }
+          this.lutCache.set(pk.toBase58(), value);
+          return value;
+        } catch (err) {
+          logger.log("lookup_table_fetch_error", {
+            address: pk.toBase58(),
+            err: String((err as any)?.message ?? err),
+          });
+          return null;
+        }
+      }));
+      for (const acc of fetched) {
+        if (acc) out.push(acc);
+      }
+    }
+
+    return out;
+  }
 
   async startPhoenix(): Promise<void> { /* no-op */ }
 
   async maybeExecute(payload: any): Promise<void> {
     try {
       const atomicPath = (payload?.path as AtomicPath) || "PHX->AMM";
-      const ammVenue = String(payload?.amm_venue ?? payload?.ammVenue ?? "raydium").toLowerCase() as "raydium" | "orca";
-      const poolFromPayload = String(payload?.amm?.pool ?? "").trim();
-      const poolKind = String(payload?.amm_meta?.poolKind ?? payload?.amm_pool_kind ?? "")
+      const isAmmAmm = atomicPath === "AMM->AMM";
+      const ammVenue = String(
+        payload?.amm_venue ??
+        payload?.amm?.venue ??
+        payload?.ammVenue ??
+        "raydium"
+      ).toLowerCase() as "raydium" | "orca";
+      const poolFromPayload = String(
+        payload?.amm_pool_id ??
+        payload?.amm?.pool ??
+        ""
+      ).trim();
+      const poolKind = String(
+        payload?.amm_meta?.poolKind ??
+        payload?.amm?.meta?.poolKind ??
+        payload?.amm_pool_kind ??
+        ""
+      )
+        .trim()
+        .toLowerCase();
+      const ammDstVenue = String(
+        payload?.amm_dst_venue ??
+        payload?.amm_dst?.venue ??
+        ""
+      ).toLowerCase() as "raydium" | "orca" | "";
+      const ammDstPoolId = String(
+        payload?.amm_dst_pool_id ??
+        payload?.amm_dst?.pool ??
+        ""
+      ).trim();
+      const ammDstPoolKind = String(
+        payload?.amm_dst_meta?.poolKind ??
+        payload?.amm_dst?.meta?.poolKind ??
+        ""
+      )
         .trim()
         .toLowerCase();
       let sizeBase = Number(payload?.size_base ?? payload?.trade_size_base ?? 0);
@@ -203,23 +328,185 @@ export class LiveExecutor {
           return;
         }
       } else {
-        logger.log("force_exec_enabled", { path: atomicPath, ammVenue, size_base: sizeBase, ev_quote: evQuote, ev_bps: evBps });
+        const forceLog: Record<string, unknown> = {
+          path: atomicPath,
+          amm_src: ammVenue,
+          size_base: sizeBase,
+          ev_quote: evQuote,
+          ev_bps: evBps,
+        };
+        if (isAmmAmm) forceLog.amm_dst = ammDstVenue;
+        logger.log("force_exec_enabled", forceLog);
       }
-
-      if (!phoenix?.market) {
+      if (!isAmmAmm && !phoenix?.market) {
         logger.log("submit_error", { where: "maybe_execute", error: "missing_phoenix_market" });
         return;
       }
 
-      const market = new PublicKey(phoenix.market);
+      const resolvePoolId = (venue: string, poolId: string): string => {
+        if (poolId) return poolId;
+        if (venue === "raydium") return (process.env.RAYDIUM_POOL_ID ?? process.env.RAYDIUM_POOL_ID_SOL_USDC ?? DEFAULT_RAYDIUM_POOL_ID).trim();
+        if (venue === "orca") return (process.env.ORCA_POOL_ID ?? DEFAULT_ORCA_POOL_ID).trim();
+        return poolId;
+      };
 
-      // 1) PHOENIX
-      let phxIxs: TransactionInstruction[] = Array.isArray(payload?.phxIxs) ? toIxArray(payload.phxIxs) : [];
-      if (!phxIxs.length) {
-        const limitPx = Number(phoenix.limit_px ?? phoenix.limitPx ?? (payload?.sell_px ?? payload?.buy_px));
-        const slippageBps = Number(process.env.PHOENIX_SLIPPAGE_BPS ?? "3");
-        logger.log("phoenix_build_params", { market: market.toBase58(), side: phoenix.side, sizeBase, limitPx, slippageBps });
-        try {
+      type BuiltLeg = { ixs: TransactionInstruction[]; lookupTables: PublicKey[] };
+
+      const buildAmmLeg = async (leg: {
+        venue: string;
+        poolId: string;
+        poolKind?: string;
+        baseIn: boolean;
+        sizeBase: number;
+        refPx: number;
+        label: string;
+      }): Promise<BuiltLeg> => {
+        const venue = leg.venue.toLowerCase();
+        const poolKind = (leg.poolKind ?? "").toLowerCase();
+        const poolId = resolvePoolId(venue, leg.poolId);
+        if (!poolId) {
+          throw new Error(`missing_pool_id_${venue}`);
+        }
+        if (!(leg.refPx > 0)) {
+          throw new Error(`${venue}_no_ref_px`);
+        }
+
+        if (venue === "raydium" && poolKind === "clmm") {
+          const amountInAtoms = leg.baseIn
+            ? uiToAtoms(leg.sizeBase, 9)
+            : uiToAtoms(leg.sizeBase * leg.refPx, 6);
+
+          const expectedOutAtoms = leg.baseIn
+            ? uiToAtoms(leg.sizeBase * leg.refPx, 6)
+            : uiToAtoms(leg.sizeBase, 9);
+
+          const clmm = await buildRaydiumClmmSwapIx({
+            connection: this.conn,
+            user: this.payer.publicKey,
+            poolId,
+            baseIn: leg.baseIn,
+            amountInAtoms,
+            expectedOutAtoms,
+            slippageBps: SLIPPAGE_BPS,
+          });
+          if (!clmm.ok) throw new Error(clmm.reason);
+          const ixs = clmm.ixs;
+          assertIxArray(ixs, "raydium_clmm");
+          logger.log("raydium_clmm_build_ok", { ixs: ixs.length, pool: poolId, leg: leg.label });
+          return { ixs, lookupTables: clmm.lookupTables ?? [] };
+        }
+
+        if (venue === "raydium") {
+          const poolPk = new PublicKey(poolId);
+          const meta = await ensureRaydiumPoolMeta(this.conn, poolPk);
+          const amountInAtoms = leg.baseIn
+            ? uiToAtoms(leg.sizeBase, 9)
+            : uiToAtoms(leg.sizeBase * leg.refPx, 6);
+
+          const dynExtra = Number.parseFloat(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? "0");
+          const bufferBps = Number.parseFloat(process.env.RAYDIUM_MINOUT_BUFFER_BPS ?? "0");
+          const usedSlip = Math.max(0, SLIPPAGE_BPS + dynExtra + bufferBps);
+
+          const inMint: PublicKey = leg.baseIn ? meta.baseMint : meta.quoteMint;
+          const outMint: PublicKey = leg.baseIn ? meta.quoteMint : meta.baseMint;
+
+          let outAtoms: bigint;
+          if (leg.baseIn) {
+            const inUi = Number(amountInAtoms) / 1e9;
+            const outUi = inUi * leg.refPx;
+            outAtoms = BigInt(Math.floor(outUi * 1e6));
+          } else {
+            const inUi = Number(amountInAtoms) / 1e6;
+            const outUi = inUi / leg.refPx;
+            outAtoms = BigInt(Math.floor(outUi * 1e9));
+          }
+          const minOut = applyBpsDownBig(outAtoms, usedSlip);
+
+          const ixs = await buildRaydiumCpmmSwapIx({
+            connection: this.conn,
+            owner: this.payer.publicKey,
+            poolId: poolPk,
+            inMint,
+            outMint,
+            amountIn: amountInAtoms,
+            amountOutMin: minOut,
+          });
+          assertIxArray(ixs, "raydium_cpmm");
+          logger.log("raydium_build_ok", { ixs: ixs.length, pool: poolId, leg: leg.label });
+          return { ixs, lookupTables: [] };
+        }
+
+        if (venue === "orca") {
+          const whirlpoolPk = new PublicKey(poolId);
+          const amountInAtoms = leg.baseIn
+            ? uiToAtoms(leg.sizeBase, 9)
+            : uiToAtoms(leg.sizeBase * leg.refPx, 6);
+          const built = await buildOrcaWhirlpoolSwapIx({
+            connection: this.conn,
+            user: this.payer.publicKey,
+            poolId: whirlpoolPk.toBase58(),
+            baseIn: leg.baseIn,
+            amountInAtoms,
+            slippageBps: SLIPPAGE_BPS,
+          });
+          if (!built.ok) throw new Error(built.reason);
+          const ixs = built.ixs;
+          assertIxArray(ixs, "orca");
+          logger.log("orca_build_ok", { ixs: ixs.length, pool: whirlpoolPk.toBase58(), leg: leg.label });
+          return { ixs, lookupTables: [] };
+        }
+
+        throw new Error(`unsupported_amm_venue_${venue}`);
+      };
+
+      // ── Build legs ─────────────────────────────────────────────────────────
+      let phxIxs: TransactionInstruction[] = [];
+      let ammSrcIxs: TransactionInstruction[] = [];
+      let ammDstIxs: TransactionInstruction[] = [];
+      const lutSet = new Map<string, PublicKey>();
+      const pushLuts = (luts: PublicKey[] = []) => {
+        for (const pk of luts) {
+          if (!pk) continue;
+          lutSet.set(pk.toBase58(), pk);
+        }
+      };
+
+      if (isAmmAmm) {
+        const srcPoolId = resolvePoolId(ammVenue, poolFromPayload);
+        const dstPoolId = resolvePoolId(ammDstVenue, ammDstPoolId);
+        if (!srcPoolId || !dstPoolId) {
+          logger.log("submit_error", { where: "amm_amm_build", error: "missing_pool_id", srcPoolId, dstPoolId });
+          return;
+        }
+        const srcLeg = await buildAmmLeg({
+          venue: ammVenue,
+          poolId: srcPoolId,
+          poolKind,
+          baseIn: false, // quote -> base
+          sizeBase,
+          refPx: buy_px,
+          label: "src",
+        });
+        const dstLeg = await buildAmmLeg({
+          venue: ammDstVenue || ammVenue,
+          poolId: dstPoolId,
+          poolKind: ammDstPoolKind,
+          baseIn: true, // base -> quote
+          sizeBase,
+          refPx: sell_px,
+          label: "dst",
+        });
+        ammSrcIxs = srcLeg.ixs;
+        ammDstIxs = dstLeg.ixs;
+        pushLuts(srcLeg.lookupTables);
+        pushLuts(dstLeg.lookupTables);
+      } else {
+        const market = new PublicKey(phoenix.market);
+        phxIxs = Array.isArray(payload?.phxIxs) ? toIxArray(payload.phxIxs) : [];
+        if (!phxIxs.length) {
+          const limitPx = Number(phoenix.limit_px ?? phoenix.limitPx ?? (payload?.sell_px ?? payload?.buy_px));
+          const slippageBps = Number(process.env.PHOENIX_SLIPPAGE_BPS ?? "3");
+          logger.log("phoenix_build_params", { market: market.toBase58(), side: phoenix.side, sizeBase, limitPx, slippageBps });
           const built: any = await buildPhoenixSwapIxs({
             connection: this.conn,
             owner: this.payer.publicKey,
@@ -234,159 +521,59 @@ export class LiveExecutor {
           else if (built && typeof built === "object" && "ok" in built && (built as any).ok && (built as any).ixs) phxIxs = toIxArray((built as any).ixs);
           if (!phxIxs.length) throw new Error("phoenix_build_returned_no_instructions");
           logger.log("phoenix_build_ok", { ixs: phxIxs.length });
-        } catch (err) {
-          const e = err as any;
-          logger.log("submit_error", { where: "phoenix_build", error: String(e?.message ?? e) });
-          return;
         }
-      }
-      assertIxArray(phxIxs, "phoenix");
+        assertIxArray(phxIxs, "phoenix");
 
-      // 2) AMM leg: choose Raydium or Orca
-      const baseIn = atomicPath === "PHX->AMM";
-      let rayIxs: TransactionInstruction[] = [];
-      let orcaIxs: TransactionInstruction[] = [];
-
-      if (ammVenue === "raydium" && poolKind === "clmm") {
-        const clmmPoolId = poolFromPayload || getenv("RAYDIUM_CLMM_POOL_ID");
-        if (!clmmPoolId) {
-          logger.log("submit_error", { where: "raydium_clmm_build", error: "missing_pool_id" });
-          return;
-        }
-
-        const refPx = Number(baseIn ? payload?.sell_px : payload?.buy_px) || 0;
-        if (!(refPx > 0)) { logger.log("submit_error", { where: "raydium_clmm_build", error: "no_ref_px" }); return; }
-
-        const amountInAtoms = baseIn
-          ? uiToAtoms(sizeBase, 9)
-          : uiToAtoms(sizeBase * refPx, 6);
-
-        const expectedOutAtoms = baseIn
-          ? uiToAtoms(sizeBase * refPx, 6)
-          : uiToAtoms(sizeBase, 9);
-
-        const clmm = await buildRaydiumClmmSwapIx({
-          connection: this.conn,
-          user: this.payer.publicKey,
-          poolId: clmmPoolId,
-          baseIn,
-          amountInAtoms,
-          expectedOutAtoms,
-          slippageBps: SLIPPAGE_BPS,
+        const srcPoolId = resolvePoolId(ammVenue, poolFromPayload);
+        const leg = await buildAmmLeg({
+          venue: ammVenue,
+          poolId: srcPoolId,
+          poolKind,
+          baseIn: atomicPath === "PHX->AMM",
+          sizeBase,
+          refPx: atomicPath === "PHX->AMM" ? sell_px : buy_px,
+          label: "amm",
         });
-
-        if (!clmm.ok) { logger.log("submit_error", { where: "raydium_clmm_build", error: clmm.reason }); return; }
-        rayIxs = clmm.ixs;
-        assertIxArray(rayIxs, "raydium_clmm");
-        logger.log("raydium_clmm_build_ok", { ixs: rayIxs.length, pool: clmmPoolId });
-      } else if (ammVenue === "raydium") {
-        const poolIdStr = poolFromPayload || DEFAULT_RAYDIUM_POOL_ID;
-        const poolId = new PublicKey(poolIdStr);
-        const meta = await ensureRaydiumPoolMeta(this.conn, poolId);
-
-        let amountInAtoms: bigint;
-        if (baseIn) amountInAtoms = uiToAtoms(sizeBase, 9);
-        else {
-          const px = Number(phoenix.limit_px ?? phoenix.limitPx ?? payload?.buy_px ?? payload?.sell_px ?? 0);
-          const quoteInUi = Math.max(0, sizeBase * (px || 0));
-          amountInAtoms = uiToAtoms(quoteInUi, 6);
-        }
-
-        const dynExtra = Number.parseFloat(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? "0");
-        const bufferBps = Number.parseFloat(process.env.RAYDIUM_MINOUT_BUFFER_BPS ?? "0");
-        const usedSlip = Math.max(0, SLIPPAGE_BPS + dynExtra + bufferBps);
-
-        const inMint: PublicKey = baseIn ? meta.baseMint : meta.quoteMint;
-        const outMint: PublicKey = baseIn ? meta.quoteMint : meta.baseMint;
-
-        const refPx = Number(baseIn ? (payload?.sell_px ?? payload?.buy_px) : (payload?.buy_px ?? payload?.sell_px)) || 0;
-        if (!(refPx > 0)) { logger.log("submit_error", { where: "raydium_build", error: "no_ref_px" }); return; }
-
-        let outAtoms: bigint;
-        if (baseIn) {
-          const inUi = Number(amountInAtoms) / 1e9;
-          const outUi = inUi * refPx;
-          outAtoms = BigInt(Math.floor(outUi * 1e6));
-        } else {
-          const inUi = Number(amountInAtoms) / 1e6;
-          const outUi = inUi / refPx;
-          outAtoms = BigInt(Math.floor(outUi * 1e9));
-        }
-        const minOut = applyBpsDownBig(outAtoms, usedSlip);
-
-        try {
-          rayIxs = await buildRaydiumCpmmSwapIx({
-            connection: this.conn,
-            owner: this.payer.publicKey,
-            poolId,
-            inMint,
-            outMint,
-            amountIn: amountInAtoms,
-            amountOutMin: minOut,
-          });
-          if (!Array.isArray(rayIxs) || rayIxs.length === 0) throw new Error("raydium_builder_returned_no_instructions");
-          logger.log("raydium_build_ok", { ixs: rayIxs.length, pool: poolIdStr });
-        } catch (err) {
-          const e = err as any;
-          logger.log("submit_error", { where: "raydium_build", error: String(e?.message ?? e) });
-          return;
-        }
-        assertIxArray(rayIxs, "raydium");
-      } else {
-        const whirlpoolId = new PublicKey(poolFromPayload || DEFAULT_ORCA_POOL_ID);
-
-        const px = Number(baseIn ? payload?.sell_px : payload?.buy_px) || 0;
-        if (!(px > 0)) { logger.log("submit_error", { where: "orca_build", error: "no_ref_px" }); return; }
-
-        const amountInAtoms = baseIn
-          ? uiToAtoms(sizeBase, 9)
-          : uiToAtoms(sizeBase * px, 6);
-
-        try {
-          const orcaResult = await buildOrcaWhirlpoolSwapIx({
-            connection: this.conn,
-            user: this.payer.publicKey,
-            poolId: whirlpoolId.toBase58(),
-            baseIn,
-            amountInAtoms,
-            slippageBps: SLIPPAGE_BPS,
-          });
-
-          if (orcaResult.ok) {
-            orcaIxs = orcaResult.ixs;
-          } else {
-            throw new Error(orcaResult.reason);
-          }
-          if (!Array.isArray(orcaIxs) || orcaIxs.length === 0) throw new Error("orca_builder_returned_no_instructions");
-          logger.log("orca_build_ok", { ixs: orcaIxs.length, pool: whirlpoolId.toBase58() });
-        } catch (err) {
-          const e = err as any;
-          logger.log("submit_error", { where: "orca_build", error: String(e?.message ?? e) });
-          return;
-        }
-        assertIxArray(orcaIxs, "orca");
+        ammSrcIxs = leg.ixs;
+        pushLuts(leg.lookupTables);
       }
 
       // --------- PRE-TX BALANCES ----------
       const pre = await getUiBalances(this.conn, this.payer.publicKey);
       logger.log("pre_tx_balances", {
-        path: atomicPath, ammVenue, size_base: sizeBase,
-        buy_px, sell_px, FIXED_TX_COST_QUOTE, PNL_SAFETY_BPS,
+        path: atomicPath,
+        amm_src: ammVenue,
+        amm_dst: isAmmAmm ? ammDstVenue : undefined,
+        size_base: sizeBase,
+        buy_px,
+        sell_px,
+        FIXED_TX_COST_QUOTE,
+        PNL_SAFETY_BPS,
         forced: FORCE || undefined,
-        ...pre
+        ...pre,
       });
 
       // --------- BUILD ATOMIC (for simulation) ----------
       const preIxs = buildPreIxs(CU_LIMIT, CU_PRICE);
-      const ammIxs = ammVenue === "raydium" ? rayIxs : orcaIxs;
-      const ixs = [...preIxs, ...phxIxs, ...ammIxs];
+      const instructions = isAmmAmm
+        ? [...preIxs, ...ammSrcIxs, ...ammDstIxs]
+        : [...preIxs, ...phxIxs, ...ammSrcIxs];
+
+      const lutAccounts = await this.getLookupTableAccounts(Array.from(lutSet.values()));
+      if (lutSet.size && lutAccounts.length < lutSet.size) {
+        logger.log("lookup_table_incomplete", {
+          requested: Array.from(lutSet.keys()),
+          fetched: lutAccounts.length,
+        });
+        return;
+      }
 
       const latest = await this.conn.getLatestBlockhash("processed");
       const msg = new TransactionMessage({
         payerKey: this.payer.publicKey,
         recentBlockhash: latest.blockhash,
-        instructions: ixs,
-      }).compileToV0Message();
+        instructions,
+      }).compileToV0Message(lutAccounts);
       const tx = new VersionedTransaction(msg);
       tx.sign([this.payer]);
 
@@ -399,7 +586,6 @@ export class LiveExecutor {
         err: sim.err,
       });
 
-      // Send gate: block when unfunded or sim-only mode on
       const gate = await canActuallySendNow(this.conn, { env: process.env, owner: this.payer.publicKey });
       if (!gate) {
         logger.log("send_gate_off", { reason: "sim_only_or_unfunded", sim_ok: sim.ok, err: sim.err });
@@ -412,20 +598,43 @@ export class LiveExecutor {
       }
 
       // --------- SUBMIT ----------
-      const only = process.env.ONLY_PHX ? "phx" : (process.env.ONLY_RAY ? "ray" : undefined);
-      const total = preIxs.length + phxIxs.length + ammIxs.length;
-      logger.log("submit_ixs", { label: "atomic", phx: phxIxs.length, amm: ammIxs.length, total });
+      const only = isAmmAmm
+        ? "both"
+        : process.env.ONLY_PHX
+          ? "phx"
+          : process.env.ONLY_RAY
+            ? "ray"
+            : undefined;
+      const total = instructions.length;
+      logger.log("submit_ixs", {
+        label: isAmmAmm ? "amm-amm" : "atomic",
+        phx: phxIxs.length,
+        amm_src: ammSrcIxs.length,
+        amm_dst: ammDstIxs.length,
+        total,
+      });
 
       const sig = await submitAtomic({
         connection: this.conn,
         owner: this.payer,
         preIxs,
-        phxIxs,
-        rayIxs: ammIxs, // pass AMM ixs regardless of venue
+        phxIxs: isAmmAmm ? ammSrcIxs : phxIxs,
+        rayIxs: isAmmAmm ? ammDstIxs : ammSrcIxs,
         only: only as any,
+        lookupTableAccounts: lutAccounts,
       });
 
-      logger.log("submitted_tx", { path: atomicPath, ammVenue, size_base: sizeBase, ix_count: total, cu_limit: CU_LIMIT, sig, live: true, shadow: false });
+      logger.log("submitted_tx", {
+        path: atomicPath,
+        amm_src: ammVenue,
+        amm_dst: isAmmAmm ? ammDstVenue : undefined,
+        size_base: sizeBase,
+        ix_count: total,
+        cu_limit: CU_LIMIT,
+        sig,
+        live: true,
+        shadow: false,
+      });
 
       // --------- CONFIRM ----------
       const t0 = Date.now();
@@ -443,7 +652,11 @@ export class LiveExecutor {
       logger.log("post_tx_balances", { sig, slot, conf_ms, ...post, ...realized });
 
       logger.log("realized_summary", {
-        sig, path: atomicPath, ammVenue, size_base: sizeBase,
+        sig,
+        path: atomicPath,
+        amm_src: ammVenue,
+        amm_dst: isAmmAmm ? ammDstVenue : undefined,
+        size_base: sizeBase,
         buy_px, sell_px,
         expected_ev_quote: Number(((sell_px - buy_px) * sizeBase - FIXED_TX_COST_QUOTE).toFixed(6)),
         ...realized

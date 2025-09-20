@@ -119,7 +119,7 @@ interface BuildArgs {
 }
 
 export async function buildRaydiumClmmSwapIx(args: BuildArgs): Promise<
-    | { ok: true; ixs: TransactionInstruction[] }
+    | { ok: true; ixs: TransactionInstruction[]; lookupTables?: PublicKey[] }
     | { ok: false; reason: string }
 > {
     try {
@@ -204,14 +204,31 @@ export async function buildRaydiumClmmSwapIx(args: BuildArgs): Promise<
               });
 
         const out: TransactionInstruction[] = [];
+        const lookupTablesSet = new Map<string, PublicKey>();
         for (const inner of buildResult.innerTransactions ?? []) {
             for (const ix of inner.instructions ?? []) {
                 out.push(ix);
             }
+            const rawLuts: any = (inner as any).lookupTableAddress;
+            if (Array.isArray(rawLuts)) {
+                for (const lut of rawLuts) {
+                    try {
+                        const pk = lut instanceof PublicKey ? lut : new PublicKey(lut);
+                        lookupTablesSet.set(pk.toBase58(), pk);
+                    } catch { /* ignore malformed entries */ }
+                }
+            } else if (rawLuts && typeof rawLuts === "object") {
+                for (const key of Object.keys(rawLuts)) {
+                    try {
+                        const pk = new PublicKey(key);
+                        lookupTablesSet.set(pk.toBase58(), pk);
+                    } catch { /* ignore malformed entries */ }
+                }
+            }
         }
 
         if (!out.length) return { ok: false, reason: "raydium_clmm_builder_returned_no_instructions" };
-        return { ok: true, ixs: out };
+        return { ok: true, ixs: out, lookupTables: Array.from(lookupTablesSet.values()) };
     } catch (e: any) {
         return { ok: false, reason: String(e?.message ?? e) };
     }

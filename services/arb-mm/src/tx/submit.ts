@@ -4,6 +4,7 @@ import type {
     PublicKey,
     TransactionInstruction,
     Signer,
+    AddressLookupTableAccount,
 } from '@solana/web3.js';
 import {
     VersionedTransaction,
@@ -46,8 +47,17 @@ export async function submitAtomic(params: {
     phxIxs: TransactionInstruction[];
     rayIxs: TransactionInstruction[];
     only?: 'phx' | 'ray' | 'both';
+    lookupTableAccounts?: AddressLookupTableAccount[];
 }): Promise<string> {
-    const { connection, owner, preIxs = buildPreIxs(), phxIxs, rayIxs, only = 'both' } = params;
+    const {
+        connection,
+        owner,
+        preIxs = buildPreIxs(),
+        phxIxs,
+        rayIxs,
+        only = 'both',
+        lookupTableAccounts = [],
+    } = params;
 
     const body =
         only === 'phx' ? [...preIxs, ...phxIxs]
@@ -62,7 +72,7 @@ export async function submitAtomic(params: {
         payerKey: owner.publicKey,
         recentBlockhash: blockhash,
         instructions: body,
-    }).compileToV0Message();
+    }).compileToV0Message(lookupTableAccounts);
 
     const tx = new VersionedTransaction(msgV0);
     tx.sign([owner]); // exactly one signer

@@ -17,6 +17,7 @@
 
 import type { Connection, PublicKey } from "@solana/web3.js";
 import { PublicKey as PK } from "@solana/web3.js";
+import { PoolInfoLayout, SqrtPriceMath, AmmConfigLayout } from "@raydium-io/raydium-sdk";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -74,6 +75,12 @@ function findPairForPool(poolId: string): { symbol?: string; baseMint?: string; 
 }
 
 const mintDecCache = new Map<string, number>();
+
+// ──────────────────────────────────────────────────────────────
+// Raydium CLMM helpers (API + on-chain state)
+// ──────────────────────────────────────────────────────────────
+
+const STATE_REFRESH_MS = Number(process.env.RAYDIUM_CLMM_REFRESH_MS ?? 1_000);
 async function fetchMintDecimals(conn: Connection, mint: string | PublicKey | undefined, fallback?: number): Promise<number> {
     if (!mint) return fallback ?? 9;
     const key = typeof mint === "string" ? mint : mint.toBase58();
@@ -93,11 +100,111 @@ async function fetchMintDecimals(conn: Connection, mint: string | PublicKey | un
 // ──────────────────────────────────────────────────────────────
 // Adapter
 // ──────────────────────────────────────────────────────────────
+type ClmmStateSnapshot = {
+    price: number;
+    feeBps: number;
+    baseDecimals: number;
+    quoteDecimals: number;
+    ts: number;
+};
+
 export async function createRaydiumClmmAdapter(conn: Connection, poolId: string): Promise<AmmAdapter> {
     // Discover pair metadata from configs (symbol & mints help with decimals and logging).
     const meta = findPairForPool(poolId) ?? {};
     const symbol = meta.symbol || "UNKNOWN/UNKNOWN";
     let _conn: Connection | undefined = conn;
+
+    let stateCache: ClmmStateSnapshot | null = null;
+    let inflightState: Promise<ClmmStateSnapshot> | null = null;
+    let configFeeCache: number | null = null;
+
+    async function resolveConfigFee(layout: any): Promise<number | null> {
+        if (configFeeCache != null) return configFeeCache;
+        if (!_conn) return null;
+        try {
+            const configPk = layout?.ammConfig;
+            if (!configPk) return null;
+            const configInfo = await _conn.getAccountInfo(configPk, "confirmed");
+            if (!configInfo?.data) return null;
+            const decoded = AmmConfigLayout.decode(configInfo.data) as any;
+            const rate = decoded?.tradeFeeRate;
+            const fee = Number(rate);
+            if (Number.isFinite(fee) && fee > 0) {
+                configFeeCache = Math.round(fee * 10_000);
+                return configFeeCache;
+            }
+        } catch {
+            // swallow, fall through to env fallback
+        }
+        return null;
+    }
+
+    async function fetchState(force = false): Promise<ClmmStateSnapshot> {
+        if (!_conn) throw new Error("raydium_clmm_no_connection");
+        const now = Date.now();
+        const cached = stateCache;
+        if (!force && cached && now - cached.ts <= STATE_REFRESH_MS) return cached;
+        if (inflightState) return inflightState;
+
+        const pending: Promise<ClmmStateSnapshot> = (async () => {
+            const info = await _conn!.getAccountInfo(new PK(poolId), "confirmed");
+            if (!info?.data) throw new Error("raydium_clmm_account_missing");
+
+            const layout = PoolInfoLayout.decode(info.data) as any;
+
+            const mintA = layout.mintA.toBase58();
+            const mintB = layout.mintB.toBase58();
+            const decimalsA = layout.mintDecimalsA;
+            const decimalsB = layout.mintDecimalsB;
+            const sqrtPrice = layout.sqrtPriceX64;
+
+            const priceAB = SqrtPriceMath
+                .sqrtPriceX64ToPrice(sqrtPrice, decimalsA, decimalsB)
+                .toNumber();
+            if (!(priceAB > 0)) throw new Error("raydium_clmm_price_invalid");
+
+            const baseMint = (meta.baseMint ?? "").trim();
+            const quoteMint = (meta.quoteMint ?? "").trim();
+            const baseIsA = baseMint && baseMint === mintA;
+            const baseIsB = baseMint && baseMint === mintB;
+
+            let price = priceAB;
+            let baseDecimals = decimalsA;
+            let quoteDecimals = decimalsB;
+
+            if (baseIsB) {
+                price = priceAB > 0 ? 1 / priceAB : Number.NaN;
+                baseDecimals = decimalsB;
+                quoteDecimals = decimalsA;
+            } else if (!baseIsA && baseMint) {
+                // Base mint not matched; keep layout ordering to avoid accidental inversion.
+                baseDecimals = decimalsA;
+                quoteDecimals = decimalsB;
+            }
+
+            const configFee = await resolveConfigFee(layout);
+            const feeBps = configFee ?? Number(process.env.RAYDIUM_TRADE_FEE_BPS ?? process.env.AMM_TAKER_FEE_BPS ?? 25);
+
+            stateCache = {
+                price,
+                feeBps,
+                baseDecimals,
+                quoteDecimals,
+                ts: now,
+            };
+            return stateCache;
+        })();
+
+        inflightState = pending.then((value) => {
+            inflightState = null;
+            return value;
+        }).catch((err) => {
+            inflightState = null;
+            throw err;
+        });
+
+        return inflightState!;
+    }
 
     // Pre-fetch decimals (best-effort). Typical SOL/USDC defaults keep us safe if not found.
     const baseDecimals = await fetchMintDecimals(conn, meta.baseMint, 9);
@@ -106,31 +213,44 @@ export async function createRaydiumClmmAdapter(conn: Connection, poolId: string)
     // Best-effort mid(): computing from on-chain sqrtPriceX64 would require exact layout decode.
     // For Step 2 we can safely return NaN — publisher still emits a line (joiner ignores invalid px).
     async function mid(): Promise<number> {
-        // TODO (Step 2.5/3): parse Raydium CLMM pool account layout and compute from sqrtPriceX64.
-        // Return NaN for now (keeps this adapter inert but visible).
-        return Number.NaN;
+        try {
+            const state = await fetchState();
+            return Number.isFinite(state.price) && state.price > 0 ? state.price : Number.NaN;
+        } catch {
+            return Number.NaN;
+        }
     }
 
-    // Fee decode: Raydium CLMM stores feeRate in 1e6 scale (ppm). Convert to bps if available.
-    // Without a layout parser, fall back to any hint injected by the registry, or env.
+    // Fee decode: Raydium CLMM stores feeRate in 1e6 scale (ppm). Convert to bps when available.
     async function feeBps(): Promise<number> {
         const hint = (adapter as any).__hintFeeBps;
         if (Number.isFinite(hint)) return Number(hint);
-        // conservative fallbacks; will be overridden later when we wire exact decode
+        try {
+            const state = await fetchState();
+            if (Number.isFinite(state.feeBps) && state.feeBps > 0) return state.feeBps;
+        } catch { /* fall back to env */ }
         const env = process.env.RAYDIUM_TRADE_FEE_BPS ?? process.env.AMM_TAKER_FEE_BPS ?? "25";
         const n = Number(env);
         return Number.isFinite(n) ? n : 25;
     }
 
     async function reservesAtoms(): Promise<ReserveSnapshot> {
-        // DO NOT leak CLMM vault balances — they are not CPMM-compatible.
-        // Return zeros with correct decimals; publisher will suppress base_int/quote_int for CLMM anyway.
-        return {
-            base: 0n,
-            quote: 0n,
-            baseDecimals,
-            quoteDecimals,
-        };
+        try {
+            const state = await fetchState();
+            return {
+                base: 0n,
+                quote: 0n,
+                baseDecimals: state.baseDecimals ?? baseDecimals,
+                quoteDecimals: state.quoteDecimals ?? quoteDecimals,
+            };
+        } catch {
+            return {
+                base: 0n,
+                quote: 0n,
+                baseDecimals,
+                quoteDecimals,
+            };
+        }
     }
 
     const adapter: AmmAdapter = {

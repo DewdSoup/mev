@@ -14,7 +14,8 @@ export type SlipMode = "flat" | "amm_cpmm" | "adaptive";
 const __filename: string = fileURLToPath(import.meta.url);
 const __dirname: string = path.dirname(__filename);
 const SVC_ROOT: string = path.resolve(__dirname, "..");
-const DEFAULT_DATA_DIR: string = path.resolve(SVC_ROOT, "..", "..", "data", "arb");
+const REPO_ROOT: string = path.resolve(SVC_ROOT, "..", "..");
+const DEFAULT_DATA_DIR: string = path.join(REPO_ROOT, "data", "arb");
 
 // Load .env.live with highest precedence, then .env
 function loadRootEnv(): void {
@@ -90,9 +91,13 @@ export function resolvePathCandidates(rel: string): string[] {
 }
 export function firstExistingPathOrDefault(relOrAbs: string): string {
   if (path.isAbsolute(relOrAbs)) return relOrAbs;
-  const candidates: string[] = resolvePathCandidates(relOrAbs);
+  const candidates: string[] = [
+    path.resolve(SVC_ROOT, relOrAbs),
+    path.resolve(REPO_ROOT, relOrAbs),
+    path.resolve(process.cwd(), relOrAbs),
+  ];
   for (const p of candidates) if (fs.existsSync(p)) return p;
-  return path.resolve(SVC_ROOT, relOrAbs);
+  return path.resolve(REPO_ROOT, relOrAbs);
 }
 
 // ── RPC resolver ───────────
@@ -265,7 +270,7 @@ export function loadConfig(): AppConfig {
   const DATA_ENV_RAW: string | undefined = process.env.DATA_DIR ?? process.env.ARB_DATA_DIR;
   const DATA_ENV: string | undefined = DATA_ENV_RAW?.trim();
   const DATA_DIR: string = DATA_ENV
-    ? (path.isAbsolute(DATA_ENV) ? DATA_ENV : path.resolve(SVC_ROOT, DATA_ENV))
+    ? (path.isAbsolute(DATA_ENV) ? DATA_ENV : path.resolve(REPO_ROOT, DATA_ENV))
     : DEFAULT_DATA_DIR;
   const PARAMS_DIR: string = path.join(DATA_DIR, "params");
   const AUTO_APPLY_PARAMS: boolean = parseBoolEnv(process.env.AUTO_APPLY_PARAMS, false);

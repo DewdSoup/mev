@@ -106,6 +106,7 @@ class PairPipeline {
     private rpcMsP50 = 0;
     private rpcMsP95 = 0;
     private rpcBlocked = 0;
+    private ammVenueByPool = new Map<string, { venue: string; poolKind?: string; feeBps?: number }>();
 
     constructor(
         private pair: PairSpec,
@@ -127,6 +128,23 @@ class PairPipeline {
 
         this._ammFeeBps = ammFeeInit;
         this._phxFeeBps = phxFeeInit;
+
+        for (const venue of pair.ammVenues ?? []) {
+            const poolId = String(venue.poolId ?? "").trim();
+            if (!poolId) continue;
+            if (!this.ammVenueByPool.has(poolId)) {
+                this.ammVenueByPool.set(poolId, {
+                    venue: String(venue.venue ?? pair.adapters?.amm ?? "raydium").toLowerCase(),
+                    poolKind: venue.poolKind,
+                    feeBps: venue.feeBps,
+                });
+            }
+        }
+        if (!this.ammVenueByPool.has(pair.ammPool)) {
+            this.ammVenueByPool.set(pair.ammPool, {
+                venue: String(pair.adapters?.amm ?? "raydium").toLowerCase(),
+            });
+        }
 
         // Construct joiner with pair-scoped params
         const J = new EdgeJoiner(
@@ -170,7 +188,15 @@ class PairPipeline {
     upsertAmmsIfMatch(obj: any) {
         const ev = (obj?.event ?? obj?.name ?? obj?.type ?? "") as string;
         const id = obj?.ammId ?? obj?.pool ?? obj?.id ?? obj?.pool_id;
-        if (!id || String(id) !== this.pair.ammPool) return;
+        if (!id) return;
+        const meta = this.ammVenueByPool.get(String(id));
+        if (!meta) return;
+        if (meta.poolKind && obj.poolKind == null && obj.pool_kind == null) {
+            obj.poolKind = meta.poolKind;
+        }
+        if (meta.feeBps != null && obj.feeBps == null && obj.fee_bps == null) {
+            obj.feeBps = meta.feeBps;
+        }
         // The joiner expects canonical amms_price payloads; we forward as‑is.
         this.joiner.upsertAmms(obj);
     }
@@ -210,22 +236,46 @@ class PairPipeline {
 
         const notional = coalesceRound(6, sizeBase * ((d.buy_px + d.sell_px) / 2));
 
+        const srcPoolId = d.amm_pool_id ?? this.pair.ammPool;
+        const srcVenue = String(d.amm_venue ?? this.ammVenueByPool.get(srcPoolId)?.venue ?? this.pair.adapters?.amm ?? "raydium").toLowerCase();
+        const srcMeta = (d as any).amm_meta ?? this.ammVenueByPool.get(srcPoolId);
+
         const payload: any = {
-            // mirror your current executor payload
             path: d.path,
             size_base: sizeBase,
             buy_px: d.buy_px,
             sell_px: d.sell_px,
             notional_quote: notional,
-            phoenix: {
+            atomic: true,
+            pair: this.pair.id,
+            amm_venue: srcVenue,
+            amm_pool_id: srcPoolId,
+            amm: {
+                pool: srcPoolId,
+                venue: srcVenue,
+                meta: srcMeta,
+            },
+            amm_meta: srcMeta,
+        };
+
+        if (d.path === "AMM->AMM") {
+            if (d.amm_dst_pool_id) {
+                const dstVenue = String(d.amm_dst_venue ?? this.ammVenueByPool.get(d.amm_dst_pool_id)?.venue ?? "raydium").toLowerCase();
+                const dstMeta = (d as any).amm_dst_meta ?? this.ammVenueByPool.get(d.amm_dst_pool_id);
+                payload.amm_dst = {
+                    pool: d.amm_dst_pool_id,
+                    venue: dstVenue,
+                    meta: dstMeta,
+                };
+                payload.amm_dst_meta = dstMeta;
+            }
+        } else {
+            payload.phoenix = {
                 market: this.pair.phoenixMarket,
                 side: d.side as "buy" | "sell",
                 limit_px: d.side === "buy" ? d.buy_px : d.sell_px,
-            },
-            amm: { pool: this.pair.ammPool },
-            atomic: true,
-            pair: this.pair.id,
-        };
+            };
+        }
 
         // Execute (same engine, same atomic mode)
         if (this.liveExec) (this.liveExec as any)?.maybeExecute?.(payload);

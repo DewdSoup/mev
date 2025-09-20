@@ -59,7 +59,14 @@ const TICK_MS = Math.max(250, Number(getenv("AMMS_TICK_MS", "1000")) || 1000);
 // Honors ARB_DATA_DIR / ARB_REPORTS_DIR / EDGE_AMMS_JSONL if provided.
 // ───────────────────────────────────────────────────────────────
 function resolveOutPath(): string {
-  // Highest precedence: explicit file path override
+  // Allow explicit LOG_FILE override first (dev runners export this)
+  const logFile = getenv("LOG_FILE", "").trim();
+  if (logFile) {
+    fs.mkdirSync(path.dirname(logFile), { recursive: true });
+    return logFile;
+  }
+
+  // Next precedence: EDGE_AMMS_JSONL (shared with arb joiner)
   const explicit = getenv("EDGE_AMMS_JSONL", "").trim();
   if (explicit) {
     fs.mkdirSync(path.dirname(explicit), { recursive: true });
@@ -70,7 +77,7 @@ function resolveOutPath(): string {
   const repoRoot = path.resolve(__here, "..", "..", ".."); // from packages/amms/src → repo
   const ammsDirHint = getenv("AMMS_DATA_DIR");
   const ammsDir = ammsDirHint
-    ? (path.isAbsolute(ammsDirHint) ? ammsDirHint : path.resolve(process.cwd(), ammsDirHint))
+    ? (path.isAbsolute(ammsDirHint) ? ammsDirHint : path.resolve(repoRoot, ammsDirHint))
     : path.join(repoRoot, "data", "amms");
 
   fs.mkdirSync(ammsDir, { recursive: true });

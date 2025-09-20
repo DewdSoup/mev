@@ -34,6 +34,35 @@ const DEFAULT_MAX_RETRIES = envNum("RPC_BACKOFF_MAX_RETRIES", 5);
 const DEFAULT_BASE_MS = envNum("RPC_BACKOFF_BASE_MS", 200);
 const DEFAULT_MAX_MS = envNum("RPC_BACKOFF_MAX_MS", 2000);
 const SHOULD_LOG = envBool("RPC_BACKOFF_LOG", true);
+const STATS_EVERY_MS = envNum("RPC_BACKOFF_STATS_MS", 15_000);
+
+const retryCounts = new Map<string, number>();
+const finalCounts = new Map<string, number>();
+const rateLimitCounts = new Map<string, number>();
+let lastStatsEmit = Date.now();
+
+function bump(map: Map<string, number>, key: string) {
+    map.set(key, (map.get(key) ?? 0) + 1);
+}
+
+function maybeEmitStats() {
+    if (!(STATS_EVERY_MS > 0)) return;
+    const now = Date.now();
+    if (now - lastStatsEmit < STATS_EVERY_MS) return;
+    const retry = retryCounts.size ? Object.fromEntries(retryCounts.entries()) : undefined;
+    const finals = finalCounts.size ? Object.fromEntries(finalCounts.entries()) : undefined;
+    const rateLimited = rateLimitCounts.size ? Object.fromEntries(rateLimitCounts.entries()) : undefined;
+    logger.log("rpc_backoff_stats", {
+        window_ms: now - lastStatsEmit,
+        retry_counts: retry,
+        final_errors: finals,
+        rate_limited: rateLimited,
+    });
+    retryCounts.clear();
+    finalCounts.clear();
+    rateLimitCounts.clear();
+    lastStatsEmit = now;
+}
 
 function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -65,15 +94,18 @@ class Semaphore {
     }
 }
 
-/** Determine if we should retry based on error or RPC result. */
-function shouldRetryError(e: any): boolean {
-    if (!e) return false;
+function classifyError(e: any): { retry: boolean; rateLimited: boolean } {
+    if (!e) return { retry: false, rateLimited: false };
     const msg = String((e as any)?.message ?? e).toLowerCase();
-    // Helius / Alchemy / RPC 429 semantics often include '429' / 'too many requests' / 'rate limited'
-    if (msg.includes("429") || msg.includes("rate limit") || msg.includes("too many requests")) return true;
-    // common transient RPC errors
-    if (msg.includes("timeout") || msg.includes("internal server error") || msg.includes("502") || msg.includes("503") || msg.includes("504")) return true;
-    return false;
+    const rateLimited = msg.includes("429") || msg.includes("rate limit") || msg.includes("too many requests");
+    const transient =
+        rateLimited ||
+        msg.includes("timeout") ||
+        msg.includes("internal server error") ||
+        msg.includes("502") ||
+        msg.includes("503") ||
+        msg.includes("504");
+    return { retry: transient, rateLimited };
 }
 
 /**
@@ -100,14 +132,29 @@ async function callWithRetry<T>(fn: AnyFn, opts?: {
             return out;
         } catch (err) {
             const e = err as any;
-            if (!shouldRetryError(e) || attempt > maxRetries) {
+            const { retry, rateLimited } = classifyError(e);
+            if (rateLimited) bump(rateLimitCounts, label);
+            if (!retry || attempt > maxRetries) {
+                bump(finalCounts, label);
+                maybeEmitStats();
                 if (SHOULD_LOG) logger.log("rpc_backoff_final_error", { label, attempt, error: String(e?.message ?? e) });
                 throw err;
             }
             // exponential backoff with jitter
             const backMs = Math.min(maxMs, baseMs * Math.pow(2, attempt - 1));
             const wait = jitter(backMs);
-            if (SHOULD_LOG) logger.log("rpc_backoff_retry", { label, attempt, wait_ms: wait, error: String(e?.message ?? e) });
+            bump(retryCounts, label);
+            maybeEmitStats();
+            if (SHOULD_LOG) {
+                const logObj: Record<string, unknown> = {
+                    label,
+                    attempt,
+                    wait_ms: wait,
+                    error: String(e?.message ?? e),
+                };
+                if (rateLimited) logObj.rate_limited = true;
+                logger.log("rpc_backoff_retry", logObj);
+            }
             await sleep(wait);
             continue;
         }

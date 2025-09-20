@@ -26,6 +26,10 @@ import {
   orcaAvgBuyQuotePerBase,
   orcaAvgSellQuotePerBase,
 } from "../executor/orca_quoter.js";
+import { quoteClmm } from "./clmm_quoter.js";
+import Decimal from "decimal.js";
+
+Decimal.set({ precision: 40, rounding: Decimal.ROUND_HALF_EVEN });
 
 // NEW: config-driven adapters
 import { getAdapter } from "../adapters/manifest.js";
@@ -119,6 +123,7 @@ type AmmSnap = {
   slot?: number | null;  // optional publisher slot
   reserves?: { base: number; quote: number; baseDecimals: number; quoteDecimals: number };
   feeBps: number;
+  poolKind?: string;
 };
 
 // Unified node abstraction for 2-leg paths
@@ -166,6 +171,9 @@ export type DecisionHookDetails = {
   amm_venue?: string;
   amm_pool_id?: string;       // exact pool to hit
   amm_dst_venue?: string;     // for AMM->AMM
+  amm_dst_pool_id?: string;   // for AMM->AMM
+  amm_meta?: { poolKind?: string; feeBps?: number };
+  amm_dst_meta?: { poolKind?: string; feeBps?: number };
 };
 
 export type DecisionHook = (
@@ -241,6 +249,10 @@ export class EdgeJoiner {
   private symbol = "SOL/USDC";
   private baseMint?: string;
   private quoteMint?: string;
+  private phoenixMarket?: string;
+  private phoenixSnapshotDir?: string;
+  private phxSnapshotLastMtime = 0;
+  private phoenixSnapshotTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private P: JoinerParams,
@@ -257,6 +269,7 @@ export class EdgeJoiner {
         this.symbol = first.symbol || this.symbol;
         this.baseMint = first.baseMint;
         this.quoteMint = first.quoteMint;
+        this.phoenixMarket = first.phoenixMarket;
         for (const pair of cfg.pairs) {
           for (const v of pair.venues || []) {
             const key = `${String(v.kind).toLowerCase()}:${v.id}`;
@@ -271,6 +284,24 @@ export class EdgeJoiner {
         logger.log("joiner_pairs_fallback", { symbol: this.symbol, pool_count: 0 });
       }
     } catch { /* best-effort */ }
+
+    const snapshotDirRaw = String(process.env.PHOENIX_SNAPSHOT_DIR ?? "").trim();
+    if (snapshotDirRaw) this.phoenixSnapshotDir = path.resolve(snapshotDirRaw);
+    else this.phoenixSnapshotDir = path.resolve(process.cwd(), "data", "cache", "phoenix");
+
+    this.loadPhoenixSnapshot(true);
+
+    const snapshotPollMs = envInt("PHOENIX_SNAPSHOT_POLL_MS", 5000);
+    if (snapshotPollMs > 0 && this.phoenixMarket) {
+      this.phoenixSnapshotTimer = setInterval(() => {
+        try {
+          this.loadPhoenixSnapshot(false);
+        } catch (e) {
+          logger.log("phoenix_snapshot_refresh_error", { err: String((e as any)?.message ?? e) });
+        }
+      }, snapshotPollMs);
+      this.phoenixSnapshotTimer.unref?.();
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -328,6 +359,8 @@ export class EdgeJoiner {
       reserves,
       feeBps,
     };
+    const poolKindRaw = String(obj?.poolKind ?? obj?.pool_kind ?? obj?.poolType ?? obj?.pool_type ?? "").trim();
+    if (poolKindRaw) snap.poolKind = poolKindRaw;
 
     this.amms.set(`${venue}:${ammId}`, snap);
     void this.maybeReport();
@@ -353,11 +386,12 @@ export class EdgeJoiner {
         const asksArr = Array.isArray(obj?.levels_asks)
           ? (obj.levels_asks as any[]).map((l) => ({ px: Number(l.px), qty: Number(l.qty) }))
           : undefined;
+        const bookTs = nnum(obj?.ts) ?? Date.now();
         this.phxBook = {
           best_bid: bid,
           best_ask: ask,
           mid: (bid + ask) / 2,
-          ts: Date.now(),
+          ts: bookTs,
           source: "book",
           book_method: String(obj?.source ?? "unknown"),
           ...(bidsArr && bidsArr.length ? { levels_bids: bidsArr } : {}),
@@ -366,21 +400,48 @@ export class EdgeJoiner {
       }
     } else if (ev === "phoenix_mid") {
       const px = nnum(obj?.px) ?? (typeof obj?.px_str === "string" ? Number(obj.px_str) : undefined);
-      if (px && px > 0) this.phxMid = { px, ts: Date.now() };
+      const eventTs = nnum(obj?.ts) ?? Date.now();
+      if (px && px > 0) this.phxMid = { px, ts: eventTs };
       const bid = nnum(obj?.best_bid);
       const ask = nnum(obj?.best_ask);
       if (bid && ask && bid > 0 && ask > 0 && bid < ask) {
+        const bookTs = eventTs;
         this.phxBook = {
           best_bid: bid,
           best_ask: ask,
           mid: (bid + ask) / 2,
-          ts: Date.now(),
+          ts: bookTs,
           source: "book",
           book_method: String(obj?.source ?? "unknown"),
         } as any;
       }
     }
     void this.maybeReport();
+  }
+
+  refreshPhoenixSnapshot(force = false): void {
+    this.loadPhoenixSnapshot(force);
+  }
+
+  private loadPhoenixSnapshot(force: boolean): void {
+    if (!this.phoenixMarket || !this.phoenixSnapshotDir) return;
+    try {
+      const file = path.join(this.phoenixSnapshotDir, `${this.phoenixMarket}.json`);
+      const st = fs.statSync(file);
+      if (!force && st.mtimeMs <= this.phxSnapshotLastMtime) return;
+      const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+      this.phxSnapshotLastMtime = st.mtimeMs;
+      this.upsertPhoenix({ event: "phoenix_l2", data: raw });
+      logger.log("phoenix_snapshot_loaded", { file, mtime_ms: st.mtimeMs });
+    } catch (e) {
+      if (force) {
+        logger.log("phoenix_snapshot_load_error", {
+          dir: this.phoenixSnapshotDir,
+          market: this.phoenixMarket,
+          error: String((e as any)?.message ?? e),
+        });
+      }
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -397,20 +458,43 @@ export class EdgeJoiner {
   // CPMM effective price (QUOTE per BASE)
   private cpmmBuyQuotePerBase(xBase: number, yQuote: number, wantBase: number, feeBps: number): number | undefined {
     if (!(xBase > 0 && yQuote > 0) || !(wantBase > 0)) return undefined;
-    const fee = Math.max(0, feeBps) / 10_000;
-    if (wantBase >= xBase * (1 - 1e-9)) return undefined;
-    const dqPrime = (wantBase * yQuote) / (xBase - wantBase);
-    const dq = dqPrime / (1 - fee);
-    if (!Number.isFinite(dq)) return undefined;
-    return dq / wantBase; // avg QUOTE per BASE paid
+    const fee = new Decimal(Math.max(0, feeBps)).div(10_000);
+    const x = new Decimal(xBase);
+    const y = new Decimal(yQuote);
+    const dx = new Decimal(wantBase);
+    const maxFraction = 0.999999999;
+    if (dx.greaterThanOrEqualTo(x.mul(maxFraction))) return undefined;
+
+    const one = new Decimal(1);
+    const dxAfterFee = dx.mul(one.minus(fee));
+    if (dxAfterFee.lte(0)) return undefined;
+
+    const k = x.mul(y);
+    const x1 = x.plus(dxAfterFee);
+    if (x1.lte(0)) return undefined;
+
+    const y1 = k.div(x1);
+    const dy = y.minus(y1);
+    if (dy.lte(0)) return undefined;
+
+    return dy.div(dxAfterFee).toNumber();
   }
   private cpmmSellQuotePerBase(xBase: number, yQuote: number, sellBase: number, feeBps: number): number | undefined {
     if (!(xBase > 0 && yQuote > 0) || !(sellBase > 0)) return undefined;
-    const fee = Math.max(0, feeBps) / 10_000;
-    const dbPrime = sellBase * (1 - fee);
-    const dy = (yQuote * dbPrime) / (xBase + dbPrime);
-    if (!Number.isFinite(dy)) return undefined;
-    return dy / sellBase; // avg QUOTE per BASE received
+    const fee = new Decimal(Math.max(0, feeBps)).div(10_000);
+    const x = new Decimal(xBase);
+    const y = new Decimal(yQuote);
+    const dx = new Decimal(sellBase);
+    if (dx.lte(0)) return undefined;
+
+    const one = new Decimal(1);
+    const dbPrime = dx.mul(one.minus(fee));
+    if (dbPrime.lte(0)) return undefined;
+
+    const dy = y.mul(dbPrime).div(x.plus(dbPrime));
+    if (dy.lte(0)) return undefined;
+
+    return dy.div(dx).toNumber();
   }
 
   // CLMM / mid-only fallback (used only if quoter errs)
@@ -431,24 +515,32 @@ export class EdgeJoiner {
     const ladder: DepthSide[] | undefined = side === "sell" ? (B as any).levels_bids : (B as any).levels_asks;
     if (!ladder || ladder.length === 0 || !(sizeBase > 0)) return undefined;
 
-    let rem = sizeBase, notional = 0;
+    let rem = new Decimal(sizeBase);
+    let notional = new Decimal(0);
     for (const { px, qty } of ladder) {
       if (!(px > 0 && qty > 0)) continue;
-      const take = Math.min(rem, qty);
-      notional += take * px;
-      rem -= take;
-      if (rem <= 1e-12) break;
+      const qtyDec = new Decimal(qty);
+      const pxDec = new Decimal(px);
+      const take = Decimal.min(rem, qtyDec);
+      notional = notional.plus(take.mul(pxDec));
+      rem = rem.minus(take);
+      if (rem.lte(1e-12)) break;
     }
-    if (rem > 1e-12) return undefined;
+    if (rem.gt(1e-12)) return undefined;
 
-    const fee = Math.max(0, feeBps) / 10_000;
-    const extra = Math.max(0, Number(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? this.C.dynamicSlippageExtraBps) / 10_000);
-    const depthExtra = Math.max(0, Number(process.env.PHOENIX_DEPTH_EXTRA_BPS ?? 0) / 10_000);
+    const fee = new Decimal(Math.max(0, feeBps)).div(10_000);
+    const extra = new Decimal(Math.max(0, Number(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? this.C.dynamicSlippageExtraBps))).div(10_000);
+    const depthExtra = new Decimal(Math.max(0, Number(process.env.PHOENIX_DEPTH_EXTRA_BPS ?? 0))).div(10_000);
 
-    const avgPx = notional / sizeBase;
-    return side === "sell"
-      ? avgPx * (1 - depthExtra - extra) * (1 - fee)
-      : avgPx * (1 + depthExtra + extra) * (1 + fee);
+    const avgPx = notional.div(sizeBase);
+    if (avgPx.lte(0)) return undefined;
+    if (side === "sell") {
+      const adj = Decimal.max(0, new Decimal(1).minus(depthExtra).minus(extra).minus(fee));
+      return avgPx.mul(adj).toNumber();
+    } else {
+      const adj = Decimal.max(0, new Decimal(1).plus(depthExtra).plus(extra).plus(fee));
+      return avgPx.mul(adj).toNumber();
+    }
   }
 
   private buildSizeGrid(refPx: number, reserves?: { base: number }): number[] {
@@ -526,6 +618,9 @@ export class EdgeJoiner {
     const adapter = getAdapter(amm.venue);
     const slip = this.P.flatSlippageBps;
 
+    const poolKind = String(amm.poolKind ?? "").toLowerCase();
+    const isClmm = poolKind === "clmm";
+
     // Prefer adapter (config-driven; fee-aware)
     if (adapter?.quote) {
       try {
@@ -548,6 +643,35 @@ export class EdgeJoiner {
       }
     }
 
+    // High-precision CLMM quoting (Raydium & Orca)
+    if (isClmm) {
+      const clmm = await quoteClmm({
+        venue: amm.venue,
+        poolKind,
+        poolId: amm.ammId,
+        side,
+        sizeBase,
+        slippageBps: slip,
+        baseMint: this.baseMint,
+        quoteMint: this.quoteMint,
+        feeBpsHint: amm.feeBps,
+      });
+      if (clmm.ok && Number.isFinite(clmm.price) && clmm.price > 0) {
+        return {
+          px: clmm.price,
+          feeBps: Number.isFinite(clmm.feeBps) && clmm.feeBps > 0 ? clmm.feeBps : amm.feeBps,
+          used: "local",
+          meta: { source: "clmm_quoter", ...(clmm.meta ?? {}) },
+        };
+      }
+      logger.log("clmm_quote_fallback", {
+        venue: amm.venue,
+        pool: amm.ammId,
+        side,
+        err: clmm.ok ? "invalid_price" : clmm.err,
+      });
+    }
+
     // Fallback to local math (keeps working even if adapters are missing)
     try {
       if (amm.venue === "orca") {
@@ -559,7 +683,7 @@ export class EdgeJoiner {
           const q = await orcaAvgSellQuotePerBase(amm.ammId, Math.max(sizeBase, MIN_ORCA_BASE_SIZE), slip);
           if (q.ok) return { px: q.price, feeBps: amm.feeBps, used: "local" };
         }
-      } else {
+      } else if (!isClmm) {
         // Raydium CPMM: closed-form reserves math
         const hasRes = !!amm.reserves && amm.reserves.base > 0 && amm.reserves.quote > 0;
         if (hasRes) {
@@ -957,7 +1081,16 @@ export class EdgeJoiner {
       recommended_size_base: best.size,
       amm_venue: best.amm.venue,
       amm_pool_id: best.amm.ammId,
-      ...(best.path === "AMM->AMM" ? { amm_dst_venue: best.ammDst?.venue } : {}),
+      amm_meta: { poolKind: best.amm.poolKind, feeBps: best.amm.feeBps },
+      ...(best.path === "AMM->AMM"
+        ? {
+            amm_dst_venue: best.ammDst?.venue,
+            amm_dst_pool_id: best.ammDst?.ammId,
+            amm_dst_meta: best.ammDst
+              ? { poolKind: best.ammDst.poolKind, feeBps: best.ammDst.feeBps }
+              : undefined,
+          }
+        : {}),
     });
 
     // Feature emission — ONLY for PHX paths (compat with 1-arg and 2-arg emitFeature signatures)

@@ -95,6 +95,88 @@ function maskUrl(u: string): string {
 const RPC_MASK = resolveRpcForMask();
 const COMMITMENT: Commitment = "processed";
 
+// ── JSONL writer (shared with arb joiner) ─────────────────────────────────────
+function resolveOutPath(): string {
+  const logFile = (process.env.LOG_FILE ?? "").trim();
+  if (logFile) {
+    fs.mkdirSync(path.dirname(logFile), { recursive: true });
+    return logFile;
+  }
+  const edgePath = (process.env.EDGE_PHOENIX_JSONL ?? "").trim();
+  if (edgePath) {
+    fs.mkdirSync(path.dirname(edgePath), { recursive: true });
+    return edgePath;
+  }
+  const fallback = path.resolve(__dirname, "..", "logs", "runtime.jsonl");
+  fs.mkdirSync(path.dirname(fallback), { recursive: true });
+  return fallback;
+}
+
+class JsonlWriter {
+  private stream: fs.WriteStream;
+  constructor(private filePath: string) {
+    this.stream = fs.createWriteStream(filePath, {
+      flags: "a",
+      encoding: "utf8",
+      mode: 0o644,
+    });
+  }
+  write(event: string, data: unknown) {
+    try {
+      this.stream.write(
+        JSON.stringify({ t: new Date().toISOString(), event, data }) + "\n"
+      );
+    } catch {
+      /* ignore file write errors */
+    }
+  }
+  end() {
+    try { this.stream.end(); } catch { /* ignore */ }
+  }
+}
+
+const JSONL = new JsonlWriter(resolveOutPath());
+process.once("exit", () => JSONL.end());
+
+function emit(event: string, data: any) {
+  JSONL.write(event, data);
+  logger.log(event, data);
+}
+
+// ── snapshot cache (disk) ────────────────────────────────────────────────────
+const SNAPSHOT_ENABLED = boolOr(process.env.PHOENIX_SNAPSHOT_ENABLE, true);
+const SNAPSHOT_DIR = (() => {
+  if (!SNAPSHOT_ENABLED) return undefined;
+  const dirRaw = (process.env.PHOENIX_SNAPSHOT_DIR ?? "").trim();
+  const dir = dirRaw ? path.resolve(dirRaw) : path.resolve(process.cwd(), "data", "cache", "phoenix");
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    logger.log("phoenix_snapshot_dir", { dir });
+  } catch (e) {
+    logger.log("phoenix_snapshot_dir_error", { dir, error: String((e as any)?.message ?? e) });
+    return undefined;
+  }
+  return dir;
+})();
+const SNAPSHOT_WRITE_MIN_MS = clamp(numOr(process.env.PHOENIX_SNAPSHOT_WRITE_MS, 500), 50, 60_000);
+const snapshotWriteAt = new Map<string, number>();
+
+function writeSnapshot(market: string, payload: any) {
+  if (!SNAPSHOT_DIR || !SNAPSHOT_ENABLED) return;
+  try {
+    const last = snapshotWriteAt.get(market) ?? 0;
+    if (Date.now() - last < SNAPSHOT_WRITE_MIN_MS) return;
+    snapshotWriteAt.set(market, Date.now());
+    const file = path.join(SNAPSHOT_DIR, `${market}.json`);
+    fs.writeFileSync(file, JSON.stringify(payload));
+  } catch (e) {
+    logger.log("phoenix_snapshot_write_error", {
+      market,
+      error: String((e as any)?.message ?? e),
+    });
+  }
+}
+
 // Cadence & depths
 const TICK_MS = clamp(numOr(process.env.PHOENIX_TICK_MS, 1000), 100, 60000);
 const L2_FETCH_DEPTH = clamp(numOr(process.env.PHOENIX_L2_DEPTH, 10), 1, 50);
@@ -147,19 +229,19 @@ async function makeClient(conn: Connection, seedMarkets: string[] = []): Promise
   if (seeds.length && typeof Ctor.createWithMarketAddresses === "function") {
     try {
       const client = await (Ctor as any).createWithMarketAddresses(conn, seeds);
-      logger.log("phoenix_client_seeded", { order: "conn,seeds", seeds: seedMarkets });
+      emit("phoenix_client_seeded", { order: "conn,seeds", seeds: seedMarkets });
       return client;
     } catch (e: any) {
-      logger.log("phoenix_client_seed_attempt_error", {
+      emit("phoenix_client_seed_attempt_error", {
         order: "conn,seeds",
         err: String(e?.message ?? e),
       });
     }
-    logger.log("phoenix_client_seed_all_failed", { seeds: seedMarkets });
+    emit("phoenix_client_seed_all_failed", { seeds: seedMarkets });
   }
 
   const client = typeof Ctor.create === "function" ? await Ctor.create(conn) : new Ctor(conn);
-  logger.log("phoenix_client_unseeded", { note: "Client.create(connection)" });
+  emit("phoenix_client_unseeded", { note: "Client.create(connection)" });
   return client;
 }
 
@@ -321,7 +403,7 @@ async function runMarket(
     /* ignore */
   }
 
-  logger.log("phoenix_boot", { rpc: maskUrl(RPC_MASK), ws_attached: true });
+  emit("phoenix_boot", { rpc: maskUrl(RPC_MASK), ws_attached: true });
 
   let lastPublishTs = 0;
   let lastWsKickTs = 0;
@@ -350,9 +432,10 @@ async function runMarket(
         const levels_bids = (depth.bids ?? []).slice(0, PUBLISH_DEPTH);
         const levels_asks = (depth.asks ?? []).slice(0, PUBLISH_DEPTH);
 
-        logger.log("phoenix_l2", {
+        const marketKey = market.toBase58();
+        const snapshot = {
           ts,
-          market: market.toBase58(),
+          market: marketKey,
           symbol,
           best_bid,
           best_bid_str: Number.isFinite(best_bid) ? best_bid.toFixed(12) : undefined,
@@ -363,11 +446,15 @@ async function runMarket(
           source,
           levels_bids,
           levels_asks,
-        });
+        };
 
-        logger.log("phoenix_mid", {
+        emit("phoenix_l2", snapshot);
+
+        writeSnapshot(marketKey, snapshot);
+
+        emit("phoenix_mid", {
           ts,
-          market: market.toBase58(),
+          market: marketKey,
           symbol,
           px: Number.isFinite(mid) ? mid : undefined,
           px_str: Number.isFinite(mid) ? mid.toFixed(12) : undefined,
@@ -377,7 +464,7 @@ async function runMarket(
           source,
         });
       } else {
-        logger.log("phoenix_l2_empty", {
+        emit("phoenix_l2_empty", {
           ts,
           market: market.toBase58(),
           symbol,
@@ -390,7 +477,7 @@ async function runMarket(
 
       lastPublishTs = ts;
     } catch (e: any) {
-      logger.log("phoenix_publish_error", { market: marketStr, error: String(e?.message ?? e) });
+      emit("phoenix_publish_error", { market: marketStr, error: String(e?.message ?? e) });
     } finally {
       inFlight = false;
     }
@@ -408,9 +495,9 @@ async function runMarket(
       },
       COMMITMENT
     );
-    logger.log("phoenix_ws_subscribed", { via: "onAccountChange" });
+    emit("phoenix_ws_subscribed", { via: "onAccountChange" });
   } catch (e: any) {
-    logger.log("phoenix_ws_unavailable", {
+    emit("phoenix_ws_unavailable", {
       note: "onAccountChange failed",
       err: String(e?.message ?? e),
     });
@@ -453,7 +540,7 @@ async function main(): Promise<void> {
   try {
     client = await makeClient(conn, seed);
   } catch (e) {
-    logger.log("phoenix_error", { stage: "client_create", err: String(e) });
+    emit("phoenix_error", { stage: "client_create", err: String(e) });
     // keep alive even if client bootstrap failed
     setInterval((): void => { }, 1 << 30);
     return;
@@ -474,7 +561,7 @@ async function main(): Promise<void> {
     if (mkts.length) {
       for (const m of mkts)
         runMarket(client, conn, m.symbol, m.market).catch((e) =>
-          logger.log("phoenix_fatal_market", { symbol: m.symbol, err: String(e) })
+          emit("phoenix_fatal_market", { symbol: m.symbol, err: String(e) })
         );
       return;
     }
@@ -489,7 +576,7 @@ async function main(): Promise<void> {
   );
 }
 
-void main().catch((e) => logger.log("phoenix_fatal", { err: String(e) }));
+void main().catch((e) => emit("phoenix_fatal", { err: String(e) }));
 
 // Keep atomic exports discoverable here (types must be type-only re-exports)
 export { buildPhoenixSwapIxs } from "./atomic";
