@@ -321,14 +321,15 @@ export class LiveExecutor {
 
       // Pre-send EV sanity (skip if forced)
       const evQuote = (sell_px - buy_px) * sizeBase - FIXED_TX_COST_QUOTE;
-      const evBps = (buy_px > 0 && sell_px > 0) ? ((sell_px / buy_px) - 1) * 10_000 : -1e9;
+      const evBpsBase = (buy_px > 0 && sell_px > 0) ? ((sell_px / buy_px) - 1) * 10_000 : Number.NaN;
+      const evBps = Number.isFinite(evBpsBase) ? evBpsBase : Number.NaN;
       if (!FORCE) {
         if (!(evQuote > 0)) {
           logger.log("submit_error", { where: "pre_send_ev_gate", error: "negative_expected_pnl_quote", sizeBase, buy_px, sell_px, ev_quote: evQuote });
           return;
         }
         const wantBps = (Number(process.env.TRADE_THRESHOLD_BPS ?? 0) || 0) + PNL_SAFETY_BPS;
-        if (!(evBps >= wantBps)) {
+        if (!Number.isFinite(evBps) || evBps < wantBps) {
           logger.log("submit_error", { where: "pre_send_ev_gate", error: "insufficient_edge_bps", size_base: sizeBase, ev_bps: evBps, want_bps: wantBps });
           return;
         }

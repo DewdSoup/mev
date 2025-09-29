@@ -100,29 +100,10 @@ export async function orcaAvgBuyQuotePerBase(
         Math.max(0, Number(process.env.ORCA_QUOTER_EXTRA_BPS ?? 2)) / 10_000;
 
     // Prefer CPMM approx when reserves exist (still conservative)
-    const base = Number(entry.base);
-    const quote = Number(entry.quote);
-    if (base > 0 && quote > 0) {
-        const q = cpmmBuyQuotePerBase(
-            base,
-            quote,
-            Math.max(
-                sizeBase,
-                Number(process.env.MIN_ORCA_BASE_SIZE ?? 0.000001)
-            ),
-            feeBps
-        );
-        if (!q || !Number.isFinite(q))
-            return { ok: false, reason: "cant_quote_from_cache" };
-        return { ok: true, price: q * (1 + extra) };
-    }
-
-    // Fallback: `px` only (no reserves) → conservative fee-upside on cost
     const px = Number(entry.px ?? entry.px_str);
     if (!Number.isFinite(px) || px <= 0)
         return { ok: false, reason: "bad_cache" };
 
-    // For a BUY on AMM (we receive BASE), cost per BASE ≈ px * (1 + fee + buffer)
     const fee = Math.max(0, feeBps) / 10_000;
     const price = px * (1 + fee) * (1 + extra);
     return Number.isFinite(price) && price > 0
@@ -153,29 +134,10 @@ export async function orcaAvgSellQuotePerBase(
         Math.max(0, Number(process.env.ORCA_QUOTER_EXTRA_BPS ?? 2)) / 10_000;
 
     // Prefer CPMM approx when reserves exist
-    const base = Number(entry.base);
-    const quote = Number(entry.quote);
-    if (base > 0 && quote > 0) {
-        const q = cpmmSellQuotePerBase(
-            base,
-            quote,
-            Math.max(
-                sizeBase,
-                Number(process.env.MIN_ORCA_BASE_SIZE ?? 0.000001)
-            ),
-            feeBps
-        );
-        if (!q || !Number.isFinite(q))
-            return { ok: false, reason: "cant_quote_from_cache" };
-        return { ok: true, price: q * (1 - extra) };
-    }
-
-    // Fallback: `px` only → conservative downside from fee
     const px = Number(entry.px ?? entry.px_str);
     if (!Number.isFinite(px) || px <= 0)
         return { ok: false, reason: "bad_cache" };
 
-    // For a SELL on AMM (we give BASE), proceeds per BASE ≈ px * (1 - fee - buffer)
     const fee = Math.max(0, feeBps) / 10_000;
     const price = px * (1 - fee) * (1 - extra);
     return Number.isFinite(price) && price > 0

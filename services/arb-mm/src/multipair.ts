@@ -2,8 +2,8 @@
 // Multi-pair, additive orchestrator (keeps single-pair main.ts untouched).
 //
 // - Loads ONLY .env.live, forces LIVE mode.
-// - Spawns one joiner pipeline per PairSpec (Phoenix <-> AMM).
-// - Fans out JSONL feed lines to the right pipeline by market/pool ids.
+// - Spawns one joiner pipeline per PairSpec (Phoenix <-> AMM or AMM <-> AMM).
+// - Fans out provider or JSONL feed lines to the right pipeline by market/pool ids.
 // - Executes with the same LiveExecutor payload shape you already use.
 // - Runs indefinitely; Ctrl-C to stop.
 
@@ -55,9 +55,20 @@ const __dirname = path.dirname(__filename);
     process.env.__ENV_LIVE_LOCKED = "1";
 })();
 
-const ewma = (prev: number, x: number, a = 0.1) => (!Number.isFinite(prev) || prev <= 0 ? Math.round(x) : Math.round(prev + (x - prev) * a));
+const ewma = (prev: number, x: number, a = 0.1) =>
+    (!Number.isFinite(prev) || prev <= 0 ? Math.round(x) : Math.round(prev + (x - prev) * a));
 
+function isRateLimitError(err: unknown): boolean {
+    if (!err) return false;
+    const code = (err as any)?.code;
+    if (code === -32429) return true;
+    const msg = String((err as any)?.message ?? err ?? "").toLowerCase();
+    return msg.includes("429") || msg.includes("rate limited") || msg.includes("too many requests") || msg.includes("rate limit");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Lightweight JSONL tailer (local to this file)
+// ────────────────────────────────────────────────────────────────────────────
 type LineHandler = (obj: any) => void;
 class JsonlFollower {
     private fd: number | null = null;
@@ -69,7 +80,11 @@ class JsonlFollower {
         await this.openAtEOF();
         this.poller = setInterval(() => this.readNewBytes(), this.pollMs);
     }
-    stop() { try { if (this.poller) clearInterval(this.poller); } catch { } try { if (this.fd !== null) fs.closeSync(this.fd); } catch { } }
+    stop() {
+        try { if (this.poller) clearInterval(this.poller); } catch { }
+        try { if (this.fd !== null) fs.closeSync(this.fd); } catch { }
+        this.poller = null; this.fd = null;
+    }
     private async openAtEOF() {
         const existed = fs.existsSync(this.file);
         this.fd = fs.openSync(this.file, "a+");
@@ -109,7 +124,10 @@ class PairPipeline {
     private rpcMsP50 = 0;
     private rpcMsP95 = 0;
     private rpcBlocked = 0;
+
     private ammVenueByPool = new Map<string, { venue: string; poolKind?: string; feeBps?: number }>();
+    private _ammFeeBps: number;
+    private _phxFeeBps: number;
 
     constructor(
         private pair: PairSpec,
@@ -119,20 +137,22 @@ class PairPipeline {
         private liveExec: LiveExecutor | null,
     ) {
         const enableRaydiumClmm = String(process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0";
+
         // Resolve fees (pair overrides -> JSON/ENV -> defaults)
         const ammFeeInit = this.resolveFeeBps("AMM", pair.ammPool, cfg.AMM_TAKER_FEE_BPS);
         const phxFeeInit = this.resolveFeeBps("PHOENIX", pair.phoenixMarket, cfg.PHOENIX_TAKER_FEE_BPS);
-        // NOTE: try to assert Raydium fee from chain if flag is set; we do it async
+        this._ammFeeBps = ammFeeInit;
+        this._phxFeeBps = phxFeeInit;
+
+        // Try to assert Raydium fee from chain (non-fatal)
         (async () => {
             try {
                 const fixed = await tryAssertRaydiumFeeBps(this.conn, pair.ammPool, ammFeeInit);
                 if (fixed !== ammFeeInit) this._ammFeeBps = fixed;
-            } catch { }
+            } catch { /* ignore */ }
         })();
 
-        this._ammFeeBps = ammFeeInit;
-        this._phxFeeBps = phxFeeInit;
-
+        // Build pool → venue map (allows multiple pools per pair)
         for (const venue of pair.ammVenues ?? []) {
             if (venue?.enabled === false) continue;
             if (!enableRaydiumClmm && String(venue.venue).toLowerCase() === "raydium" && String(venue.poolKind).toLowerCase() === "clmm") continue;
@@ -153,63 +173,53 @@ class PairPipeline {
         }
 
         // Construct joiner with pair-scoped params
-        const J = new EdgeJoiner(
+        this.joiner = new EdgeJoiner(
             {
-                minAbsBps: cfg.EDGE_MIN_ABS_BPS,
-                waitLogMs: cfg.EDGE_WAIT_LOG_MS,
-                thresholdBps: cfg.TRADE_THRESHOLD_BPS,
-                flatSlippageBps: cfg.MAX_SLIPPAGE_BPS,
-                tradeSizeBase: pair.sizing?.tradeSizeBase ?? cfg.TRADE_SIZE_BASE,
-                decisionMinBase: pair.sizing?.decisionMinBase ?? cfg.DECISION_MIN_BASE,
+                minAbsBps: this.cfg.EDGE_MIN_ABS_BPS,
+                waitLogMs: this.cfg.EDGE_WAIT_LOG_MS,
+                thresholdBps: this.cfg.TRADE_THRESHOLD_BPS,
+                flatSlippageBps: this.cfg.MAX_SLIPPAGE_BPS,
+                tradeSizeBase: pair.sizing?.tradeSizeBase ?? this.cfg.TRADE_SIZE_BASE,
+                decisionMinBase: pair.sizing?.decisionMinBase ?? this.cfg.DECISION_MIN_BASE,
                 phoenixFeeBps: this._phxFeeBps,
                 ammFeeBps: this._ammFeeBps,
-                fixedTxCostQuote: pair.fees?.fixedTxCostQuote ?? cfg.FIXED_TX_COST_QUOTE,
+                fixedTxCostQuote: pair.fees?.fixedTxCostQuote ?? this.cfg.FIXED_TX_COST_QUOTE,
             },
             {
-                bookTtlMs: cfg.BOOK_TTL_MS,
-                activeSlippageMode: cfg.ACTIVE_SLIPPAGE_MODE,
-                phoenixSlippageBps: cfg.PHOENIX_SLIPPAGE_BPS,
-                cpmmMaxPoolTradeFrac: pair.sizing?.cpmmMaxPoolTradeFrac ?? cfg.CPMM_MAX_POOL_TRADE_FRAC,
-                dynamicSlippageExtraBps: cfg.DYNAMIC_SLIPPAGE_EXTRA_BPS,
-                logSimFields: cfg.LOG_SIM_FIELDS,
-                enforceDedupe: cfg.ENFORCE_DEDUPE,
-                decisionBucketMs: cfg.DECISION_BUCKET_MS,
-                decisionMinEdgeDeltaBps: cfg.DECISION_MIN_EDGE_DELTA_BPS,
-                useRpcSim: cfg.USE_RPC_SIM,
-                // also expose decisionMinBase in options for belt-and-suspenders
-                decisionMinBase: pair.sizing?.decisionMinBase ?? cfg.DECISION_MIN_BASE,
+                bookTtlMs: this.cfg.BOOK_TTL_MS,
+                activeSlippageMode: this.cfg.ACTIVE_SLIPPAGE_MODE,
+                phoenixSlippageBps: this.cfg.PHOENIX_SLIPPAGE_BPS,
+                cpmmMaxPoolTradeFrac: pair.sizing?.cpmmMaxPoolTradeFrac ?? this.cfg.CPMM_MAX_POOL_TRADE_FRAC,
+                dynamicSlippageExtraBps: this.cfg.DYNAMIC_SLIPPAGE_EXTRA_BPS,
+                logSimFields: this.cfg.LOG_SIM_FIELDS,
+                enforceDedupe: this.cfg.ENFORCE_DEDUPE,
+                decisionBucketMs: this.cfg.DECISION_BUCKET_MS,
+                decisionMinEdgeDeltaBps: this.cfg.DECISION_MIN_EDGE_DELTA_BPS,
+                useRpcSim: this.cfg.USE_RPC_SIM,
+                // Expose here as well in case joiner reads it from options bag
+                decisionMinBase: pair.sizing?.decisionMinBase ?? this.cfg.DECISION_MIN_BASE,
             },
             this._onDecision,
-            undefined, // rpcSimFn (off for now in live)
+            undefined as RpcSimFn | undefined, // executor handles tx-level sim; joiner doesn't need it
             this._onRpcSample
         );
-
-        this.joiner = J;
     }
 
-    private _ammFeeBps: number;
-    private _phxFeeBps: number;
-
-    // Filtered feed from AMMs publisher
+    // Filtered feed from AMMs publisher/provider
     upsertAmmsIfMatch(obj: any) {
-        const ev = (obj?.event ?? obj?.name ?? obj?.type ?? "") as string;
         const id = obj?.ammId ?? obj?.pool ?? obj?.id ?? obj?.pool_id;
         if (!id) return;
         const meta = this.ammVenueByPool.get(String(id));
         if (!meta) return;
-        if (meta.poolKind && obj.poolKind == null && obj.pool_kind == null) {
-            obj.poolKind = meta.poolKind;
-        }
-        if (meta.feeBps != null && obj.feeBps == null && obj.fee_bps == null) {
-            obj.feeBps = meta.feeBps;
-        }
-        // The joiner expects canonical amms_price payloads; we forward as‑is.
+
+        if (meta.poolKind && obj.poolKind == null && obj.pool_kind == null) obj.poolKind = meta.poolKind;
+        if (meta.feeBps != null && obj.feeBps == null && obj.fee_bps == null) obj.feeBps = meta.feeBps;
+
         this.joiner.upsertAmms(obj);
     }
 
-    // Filtered feed from Phoenix publisher
+    // Filtered feed from Phoenix publisher/provider
     upsertPhoenixIfMatch(obj: any) {
-        const ev = (obj?.event ?? obj?.name ?? obj?.type ?? "") as string;
         const mkt = obj?.market ?? obj?.market_id ?? obj?.id;
         if (!mkt || String(mkt) !== this.pair.phoenixMarket) return;
         this.joiner.upsertPhoenix(obj);
@@ -225,14 +235,14 @@ class PairPipeline {
         if (s?.blocked) this.rpcBlocked++;
     };
 
-    private _onDecision: DecisionHook = (wouldTrade, edgeNetBps, expectedPnl, d) => {
+    private _onDecision: DecisionHook = (wouldTrade, _edgeNetBps, _expectedPnl, d) => {
         if (!d) return;
 
         // Allowed path gate (optional)
         const ALLOWED = String(process.env.EXEC_ALLOWED_PATH ?? "both");
         if (ALLOWED !== "both" && d.path && d.path !== ALLOWED) return;
 
-        // final EV gate already applied in joiner; we only execute when wouldTrade=true
+        // Final EV gate handled by joiner; only execute when wouldTrade=true
         if (!wouldTrade) return;
 
         const sizeBase =
@@ -256,11 +266,7 @@ class PairPipeline {
             pair: this.pair.id,
             amm_venue: srcVenue,
             amm_pool_id: srcPoolId,
-            amm: {
-                pool: srcPoolId,
-                venue: srcVenue,
-                meta: srcMeta,
-            },
+            amm: { pool: srcPoolId, venue: srcVenue, meta: srcMeta },
             amm_meta: srcMeta,
         };
 
@@ -268,11 +274,7 @@ class PairPipeline {
             if (d.amm_dst_pool_id) {
                 const dstVenue = String(d.amm_dst_venue ?? this.ammVenueByPool.get(d.amm_dst_pool_id)?.venue ?? "raydium").toLowerCase();
                 const dstMeta = (d as any).amm_dst_meta ?? this.ammVenueByPool.get(d.amm_dst_pool_id);
-                payload.amm_dst = {
-                    pool: d.amm_dst_pool_id,
-                    venue: dstVenue,
-                    meta: dstMeta,
-                };
+                payload.amm_dst = { pool: d.amm_dst_pool_id, venue: dstVenue, meta: dstMeta };
                 payload.amm_dst_meta = dstMeta;
             }
         } else {
@@ -283,7 +285,6 @@ class PairPipeline {
             };
         }
 
-        // Execute (same engine, same atomic mode)
         if (this.liveExec) (this.liveExec as any)?.maybeExecute?.(payload);
     };
 }
@@ -311,8 +312,10 @@ async function main() {
     logger.log("arb-multipair boot", { rpc: maskUrl(RPC), pairs: PAIRS.map(p => p.id) });
 
     // Embedded publishers (optional; same as single-process live)
+    const providerEnabled = String(process.env.ENABLE_MARKET_PROVIDER ?? "0") === "1";
+
     const sup = new PublisherSupervisor({
-        enable: String(process.env.ENABLE_EMBEDDED_PUBLISHERS ?? "1") === "1",
+        enable: !providerEnabled && (String(process.env.ENABLE_EMBEDDED_PUBLISHERS ?? "1") === "1"),
         phoenixJsonl: CFG.PHOENIX_JSONL,
         ammsJsonl: CFG.AMMS_JSONL,
         freshnessMs: 3500,
@@ -324,11 +327,11 @@ async function main() {
     // Network + health
     const conn = rpcClient;
 
-    const ENABLE_MARKET_PROVIDER = String(process.env.ENABLE_MARKET_PROVIDER ?? "0").trim() === "1";
+    const ENABLE_MARKET_PROVIDER = providerEnabled;
     let marketProvider: MarketStateProvider | null = null;
     if (ENABLE_MARKET_PROVIDER) {
         try {
-            marketProvider = new MarketStateProvider(conn, loadPairsFromEnvOrDefault());
+            marketProvider = new MarketStateProvider(conn, PAIRS);
             await marketProvider.start();
             logger.log("market_provider_started", {
                 pools: marketProvider.getTrackedPools().length,
@@ -341,6 +344,7 @@ async function main() {
         }
     }
 
+    // Warm up commonly accessed accounts
     const warmupKeys = new Set<string>();
     const enableRaydiumClmm = String(process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0";
     for (const pair of PAIRS) {
@@ -354,11 +358,8 @@ async function main() {
     }
     const warmupPubkeys: PublicKey[] = [];
     for (const key of warmupKeys) {
-        try {
-            warmupPubkeys.push(new PublicKey(key));
-        } catch (err) {
-            logger.log("rpc_warmup_skip", { key, err: String((err as any)?.message ?? err) });
-        }
+        try { warmupPubkeys.push(new PublicKey(key)); }
+        catch (err) { logger.log("rpc_warmup_skip", { key, err: String((err as any)?.message ?? err) }); }
     }
     if (warmupPubkeys.length) {
         try {
@@ -369,6 +370,7 @@ async function main() {
         }
     }
 
+    // Basic health loop
     initRisk();
     (async function startHealth() {
         const sampleTps = async () => {
@@ -382,7 +384,7 @@ async function main() {
                 const [slot, version, tps] = await Promise.all([conn.getSlot("processed"), conn.getVersion(), sampleTps()]);
                 setChainTps(tps);
                 logger.log("arb health", { slot, tps: roundN(tps, 2) ?? 0, version, httpHealth: { ok: true, body: "ok" } });
-                console.log(`HEALTH slot=${slot} tps=${roundN(tps, 2)} version=${version["solana-core"]}`);
+                console.log(`HEALTH slot=${slot} tps=${roundN(tps, 2)} version=${String((version as any)["solana-core"] ?? "unknown")}`);
             } catch {
                 setChainTps(undefined);
             }
@@ -402,29 +404,80 @@ async function main() {
     // Build pipelines
     const pipelines = PAIRS.map(p => new PairPipeline(p, conn, CFG, resolveFeeBps, exec));
 
-    // Fan-out feeds to pipelines by id
-    const ammsFollower = new JsonlFollower(
-        CFG.AMMS_JSONL,
-        (obj) => {
-            for (const pipe of pipelines) pipe.upsertAmmsIfMatch(obj);
-        },
-        Number(process.env.EDGE_FOLLOW_POLL_MS ?? 500) || 500
-    );
-    const phxFollower = new JsonlFollower(
-        CFG.PHOENIX_JSONL,
-        (obj) => {
-            for (const pipe of pipelines) pipe.upsertPhoenixIfMatch(obj);
-        },
-        Number(process.env.EDGE_FOLLOW_POLL_MS ?? 500) || 500
-    );
+    // ── Feed source: provider OR jsonl followers
+    let ammsFollower: JsonlFollower | null = null;
+    let phxFollower: JsonlFollower | null = null;
 
-    await Promise.all([ammsFollower.start(), phxFollower.start()]);
+    if (providerEnabled && marketProvider) {
+        console.log("edge_input_source { source: 'provider' }");
+        marketProvider.subscribe((state) => {
+            try {
+                // AMMs: mirror "amms_price"
+                for (const s of state.amms) {
+                    const obj = {
+                        event: "amms_price",
+                        // `AmmSnapshot` does not define `symbol`; keep a default without typing complaints.
+                        symbol: (s as any)?.symbol ?? "SOL/USDC",
+                        venue: s.venue,
+                        ammId: s.poolId,
+                        poolKind: s.poolKind,
+                        ts: s.lastUpdateTs,
+                        baseDecimals: s.baseDecimals,
+                        quoteDecimals: s.quoteDecimals,
+                        px: s.price ?? undefined,
+                        feeBps: s.feeBps ?? undefined,
+                        base_vault: s.baseVault ?? undefined,
+                        quote_vault: s.quoteVault ?? undefined,
+                        base_int: s.baseReserve != null ? String(s.baseReserve) : undefined,
+                        quote_int: s.quoteReserve != null ? String(s.quoteReserve) : undefined,
+                        slot: s.slot ?? undefined,
+                        source: "provider",
+                        validation_passed: s.price != null,
+                    };
+                    for (const pipe of pipelines) pipe.upsertAmmsIfMatch(obj);
+                }
+                // Phoenix: mirror "phoenix_l2"
+                for (const p of state.phoenix) {
+                    const obj = {
+                        event: "phoenix_l2",
+                        ts: p.lastUpdateTs,
+                        market: p.market,
+                        symbol: p.symbol,
+                        best_bid: p.bestBid ?? undefined,
+                        best_ask: p.bestAsk ?? undefined,
+                        phoenix_mid: p.mid ?? undefined,
+                        levels_bids: p.levelsBids,
+                        levels_asks: p.levelsAsks,
+                        slot: p.slot ?? undefined,
+                        source: "provider",
+                    };
+                    for (const pipe of pipelines) pipe.upsertPhoenixIfMatch(obj);
+                }
+            } catch { /* ignore per tick */ }
+        });
+    } else {
+        // Fan-out feeds to pipelines by id
+        const pollMs = Number(process.env.EDGE_FOLLOW_POLL_MS ?? 500) || 500;
 
-    // Run indefinitely; graceful exit
+        ammsFollower = new JsonlFollower(
+            CFG.AMMS_JSONL,
+            (obj) => { for (const pipe of pipelines) pipe.upsertAmmsIfMatch(obj); },
+            pollMs
+        );
+        phxFollower = new JsonlFollower(
+            CFG.PHOENIX_JSONL,
+            (obj) => { for (const pipe of pipelines) pipe.upsertPhoenixIfMatch(obj); },
+            pollMs
+        );
+
+        await Promise.all([ammsFollower.start(), phxFollower.start()]);
+    }
+
+    // ── Graceful shutdown
     function shutdown(signal: string) {
         (async () => {
-            try { ammsFollower.stop(); } catch { }
-            try { phxFollower.stop(); } catch { }
+            try { ammsFollower?.stop(); } catch { }
+            try { phxFollower?.stop(); } catch { }
             try { sup.stop(); } catch { }
             try { await marketProvider?.stop(); } catch { }
             logger.log("arb-multipair_shutdown", { ok: true, signal });
@@ -433,11 +486,29 @@ async function main() {
     }
     process.on("SIGINT", () => shutdown("SIGINT"));
     process.on("SIGTERM", () => shutdown("SIGTERM"));
-    process.on("uncaughtException", (e) => { logger.log("arb-multipair_fatal", { error: String(e) }); process.exit(1); });
-    process.on("unhandledRejection", (e) => { logger.log("arb-multipair_fatal", { error: String(e) }); process.exit(1); });
+    process.on("uncaughtException", (e) => {
+        if (isRateLimitError(e)) {
+            logger.log("arb-multipair_rate_limit", { error: String(e) });
+            return;
+        }
+        logger.log("arb-multipair_fatal", { error: String(e) });
+        process.exit(1);
+    });
+    process.on("unhandledRejection", (e: any) => {
+        if (isRateLimitError(e)) {
+            logger.log("arb-multipair_rate_limit", { error: String(e) });
+            return;
+        }
+        logger.log("arb-multipair_fatal", { error: String(e) });
+        process.exit(1);
+    });
 }
 
 main().catch((e) => {
+    if (isRateLimitError(e)) {
+        logger.log("arb-multipair_rate_limit", { error: String(e) });
+        return;
+    }
     logger.log("arb-multipair_fatal", { error: String(e) });
     process.exit(1);
 });

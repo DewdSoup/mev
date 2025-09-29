@@ -257,8 +257,20 @@ export function stamp(): string {
 }
 
 export function loadConfig(): AppConfig {
-  const AMMS_JSONL: string = firstExistingPathOrDefault(process.env.EDGE_AMMS_JSONL ?? "data/amms/runtime.jsonl");
-  const PHOENIX_JSONL: string = firstExistingPathOrDefault(process.env.EDGE_PHOENIX_JSONL ?? "data/phoenix/runtime.jsonl");
+  const runRootRaw = process.env.RUN_ROOT?.trim();
+  const runRoot = runRootRaw
+    ? (path.isAbsolute(runRootRaw) ? runRootRaw : path.resolve(REPO_ROOT, runRootRaw))
+    : null;
+
+  const defaultAmmsLog = runRoot ? path.join(runRoot, "amms-runtime.jsonl") : "data/amms/runtime.jsonl";
+  const defaultPhxLog = runRoot ? path.join(runRoot, "phoenix-runtime.jsonl") : "data/phoenix/runtime.jsonl";
+
+  const AMMS_JSONL: string = firstExistingPathOrDefault(
+    process.env.EDGE_AMMS_JSONL ?? defaultAmmsLog
+  );
+  const PHOENIX_JSONL: string = firstExistingPathOrDefault(
+    process.env.EDGE_PHOENIX_JSONL ?? defaultPhxLog
+  );
 
   const EDGE_MIN_ABS_BPS: number = parseFloatEnv(process.env.EDGE_MIN_ABS_BPS, 0);
   const EDGE_WAIT_LOG_MS: number = parseMsEnv(process.env.EDGE_WAIT_LOG_MS, 5000, 100, 60000);

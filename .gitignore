@@ -3,3 +3,7 @@ dist/
 
 # ignore heavy tmp outputs
 packages/amms/configs/.tmp/
+
+# runtime artifacts (per-run logs and pointers)
+data/runtime
+data/runs/

@@ -1,4 +1,9 @@
-import { Connection, PublicKey } from "@solana/web3.js";
+// services/arb-mm/src/edge/clmm_quoter.ts
+//
+// Node >= 18 ships with global `fetch`. If you run on Node 16, uncomment this:
+// import fetch from "node-fetch";
+
+import { PublicKey, Keypair } from "@solana/web3.js";
 import {
   Clmm,
   fetchMultipleMintInfos,
@@ -15,7 +20,6 @@ import {
 import { AnchorProvider } from "@coral-xyz/anchor";
 import Decimal from "decimal.js";
 import BN from "bn.js";
-import { Keypair } from "@solana/web3.js";
 import { TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 
 import { logger } from "../ml_logger.js";
@@ -23,16 +27,60 @@ import { rpcClient } from "@mev/rpc-facade";
 
 const ENABLE_RAYDIUM_CLMM = String(process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0";
 
+// When provider is enabled we avoid all per-quote RPC — quotes must come from snapshots.
+// Soft-guard: never throw; return { ok:false, err:"snapshot_only" } so callers can skip gracefully.
+const SNAPSHOT_ONLY = String(process.env.QUOTER_SNAPSHOT_ONLY ?? "1").trim() === "1";
+const ALLOW_ONCHAIN_FALLBACK = String(process.env.CLMM_ALLOW_ONCHAIN_FALLBACK ?? "1").trim() !== "0";
+const ONCHAIN_CACHE_TTL_MS = Number(process.env.CLMM_ONCHAIN_CACHE_TTL_MS ?? 750);
+
+type QuoteCacheEntry = { ts: number; result: QuoteOk };
+const onchainQuoteCache = new Map<string, QuoteCacheEntry>();
+const snapshotAllowLogged = new Set<string>();
+
+function cacheKey(args: QuoteArgs): string {
+  const venue = (args.venue ?? "unknown").toLowerCase();
+  const sizeBucket = Math.round(args.sizeBase * 1e6) / 1e6;
+  return `${venue}:${args.poolId}:${args.side}:${sizeBucket}`;
+}
+
+function getCachedQuote(key: string): QuoteOk | undefined {
+  const entry = onchainQuoteCache.get(key);
+  if (!entry) return undefined;
+  if (nowMs() - entry.ts > ONCHAIN_CACHE_TTL_MS) {
+    onchainQuoteCache.delete(key);
+    return undefined;
+  }
+  return entry.result;
+}
+
+function rememberQuote(key: string, result: QuoteResult): void {
+  if (!result.ok) return;
+  onchainQuoteCache.set(key, { ts: nowMs(), result });
+}
+
+function snapshotOnlyBlock(venue: string, poolId: string, side: QuoteSide, sizeBase: number) {
+  if (!SNAPSHOT_ONLY) return null;
+  if (ALLOW_ONCHAIN_FALLBACK) {
+    const key = `${venue}:${poolId}`;
+    if (!snapshotAllowLogged.has(key)) {
+      snapshotAllowLogged.add(key);
+      logger.log("clmm_quote_snapshot_allow", { venue, pool: poolId });
+    }
+    return null;
+  }
+  logger.log("clmm_quote_snapshot_only_block", { venue, pool: poolId, side, size_base: sizeBase });
+  return { ok: false as const, err: "snapshot_only" };
+}
+
 const RAYDIUM_CLMM_API = String(
   process.env.RAYDIUM_CLMM_API_URL ??
-    "https://api.raydium.io/v2/ammV3/ammPools"
+  "https://api.raydium.io/v2/ammV3/ammPools"
 );
 const raydiumConn = rpcClient;
 const orcaConn = raydiumConn; // reuse the same transport for now
 
 Decimal.set({ precision: 40, rounding: Decimal.ROUND_HALF_EVEN });
 
-const BPS_DENOM = new Decimal(10_000);
 const TEN = new Decimal(10);
 
 const RATE_LIMIT_BASE_MS = Number(process.env.CLMM_RATELIMIT_BASE_MS ?? 500);
@@ -58,10 +106,17 @@ type QuoteArgs = {
   quoteMint?: string;
   feeBpsHint?: number;
   venue?: string;
+  poolKind?: string;
+  reserves?: {
+    base: number;
+    quote: number;
+    baseDecimals: number;
+    quoteDecimals: number;
+  };
 };
 
 type QuoteOk = { ok: true; price: number; feeBps: number; meta?: Record<string, unknown> };
-type QuoteErr = { ok: false; err: string };
+type QuoteErr = { ok: false; err: string; meta?: Record<string, unknown> };
 export type QuoteResult = QuoteOk | QuoteErr;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -92,6 +147,53 @@ function calcFeeBps(feeAtoms: BN | undefined, baseAtoms: BN | undefined): number
   const fee = new Decimal(feeAtoms.toString());
   const amt = new Decimal(baseAtoms.toString());
   return fee.mul(10_000).div(amt).toNumber();
+}
+
+function cpmmBuyQuotePerBase(base: number, quote: number, wantBase: number, feeBps: number): number | undefined {
+  if (!(base > 0 && quote > 0 && wantBase > 0)) return undefined;
+  if (wantBase >= base * 0.999999) return undefined;
+  const fee = Math.max(0, feeBps) / 10_000;
+  const dqPrime = (wantBase * quote) / (base - wantBase);
+  const dq = dqPrime / (1 - fee);
+  if (!Number.isFinite(dq) || dq <= 0) return undefined;
+  return dq / wantBase;
+}
+
+function cpmmSellQuotePerBase(base: number, quote: number, sellBase: number, feeBps: number): number | undefined {
+  if (!(base > 0 && quote > 0 && sellBase > 0)) return undefined;
+  const fee = Math.max(0, feeBps) / 10_000;
+  const dbPrime = sellBase * (1 - fee);
+  const dy = (quote * dbPrime) / (base + dbPrime);
+  if (!Number.isFinite(dy) || dy <= 0) return undefined;
+  return dy / sellBase;
+}
+
+function quoteFromReserves(args: QuoteArgs): QuoteResult | null {
+  // CLMM pools do not follow CPMM math, so reserve-based quoting is unsafe.
+  if (String(args.poolKind ?? "").toLowerCase() === "clmm") return null;
+  const reserves = args.reserves;
+  if (!reserves) return null;
+  const { base, quote } = reserves;
+  if (!(base > 0 && quote > 0) || !(args.sizeBase > 0)) return null;
+
+  const feeBps = Number.isFinite(args.feeBpsHint) ? Number(args.feeBpsHint) : 0;
+  const price = args.side === "buy"
+    ? cpmmBuyQuotePerBase(base, quote, args.sizeBase, feeBps)
+    : cpmmSellQuotePerBase(base, quote, args.sizeBase, feeBps);
+
+  if (price == null || !Number.isFinite(price) || price <= 0) return null;
+
+  return {
+    ok: true,
+    price,
+    feeBps,
+    meta: {
+      source: "snapshot_cpmm",
+      reserves_base: base,
+      reserves_quote: quote,
+      fee_bps_hint: feeBps,
+    },
+  } satisfies QuoteOk;
 }
 
 function nowMs(): number {
@@ -300,7 +402,7 @@ async function fetchMintInfos(mints: PublicKey[]): Promise<Record<string, any>> 
   return out;
 }
 
-function resolveOrientation(poolInfo: ClmmPoolInfo, baseMint?: string, quoteMint?: string) {
+function resolveOrientation(poolInfo: ClmmPoolInfo, baseMint?: string, _quoteMint?: string) {
   const mintA = poolInfo.mintA.mint.toBase58();
   const mintB = poolInfo.mintB.mint.toBase58();
   const baseIsA = baseMint ? strEq(baseMint, mintA) : true;
@@ -334,16 +436,33 @@ function resolveOrientation(poolInfo: ClmmPoolInfo, baseMint?: string, quoteMint
 }
 
 export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
+  const local = quoteFromReserves(args);
+  if (local) return local;
+
+  const key = cacheKey(args);
+  const cached = getCachedQuote(key);
+  if (cached) {
+    logger.log("clmm_quote_cache_hit", { venue: args.venue ?? "raydium", pool: args.poolId, side: args.side, size_base: args.sizeBase });
+    return cached;
+  }
+
+  // Soft block in snapshot-only mode
+  {
+    const soft = snapshotOnlyBlock(args.venue ?? "raydium", args.poolId, args.side, args.sizeBase);
+    if (soft) return soft;
+  }
+
   try {
-    if (!ENABLE_RAYDIUM_CLMM && args.venue === "raydium") {
+    if (!ENABLE_RAYDIUM_CLMM && (args.venue ?? "raydium").toLowerCase() === "raydium") {
       return { ok: false, err: "raydium_clmm_disabled" };
     }
     if (!(args.sizeBase > 0)) return { ok: false, err: "size_not_positive" };
+
     const poolInfo = await fetchPoolInfo(args.poolId);
     const tickArrays = await fetchTickArrays(args.poolId, poolInfo);
     const epochInfo = await fetchEpochInfo();
 
-    const { baseIsA, baseMintPk, quoteMintPk, baseDecimals, quoteDecimals } = resolveOrientation(
+    const { baseIsA, baseMintPk, baseDecimals, quoteDecimals } = resolveOrientation(
       poolInfo,
       args.baseMint,
       args.quoteMint
@@ -358,7 +477,7 @@ export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
 
     if (args.side === "sell") {
       const amountIn = uiToBn(args.sizeBase, baseDecimals);
-      const result = Clmm.computeAmountOut({
+      const computeOut = Clmm.computeAmountOut({
         poolInfo,
         tickArrayCache: tickArrays,
         baseMint: baseMintPk,
@@ -369,8 +488,8 @@ export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
         epochInfo,
         catchLiquidityInsufficient: true,
       });
-      const realInAtoms: BN = result.realAmountIn.amount;
-      const outAtoms: BN = result.amountOut.amount;
+      const realInAtoms: BN = computeOut.realAmountIn.amount;
+      const outAtoms: BN = computeOut.amountOut.amount;
       if (realInAtoms.isZero() || outAtoms.isZero()) return { ok: false, err: "raydium_clmm_zero_result" };
 
       const inUi = bnToUi(realInAtoms, baseDecimals);
@@ -380,13 +499,16 @@ export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
       const price = outUi.div(inUi).toNumber();
       if (!Number.isFinite(price) || price <= 0) return { ok: false, err: "raydium_clmm_price_nan" };
 
-      const feeBps = calcFeeBps(result.fee, realInAtoms) || args.feeBpsHint || Math.round((poolInfo.ammConfig?.tradeFeeRate ?? 0) * 10_000);
+      const feeBps =
+        calcFeeBps(computeOut.fee, realInAtoms) ||
+        args.feeBpsHint ||
+        Math.round((poolInfo.ammConfig?.tradeFeeRate ?? 0) * 10_000);
 
       const meta = {
         mode: "computeAmountOut",
         priceImpactBps: (() => {
           try {
-            const exec = new Decimal(result.executionPrice.toString());
+            const exec = new Decimal(computeOut.executionPrice.toString());
             const mid = baseIsA
               ? new Decimal(poolInfo.currentPrice.toString())
               : new Decimal(1).div(poolInfo.currentPrice.toString());
@@ -398,12 +520,14 @@ export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
         usedTickArrays: Object.keys(tickArrays ?? {}).length,
       };
 
-      return { ok: true, price, feeBps, meta };
+      const quoteResult: QuoteResult = { ok: true, price, feeBps, meta };
+      rememberQuote(key, quoteResult);
+      return quoteResult;
     }
 
     // BUY: need exact-out (base out, quote in)
     const amountOut = uiToBn(args.sizeBase, baseDecimals);
-    const result = Clmm.computeAmountIn({
+    const computeIn = Clmm.computeAmountIn({
       poolInfo,
       tickArrayCache: tickArrays,
       baseMint: baseMintPk,
@@ -414,8 +538,8 @@ export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
       epochInfo,
     });
 
-    const inAtoms: BN = result.amountIn.amount;
-    const realOutAtoms: BN = result.realAmountOut.amount;
+    const inAtoms: BN = computeIn.amountIn.amount;
+    const realOutAtoms: BN = computeIn.realAmountOut.amount;
     if (inAtoms.isZero() || realOutAtoms.isZero()) return { ok: false, err: "raydium_clmm_zero_result" };
 
     const inUi = bnToUi(inAtoms, quoteDecimals);
@@ -425,13 +549,16 @@ export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
     const price = inUi.div(outUi).toNumber();
     if (!Number.isFinite(price) || price <= 0) return { ok: false, err: "raydium_clmm_price_nan" };
 
-    const feeBps = calcFeeBps(result.fee, inAtoms) || args.feeBpsHint || Math.round((poolInfo.ammConfig?.tradeFeeRate ?? 0) * 10_000);
+    const feeBps =
+      calcFeeBps(computeIn.fee, inAtoms) ||
+      args.feeBpsHint ||
+      Math.round((poolInfo.ammConfig?.tradeFeeRate ?? 0) * 10_000);
 
     const meta = {
       mode: "computeAmountIn",
       priceImpactBps: (() => {
         try {
-          const exec = new Decimal(result.executionPrice.toString());
+          const exec = new Decimal(computeIn.executionPrice.toString());
           const mid = baseIsA
             ? new Decimal(poolInfo.currentPrice.toString())
             : new Decimal(1).div(poolInfo.currentPrice.toString());
@@ -443,7 +570,9 @@ export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
       usedTickArrays: Object.keys(tickArrays ?? {}).length,
     };
 
-    return { ok: true, price, feeBps, meta };
+    const quoteResult: QuoteResult = { ok: true, price, feeBps, meta };
+    rememberQuote(key, quoteResult);
+    return quoteResult;
   } catch (err: any) {
     if (isRateLimitError(err)) {
       logger.log("raydium_clmm_rate_limited", {
@@ -468,7 +597,7 @@ export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
 // ────────────────────────────────────────────────────────────────────────────
 
 class ReadonlyWallet {
-  constructor(public publicKey: PublicKey) {}
+  constructor(public publicKey: PublicKey) { }
   get payer(): Keypair { return Keypair.generate(); }
   async signTransaction<T>(tx: T): Promise<T> { return tx; }
   async signAllTransactions<T>(txs: T[]): Promise<T[]> { return txs; }
@@ -514,6 +643,22 @@ async function getWhirlpool(poolId: string) {
 }
 
 export async function quoteOrcaWhirlpool(args: QuoteArgs): Promise<QuoteResult> {
+  const local = quoteFromReserves(args);
+  if (local) return local;
+
+  const key = cacheKey(args);
+  const cached = getCachedQuote(key);
+  if (cached) {
+    logger.log("clmm_quote_cache_hit", { venue: args.venue ?? "orca", pool: args.poolId, side: args.side, size_base: args.sizeBase });
+    return cached;
+  }
+
+  // Soft block in snapshot-only mode
+  {
+    const soft = snapshotOnlyBlock(args.venue ?? "orca", args.poolId, args.side, args.sizeBase);
+    if (soft) return soft;
+  }
+
   try {
     if (!(args.sizeBase > 0)) return { ok: false, err: "size_not_positive" };
     const whirlpool = await getWhirlpool(args.poolId);
@@ -574,7 +719,9 @@ export async function quoteOrcaWhirlpool(args: QuoteArgs): Promise<QuoteResult> 
         estimatedEndTick: quote.estimatedEndTickIndex,
       };
 
-      return { ok: true, price, feeBps, meta };
+      const quoteResult: QuoteResult = { ok: true, price, feeBps, meta };
+      rememberQuote(key, quoteResult);
+      return quoteResult;
     }
 
     // BUY: need exact-out (base out)
@@ -615,7 +762,9 @@ export async function quoteOrcaWhirlpool(args: QuoteArgs): Promise<QuoteResult> 
       estimatedEndTick: quote.estimatedEndTickIndex,
     };
 
-    return { ok: true, price, feeBps, meta };
+    const quoteResult: QuoteResult = { ok: true, price, feeBps, meta };
+    rememberQuote(key, quoteResult);
+    return quoteResult;
   } catch (err: any) {
     if (isRateLimitError(err)) {
       logger.log("orca_whirlpool_rate_limited", {
@@ -653,10 +802,22 @@ export async function quoteClmm(args: QuoteArgs & { venue: string; poolKind?: st
       ok: false,
       err: "rate_limited_cooldown",
       meta: { wait_ms: cooldown.remaining },
-    } as QuoteResult;
+    };
   }
 
-  const res = await handler(args);
+  let res: QuoteResult;
+  try {
+    res = await handler(args);
+  } catch (err) {
+    const msg = String((err as any)?.message ?? err);
+    if (isRateLimitError(err)) {
+      markRateLimited(rlKey);
+      logger.log("clmm_quote_handler_error", { venue: args.venue, pool: args.poolId, side: args.side, err: msg, rate_limited: true });
+      return { ok: false, err: "rate_limited", meta: { source: "handler_throw" } };
+    }
+    logger.log("clmm_quote_handler_error", { venue: args.venue, pool: args.poolId, side: args.side, err: msg });
+    return { ok: false, err: msg };
+  }
   if (!res.ok && res.err === "rate_limited") {
     markRateLimited(rlKey);
     return res;

@@ -99,6 +99,18 @@ function stampLocal() {
   return new Date().toISOString().replace(/[:.]/g, "").replace("Z", "Z");
 }
 
+function resolveLiveDir(baseDataDir: string): string {
+  const override = process.env.ARB_LIVE_DIR?.trim();
+  if (override && override.length) {
+    const resolved = path.isAbsolute(override) ? override : path.resolve(override);
+    ensureDir(resolved);
+    return resolved;
+  }
+  const fallback = path.join(baseDataDir, "live");
+  ensureDir(fallback);
+  return fallback;
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // JSONL follower (tail)
 // ────────────────────────────────────────────────────────────────────────────
@@ -240,8 +252,9 @@ const runStartedAt = new Date();
 let consideredCnt = 0;
 let wouldTradeCnt = 0;
 let wouldNotCnt = 0;
-let bestEdgeNet = -Infinity;
-let worstEdgeNet = +Infinity;
+let bestEdgeNet: number | null = null;
+let worstEdgeNet: number | null = null;
+let bestPnlQuote: number | null = null;
 let cumSimPnLQuote = 0;
 let wroteSummary = false;
 
@@ -309,11 +322,16 @@ function recordDecision(
   if (wouldTrade) {
     wouldTradeCnt++;
     cumSimPnLQuote += expectedPnl;
+    if (Number.isFinite(expectedPnl)) {
+      bestPnlQuote = bestPnlQuote == null ? expectedPnl : Math.max(bestPnlQuote, expectedPnl);
+    }
   } else {
     wouldNotCnt++;
   }
-  if (edgeNetBps > bestEdgeNet) bestEdgeNet = edgeNetBps;
-  if (edgeNetBps < worstEdgeNet) worstEdgeNet = edgeNetBps;
+  if (Number.isFinite(edgeNetBps)) {
+    bestEdgeNet = bestEdgeNet == null ? edgeNetBps : Math.max(bestEdgeNet, edgeNetBps);
+    worstEdgeNet = worstEdgeNet == null ? edgeNetBps : Math.min(worstEdgeNet, edgeNetBps);
+  }
 }
 
 function ewma(prev: number, x: number, alpha = 0.1) {
@@ -323,8 +341,7 @@ function ewma(prev: number, x: number, alpha = 0.1) {
 
 function writeLiveSummarySync(CFG: any, mlEventsFile?: string) {
   try {
-    const LIVE_DIR = path.join(CFG.DATA_DIR, "live");
-    ensureDir(LIVE_DIR);
+    const LIVE_DIR = resolveLiveDir(CFG.DATA_DIR);
     const file = path.join(LIVE_DIR, `arb-summary-${stampLocal()}.json`);
     const summary: any = {
       file,
@@ -334,12 +351,9 @@ function writeLiveSummarySync(CFG: any, mlEventsFile?: string) {
       would_trade: wouldTradeCnt,
       would_not_trade: wouldNotCnt,
       pnl_sum: roundN(cumSimPnLQuote, 6) ?? 0,
-      best_edge_bps: Number.isFinite(bestEdgeNet)
-        ? (roundN(bestEdgeNet, 4) ?? 0)
-        : 0,
-      worst_edge_bps: Number.isFinite(worstEdgeNet)
-        ? (roundN(worstEdgeNet, 4) ?? 0)
-        : 0,
+      best_edge_bps: bestEdgeNet != null ? roundN(bestEdgeNet, 4) ?? 0 : null,
+      worst_edge_bps: worstEdgeNet != null ? roundN(worstEdgeNet, 4) ?? 0 : null,
+      best_pnl_quote: bestPnlQuote != null ? roundN(bestPnlQuote, 6) ?? 0 : null,
       threshold_bps: String(
         process.env.TRADE_THRESHOLD_BPS ?? CFG.TRADE_THRESHOLD_BPS
       ),
@@ -408,8 +422,11 @@ async function main() {
   });
 
   // Embedded publishers (optional; auto when enabled)
+  const providerEnabled = String(process.env.ENABLE_MARKET_PROVIDER ?? "0") === "1";
+  const enableEmbedded = !providerEnabled && String(process.env.ENABLE_EMBEDDED_PUBLISHERS ?? "1") === "1";
+
   const sup = new PublisherSupervisor({
-    enable: String(process.env.ENABLE_EMBEDDED_PUBLISHERS ?? "1") === "1",
+    enable: enableEmbedded,
     phoenixJsonl: CFG.PHOENIX_JSONL,
     ammsJsonl: CFG.AMMS_JSONL,
     freshnessMs: 3500,
@@ -419,24 +436,24 @@ async function main() {
   sup.start();
 
   // Attach WS endpoint (Phoenix publisher will poll if SDK lacks subs)
-const conn = rpcClient;
+  const conn = rpcClient;
 
-const ENABLE_MARKET_PROVIDER = String(process.env.ENABLE_MARKET_PROVIDER ?? "0").trim() === "1";
-let marketProvider: MarketStateProvider | null = null;
-if (ENABLE_MARKET_PROVIDER) {
-  try {
-    marketProvider = new MarketStateProvider(conn, loadPairsFromEnvOrDefault());
-    await marketProvider.start();
-    logger.log("market_provider_started", {
-      pools: marketProvider.getTrackedPools().length,
-      markets: marketProvider.getPhoenixMarkets().length,
-      refresh_ms: Number(process.env.MARKET_PROVIDER_REFRESH_MS ?? 900),
-    });
-  } catch (err) {
-    logger.log("market_provider_start_error", { err: String((err as any)?.message ?? err) });
-    marketProvider = null;
+  const ENABLE_MARKET_PROVIDER = String(process.env.ENABLE_MARKET_PROVIDER ?? "0").trim() === "1";
+  let marketProvider: MarketStateProvider | null = null;
+  if (ENABLE_MARKET_PROVIDER) {
+    try {
+      marketProvider = new MarketStateProvider(conn, loadPairsFromEnvOrDefault());
+      await marketProvider.start();
+      logger.log("market_provider_started", {
+        pools: marketProvider.getTrackedPools().length,
+        markets: marketProvider.getPhoenixMarkets().length,
+        refresh_ms: Number(process.env.MARKET_PROVIDER_REFRESH_MS ?? 900),
+      });
+    } catch (err) {
+      logger.log("market_provider_start_error", { err: String((err as any)?.message ?? err) });
+      marketProvider = null;
+    }
   }
-}
 
   const warmupKeys = new Set<string>();
   const tryPush = (value: string | undefined) => {
@@ -580,9 +597,11 @@ if (ENABLE_MARKET_PROVIDER) {
   const ALLOWED = String(process.env.EXEC_ALLOWED_PATH ?? "both");
 
   // ML events log (jsonl)
-  const LIVE_DIR = path.join(CFG.DATA_DIR, "live");
-  ensureDir(LIVE_DIR);
-  const ML_EVENTS_FILE = path.join(LIVE_DIR, `${stampLocal()}.events.jsonl`);
+  const LIVE_DIR = resolveLiveDir(CFG.DATA_DIR);
+  const ML_EVENTS_OVERRIDE = process.env.ML_EVENTS_FILE?.trim();
+  const ML_EVENTS_FILE = ML_EVENTS_OVERRIDE && ML_EVENTS_OVERRIDE.length
+    ? (path.isAbsolute(ML_EVENTS_OVERRIDE) ? ML_EVENTS_OVERRIDE : path.resolve(ML_EVENTS_OVERRIDE))
+    : path.join(LIVE_DIR, `${stampLocal()}.events.jsonl`);
   const emitMlLocal = (obj: any) => {
     try { fs.appendFileSync(ML_EVENTS_FILE, JSON.stringify(obj) + "\n"); } catch { }
   };
@@ -701,7 +720,9 @@ if (ENABLE_MARKET_PROVIDER) {
     if (s?.blocked) rpcBlocked++;
   };
 
-  // Joiner: include actual AMM fee for EV
+  // ──────────────────────────────────────────────────────────────────────
+  // Joiner (include actual AMM fee for EV; tx-level sim handled by executor)
+  // ──────────────────────────────────────────────────────────────────────
   const joiner = new EdgeJoiner(
     {
       minAbsBps: CFG.EDGE_MIN_ABS_BPS,
@@ -710,9 +731,9 @@ if (ENABLE_MARKET_PROVIDER) {
       flatSlippageBps: CFG.MAX_SLIPPAGE_BPS,
       tradeSizeBase: CFG.TRADE_SIZE_BASE,
 
-      // 👇 ensure your min-size is honored by the decision/size optimizer
+      // ensure min-size is honored by the decision/size optimizer
       decisionMinBase: CFG.DECISION_MIN_BASE,
-      // (belt-and-suspenders aliases, harmless if unused by your joiner)
+      // (aliases, harmless if unused by your joiner)
       minBase: CFG.DECISION_MIN_BASE,
       minTradeBase: CFG.DECISION_MIN_BASE,
 
@@ -730,17 +751,89 @@ if (ENABLE_MARKET_PROVIDER) {
       enforceDedupe: CFG.ENFORCE_DEDUPE,
       decisionBucketMs: CFG.DECISION_BUCKET_MS,
       decisionMinEdgeDeltaBps: CFG.DECISION_MIN_EDGE_DELTA_BPS,
-      useRpcSim: CFG.USE_RPC_SIM, // executor will actually simulate the tx
+      useRpcSim: CFG.USE_RPC_SIM,
 
-      // 👇 mirrored here too, in case your joiner reads it from the “options” bag
+      // mirrored here too, in case your joiner reads it from the “options” bag
       decisionMinBase: CFG.DECISION_MIN_BASE,
     },
     onDecision,
-    rpcSimFn,       // keep undefined; tx-level sim is executed in the executor
+    rpcSimFn,
     onRpcSample
   );
 
-  // Feed joiner from JSONL publishers and maintain local state
+  // If provider is enabled, feed the joiner directly from in-memory snapshots
+  if (providerEnabled && marketProvider) {
+    console.log("edge_input_source { source: 'provider' }");
+    marketProvider.subscribe((state) => {
+      try {
+        // AMMs → mirror "amms_price" payload and keep LAST_CPMM fresh when reserves available
+        for (const s of state.amms) {
+          const obj = {
+            event: "amms_price",
+            symbol: "SOL/USDC",
+            venue: s.venue,
+            ammId: s.poolId,
+            poolKind: s.poolKind,
+            ts: s.lastUpdateTs,
+            baseDecimals: s.baseDecimals,
+            quoteDecimals: s.quoteDecimals,
+            px: s.price ?? undefined,
+            feeBps: s.feeBps ?? undefined,
+            base_vault: s.baseVault ?? undefined,
+            quote_vault: s.quoteVault ?? undefined,
+            base_int: s.baseReserveAtoms ?? (s.baseReserve != null && s.baseDecimals != null
+              ? Math.trunc(s.baseReserve * 10 ** s.baseDecimals).toString()
+              : undefined),
+            quote_int: s.quoteReserveAtoms ?? (s.quoteReserve != null && s.quoteDecimals != null
+              ? Math.trunc(s.quoteReserve * 10 ** s.quoteDecimals).toString()
+              : undefined),
+            base_ui: s.baseReserve ?? undefined,
+            quote_ui: s.quoteReserve ?? undefined,
+            slot: s.slot ?? undefined,
+            source: "provider",
+            validation_passed: s.price != null,
+          };
+          joiner.upsertAmms(obj);
+
+          // update local CPMM view when we have reserves
+          try {
+            if (s.baseReserve != null && s.quoteReserve != null) {
+              LAST_CPMM = { base: s.baseReserve, quote: s.quoteReserve };
+            }
+          } catch { /* ignore */ }
+        }
+
+        // Phoenix → mirror "phoenix_l2" payload and keep LAST_BOOK/LAST_PHX_MID fresh
+        for (const p of state.phoenix) {
+          const obj = {
+            event: "phoenix_l2",
+            ts: p.lastUpdateTs,
+            market: p.market,
+            symbol: p.symbol,
+            best_bid: p.bestBid ?? undefined,
+            best_ask: p.bestAsk ?? undefined,
+            phoenix_mid: p.mid ?? undefined,
+            levels_bids: p.levelsBids,
+            levels_asks: p.levelsAsks,
+            slot: p.slot ?? undefined,
+            source: "provider",
+          };
+          joiner.upsertPhoenix(obj);
+
+          try {
+            const bids = (p.levelsBids ?? []).map((l) => ({ px: Number(l.px), qtyBase: Number(l.qty ?? 0) }));
+            const asks = (p.levelsAsks ?? []).map((l) => ({ px: Number(l.px), qtyBase: Number(l.qty ?? 0) }));
+            LAST_BOOK = { bids, asks, takerFeeBps: Number.isFinite(PHX_FEE_BPS as number) ? Number(PHX_FEE_BPS) : 0 };
+            if (Number.isFinite(p.mid as number)) LAST_PHX_MID = p.mid as number;
+            else if (Number.isFinite(p.bestBid as number) && Number.isFinite(p.bestAsk as number))
+              LAST_PHX_MID = ((p.bestBid as number) + (p.bestAsk as number)) / 2;
+          } catch { /* ignore */ }
+        }
+      } catch { /* swallow per-tick errors */ }
+    });
+  }
+
+  // Feed joiner from JSONL publishers and maintain local state (when provider is not enabled)
   const POLL_MS = Number(process.env.EDGE_FOLLOW_POLL_MS ?? 500) || 500;
 
   const ammsFollower = new JsonlFollower(
@@ -803,7 +896,11 @@ if (ENABLE_MARKET_PROVIDER) {
     POLL_MS
   );
 
-  await Promise.all([ammsFollower.start(), phxFollower.start()]);
+  if (!providerEnabled) {
+    await Promise.all([ammsFollower.start(), phxFollower.start()]);
+  } else {
+    console.log("edge_input_source { source: 'provider' }");
+  }
 
   // NO AUTO-STOP → run indefinitely until SIGINT/SIGTERM
 
@@ -848,24 +945,24 @@ if (ENABLE_MARKET_PROVIDER) {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("beforeExit", () => { if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE); });
   process.on("exit", () => { if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE); });
-process.on("uncaughtException", (e) => {
-  if (isRateLimitError(e)) {
-    logger.log("arb_rate_limit", { error: String(e) });
-    return;
-  }
-  logger.log("arb_fatal", { error: String(e) });
-  if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
-  process.exit(1);
-});
-process.on("unhandledRejection", (e) => {
-  if (isRateLimitError(e)) {
-    logger.log("arb_rate_limit", { error: String(e) });
-    return;
-  }
-  logger.log("arb_fatal", { error: String(e) });
-  if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
-  process.exit(1);
-});
+  process.on("uncaughtException", (e) => {
+    if (isRateLimitError(e)) {
+      logger.log("arb_rate_limit", { error: String(e) });
+      return;
+    }
+    logger.log("arb_fatal", { error: String(e) });
+    if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (e) => {
+    if (isRateLimitError(e)) {
+      logger.log("arb_rate_limit", { error: String(e) });
+      return;
+    }
+    logger.log("arb_fatal", { error: String(e) });
+    if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
+    process.exit(1);
+  });
 }
 
 main().catch(async (e) => {
@@ -877,8 +974,7 @@ main().catch(async (e) => {
   try {
     const { loadConfig } = await import("./config.js");
     const CFG = loadConfig();
-    const LIVE_DIR = path.join(CFG.DATA_DIR, "live");
-    if (!fs.existsSync(LIVE_DIR)) fs.mkdirSync(LIVE_DIR, { recursive: true });
+    const LIVE_DIR = resolveLiveDir(CFG.DATA_DIR);
     const file = path.join(LIVE_DIR, `arb-summary-${stampLocal()}.json`);
     fs.writeFileSync(file, JSON.stringify({ error: String(e) }, null, 2));
   } catch { }
@@ -889,5 +985,5 @@ function isRateLimitError(err: unknown): boolean {
   const code = (err as any)?.code;
   if (code === -32429) return true;
   const msg = String((err as any)?.message ?? err ?? "").toLowerCase();
-  return msg.includes("429") || msg.includes("rate limited");
+  return msg.includes("429") || msg.includes("rate limited") || msg.includes("too many requests") || msg.includes("rate limit");
 }

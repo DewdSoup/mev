@@ -12,13 +12,19 @@ export function setChainTps(tps?: number) { chainTps = tps; }
 
 function ensureDir(p: string) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
 function dataDirs() {
-  const base = process.env.DATA_DIR?.trim() || path.resolve(process.cwd(), "data");
+  const baseRaw = process.env.DATA_DIR?.trim();
+  const base = baseRaw ? path.resolve(baseRaw) : path.resolve(process.cwd(), "data");
   ensureDir(base);
+  const single = String(process.env.RUN_ROOT_SINGLE ?? "").trim() === "1";
+  if (single) {
+    return { base, feat: base, ml: base, single: true } as const;
+  }
   const feat = path.join(base, "features"); ensureDir(feat);
   const ml = path.join(base, "ml"); ensureDir(ml);
-  return { base, feat, ml };
+  return { base, feat, ml, single: false } as const;
 }
-function dayFile(dir: string, stem: string) {
+function dayFile(dir: string, stem: string, single?: boolean) {
+  if (single) return path.join(dir, `${stem}.jsonl`);
   const d = new Date();
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth()+1).padStart(2,"0");
@@ -28,8 +34,8 @@ function dayFile(dir: string, stem: string) {
 
 export function emitFeature(row: any) {
   try {
-    const { feat } = dataDirs();
-    const file = dayFile(feat, "edge_features");
+    const dirs = dataDirs();
+    const file = dayFile(dirs.feat, "edge_features", dirs.single);
     fs.appendFileSync(file, JSON.stringify(row) + "\n");
   } catch (e) {
     logger.log("feature_sink_error", { err: String(e) });
@@ -38,8 +44,8 @@ export function emitFeature(row: any) {
 
 export function emitMl(kind: "submit" | "fill" | "error", row: any) {
   try {
-    const { ml } = dataDirs();
-    const file = dayFile(ml, "events");
+    const dirs = dataDirs();
+    const file = dayFile(dirs.ml, "events", dirs.single);
     const out = { ts: Date.now(), kind, ...row };
     fs.appendFileSync(file, JSON.stringify(out) + "\n");
   } catch (e) {

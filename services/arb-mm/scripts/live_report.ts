@@ -10,6 +10,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const SVC_ROOT = path.resolve(__dirname, "..");
+const envLive = process.env.ARB_LIVE_DIR?.trim();
+const ENV_LIVE_DIR = envLive && envLive.length
+  ? (path.isAbsolute(envLive) ? envLive : path.resolve(process.cwd(), envLive))
+  : null;
 const PRIMARY = path.join(SVC_ROOT, "..", "data", "arb", "live");
 const ALT = path.join(SVC_ROOT, "data", "live"); // legacy nested
 
@@ -30,11 +34,24 @@ function readJson(p: string): any | null {
 }
 function n(v: any, d = 0) { const x = Number(v); return Number.isFinite(x) ? x : d; }
 
-const all = [...listSummaries(PRIMARY), ...listSummaries(ALT)]
+const searchDirs = [PRIMARY, ALT];
+if (ENV_LIVE_DIR) searchDirs.unshift(ENV_LIVE_DIR);
+
+const seen = new Set<string>();
+const all = searchDirs
+  .flatMap((dir) => listSummaries(dir))
+  .filter((p) => {
+    if (seen.has(p)) return false;
+    seen.add(p);
+    return true;
+  })
   .sort((a, b) => path.basename(a).localeCompare(path.basename(b))); // by filename asc
 
 if (all.length === 0) {
-  console.log(`No live summary files in ${path.relative(process.cwd(), PRIMARY)} (or ALT).`);
+  const relPrimary = path.relative(process.cwd(), PRIMARY);
+  const relEnv = ENV_LIVE_DIR ? path.relative(process.cwd(), ENV_LIVE_DIR) : null;
+  if (relEnv) console.log(`No live summary files in ${relEnv}.`);
+  console.log(`No live summary files in ${relPrimary} (or ALT).`);
   process.exit(0);
 }
 

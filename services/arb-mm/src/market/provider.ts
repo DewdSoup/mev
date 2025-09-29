@@ -191,6 +191,8 @@ export class MarketStateProvider {
       if (this.stopping) return;
       void this.refreshPhoenix();
     }, this.config.phoenixRefreshMs);
+    // optional: allow process to exit cleanly if nothing else is pending
+    if (typeof this.phoenixTimer?.unref === "function") this.phoenixTimer.unref();
   }
 
   async stop(): Promise<void> {
@@ -199,8 +201,16 @@ export class MarketStateProvider {
 
     if (this.refreshTimer) clearInterval(this.refreshTimer);
     if (this.phoenixTimer) clearInterval(this.phoenixTimer);
+    if (this.ammDebounceTimer) clearTimeout(this.ammDebounceTimer);
     this.refreshTimer = null;
     this.phoenixTimer = null;
+    this.ammDebounceTimer = null;
+
+    // NEW: clean up the slot-change subscription
+    if (this.slotSubId != null) {
+      try { await this.conn.removeSlotChangeListener(this.slotSubId); } catch { /* noop */ }
+      this.slotSubId = null;
+    }
 
     const subs = Array.from(this.accountSubs.keys());
     await Promise.all(
@@ -302,12 +312,10 @@ export class MarketStateProvider {
     }
 
     const snap = this.amms.get(pool.poolId);
-    if (pool.poolKind === "cpmm" && snap) {
-      this.ensureCpmmVaultSubscriptions(state, snap);
-    }
+    if (snap) this.ensurePoolVaultSubscriptions(state, snap);
   }
 
-  private ensureCpmmVaultSubscriptions(state: PoolWatcherState, snap: AmmSnapshot): void {
+  private ensurePoolVaultSubscriptions(state: PoolWatcherState, snap: AmmSnapshot): void {
     const poolId = state.meta.poolId;
 
     const baseVault = snap.baseVault ?? null;
@@ -315,7 +323,7 @@ export class MarketStateProvider {
       void this.removeAccountSub(state.baseVaultSubId);
       state.baseVault = baseVault;
       state.baseVaultSubId = this.addAccountSub(`vault:${poolId}:base`, new PublicKey(baseVault), (info, slot) => {
-        this.handleRaydiumCpmmVault(state.meta, "base", info, slot);
+        this.handleVaultAccount(state.meta, "base", info, slot);
       });
     } else if (!baseVault && state.baseVaultSubId) {
       void this.removeAccountSub(state.baseVaultSubId);
@@ -328,12 +336,27 @@ export class MarketStateProvider {
       void this.removeAccountSub(state.quoteVaultSubId);
       state.quoteVault = quoteVault;
       state.quoteVaultSubId = this.addAccountSub(`vault:${poolId}:quote`, new PublicKey(quoteVault), (info, slot) => {
-        this.handleRaydiumCpmmVault(state.meta, "quote", info, slot);
+        this.handleVaultAccount(state.meta, "quote", info, slot);
       });
     } else if (!quoteVault && state.quoteVaultSubId) {
       void this.removeAccountSub(state.quoteVaultSubId);
       state.quoteVaultSubId = undefined;
       state.quoteVault = undefined;
+    }
+  }
+
+  private handleVaultAccount(
+    pool: TrackedPoolMeta,
+    which: "base" | "quote",
+    info: AccountInfo<Buffer>,
+    slot: number | null
+  ): void {
+    if (pool.poolKind === "cpmm") {
+      this.handleRaydiumCpmmVault(pool, which, info, slot);
+      return;
+    }
+    if (pool.poolKind === "clmm") {
+      this.handleClmmVault(pool, which, info, slot);
     }
   }
 
@@ -357,7 +380,7 @@ export class MarketStateProvider {
           logger.log("market_provider_ws_handler_error", { label, err: String((err as any)?.message ?? err) });
         }
       },
-      "processed"
+      "confirmed"
     );
     this.accountSubs.set(id, label);
     return id;
@@ -389,8 +412,10 @@ export class MarketStateProvider {
     snap.slot = slot ?? snap.slot ?? null;
     snap.degraded = false;
     snap.degradedReason = null;
-    snap.stale = false;
     snap.ageMs = 0;
+    const ttl = this.config.snapshotTtlMs;
+    snap.stale = ttl ? (Date.now() - (snap.lastUpdateTs ?? 0) > ttl) : false;
+
     this.clearAmmDegraded(pool.poolId);
     this.amms.set(pool.poolId, snap);
     this.ammsWriter?.write("amms_price", serializeAmmSnapshot(snap));
@@ -416,6 +441,15 @@ export class MarketStateProvider {
         this.lastSlotSeen = slot ?? this.lastSlotSeen;
         const type = String((slotUpdate as any)?.type ?? "");
         this.scheduleAmmRefresh(slot, type || "slot");
+        // If the last applied slot is far behind, flag degraded to allow a single HTTP backfill
+        if (slot != null) {
+          for (const [poolId, snap] of this.amms) {
+            const lagOk = Number(process.env.AMM_SLOT_MAX_LAG ?? 8);
+            if (snap.slot != null && slot - snap.slot > lagOk) {
+              this.setAmmDegraded(poolId, "slot_gap");
+            }
+          }
+        }
       });
     } catch (err) {
       logger.log("market_provider_slot_sub_error", { err: String((err as any)?.message ?? err) });
@@ -431,7 +465,12 @@ export class MarketStateProvider {
       this.ammDebounceTimer = null;
       const targetSlot = this.pendingSlot;
       this.pendingSlot = null;
-      void this.refreshAmms(false, targetSlot, reason);
+      // WS-first: only hit HTTP batch if we are degraded or missing pools
+      const needHttp =
+        Array.from(this.ammDegradedReasons.values()).length > 0 ||
+        this.amms.size === 0;
+
+      void this.refreshAmms(needHttp /*force*/, targetSlot, reason);
     }, this.config.refreshDebounceMs);
     if (typeof this.ammDebounceTimer?.unref === "function") this.ammDebounceTimer.unref();
   }
@@ -442,7 +481,8 @@ export class MarketStateProvider {
     for (let i = 0; i < keys.length; i += this.config.batchMax) {
       const slice = keys.slice(i, i + this.config.batchMax);
       try {
-        const infos = await this.conn.getMultipleAccountsInfo(slice, { commitment: "processed" });
+        const infos = await this.conn.getMultipleAccountsInfo(slice, { commitment: "confirmed" });
+
         this.refreshStats.batches += 1;
         for (let j = 0; j < slice.length; j += 1) {
           const key = slice[j];
@@ -522,7 +562,7 @@ export class MarketStateProvider {
     };
     this.commitAmmSnapshot(pool, snap, slot ?? prev?.slot ?? null);
     const watcher = this.poolWatchers.get(pool.poolId);
-    if (watcher) this.ensureCpmmVaultSubscriptions(watcher, snap);
+    if (watcher) this.ensurePoolVaultSubscriptions(watcher, snap);
   }
 
   private handleRaydiumCpmmVault(
@@ -537,6 +577,7 @@ export class MarketStateProvider {
     const amount = new BN(decoded.amount.toString());
     const decimals = which === "base" ? snap.baseDecimals : snap.quoteDecimals;
     const reserve = amount.toNumber() / 10 ** decimals;
+    const atomsStr = amount.toString();
 
     const next: AmmSnapshot = {
       ...snap,
@@ -544,11 +585,48 @@ export class MarketStateProvider {
       slot: slot ?? snap.slot ?? null,
       stale: false,
     };
-    if (which === "base") next.baseReserve = reserve;
-    else next.quoteReserve = reserve;
+    if (which === "base") {
+      next.baseReserve = reserve;
+      next.baseReserveUi = reserve;
+      next.baseReserveAtoms = atomsStr;
+    } else {
+      next.quoteReserve = reserve;
+      next.quoteReserveUi = reserve;
+      next.quoteReserveAtoms = atomsStr;
+    }
 
-    if (next.baseReserve != null && next.quoteReserve != null && next.baseReserve > 0) {
-      next.price = next.quoteReserve / next.baseReserve;
+    this.commitAmmSnapshot(pool, next, slot ?? snap.slot ?? null);
+  }
+
+  private handleClmmVault(
+    pool: TrackedPoolMeta,
+    which: "base" | "quote",
+    info: AccountInfo<Buffer>,
+    slot: number | null,
+  ): void {
+    const snap = this.amms.get(pool.poolId);
+    if (!snap) return;
+    const decoded: any = SPL_ACCOUNT_LAYOUT.decode(info.data);
+    const amount = new BN(decoded.amount.toString());
+    const atomsStr = amount.toString();
+    const decimals = which === "base" ? snap.baseDecimals : snap.quoteDecimals;
+    const reserve = amount.toNumber() / 10 ** decimals;
+
+    const next: AmmSnapshot = {
+      ...snap,
+      lastUpdateTs: Date.now(),
+      slot: slot ?? snap.slot ?? null,
+      stale: false,
+    };
+
+    if (which === "base") {
+      next.baseReserve = reserve;
+      next.baseReserveUi = reserve;
+      next.baseReserveAtoms = atomsStr;
+    } else {
+      next.quoteReserve = reserve;
+      next.quoteReserveUi = reserve;
+      next.quoteReserveAtoms = atomsStr;
     }
 
     this.commitAmmSnapshot(pool, next, slot ?? snap.slot ?? null);
@@ -568,9 +646,18 @@ export class MarketStateProvider {
     const baseDecimals = baseIsA ? decimalsA : decimalsB;
     const quoteDecimals = baseIsA ? decimalsB : decimalsA;
 
+    const vaultA = new PublicKey(state.vaultA).toBase58();
+    const vaultB = new PublicKey(state.vaultB).toBase58();
+    const baseVault = baseIsA ? vaultA : vaultB;
+    const quoteVault = baseIsA ? vaultB : vaultA;
+
     const sqrtPrice = new BN(state.sqrtPriceX64.toString());
-    const rawPrice = SqrtPriceMath.sqrtPriceX64ToPrice(sqrtPrice, decimalsA, decimalsB).toNumber();
-    const price = baseIsA ? rawPrice : rawPrice > 0 ? 1 / rawPrice : null;
+    const priceAB = SqrtPriceMath.sqrtPriceX64ToPrice(sqrtPrice, decimalsA, decimalsB).toNumber();
+    const priceBA = priceAB > 0 ? 1 / priceAB : null;
+    let price = baseIsA ? priceBA ?? priceAB : priceAB;
+    if (price != null && price < 1 && priceBA && priceAB) {
+      price = Math.max(priceAB, priceBA);
+    }
 
     const feeBps = pool.feeHint ?? prev?.feeBps ?? (Number.isFinite(state.tradeFeeRate) ? Number(state.tradeFeeRate) * 10_000 : null);
     const snap: AmmSnapshot = {
@@ -581,8 +668,8 @@ export class MarketStateProvider {
       feeBps,
       baseDecimals,
       quoteDecimals,
-      baseVault: prev?.baseVault,
-      quoteVault: prev?.quoteVault,
+      baseVault,
+      quoteVault,
       baseReserve: prev?.baseReserve ?? null,
       quoteReserve: prev?.quoteReserve ?? null,
       lastUpdateTs: Date.now(),
@@ -591,6 +678,8 @@ export class MarketStateProvider {
     };
 
     this.commitAmmSnapshot(pool, snap, slot ?? prev?.slot ?? null);
+    const watcher = this.poolWatchers.get(pool.poolId);
+    if (watcher) this.ensurePoolVaultSubscriptions(watcher, snap);
   }
 
   private handleOrcaClmmState(pool: TrackedPoolMeta, info: AccountInfo<Buffer>, slot: number | null): void {
@@ -608,13 +697,21 @@ export class MarketStateProvider {
     const baseIsA = baseMint.equals(mintA);
     const baseDecimals = baseIsA ? decimalsA : decimalsB;
     const quoteDecimals = baseIsA ? decimalsB : decimalsA;
+    const vaultA = new PublicKey(whirlpool.tokenVaultA).toBase58();
+    const vaultB = new PublicKey(whirlpool.tokenVaultB).toBase58();
+    const baseVault = baseIsA ? vaultA : vaultB;
+    const quoteVault = baseIsA ? vaultB : vaultA;
 
-    const priceRaw = PriceMath.sqrtPriceX64ToPrice(
+    const priceAB = PriceMath.sqrtPriceX64ToPrice(
       whirlpool.sqrtPrice,
       decimalsA,
       decimalsB
     ).toNumber();
-    const price = baseIsA ? priceRaw : priceRaw > 0 ? 1 / priceRaw : null;
+    const priceBA = priceAB > 0 ? 1 / priceAB : null;
+    let price = baseIsA ? priceBA ?? priceAB : priceAB;
+    if (price != null && price < 1 && priceBA && priceAB) {
+      price = Math.max(priceAB, priceBA);
+    }
 
     const feeBps = pool.feeHint ?? prev?.feeBps ?? (Number.isFinite(whirlpool.feeRate) ? Number(whirlpool.feeRate) / 100 : null);
     const snap: AmmSnapshot = {
@@ -625,8 +722,8 @@ export class MarketStateProvider {
       feeBps,
       baseDecimals,
       quoteDecimals,
-      baseVault: prev?.baseVault,
-      quoteVault: prev?.quoteVault,
+      baseVault,
+      quoteVault,
       baseReserve: prev?.baseReserve ?? null,
       quoteReserve: prev?.quoteReserve ?? null,
       lastUpdateTs: Date.now(),
@@ -635,6 +732,8 @@ export class MarketStateProvider {
     };
 
     this.commitAmmSnapshot(pool, snap, slot ?? prev?.slot ?? null);
+    const watcher = this.poolWatchers.get(pool.poolId);
+    if (watcher) this.ensurePoolVaultSubscriptions(watcher, snap);
   }
 
   private async refreshPhoenixMarket(market: string, symbol: string, slot: number | null, forceClient = false): Promise<void> {
@@ -754,7 +853,7 @@ export class MarketStateProvider {
     for (const { market } of this.trackedMarkets) keys.push(new PublicKey(market));
     if (!keys.length) return;
     try {
-      await rpc.warmupAccounts(keys, "processed");
+      await rpc.warmupAccounts(keys, "confirmed");
       logger.log("market_provider_warmup", { count: keys.length });
     } catch (err) {
       logger.log("market_provider_warmup_error", { count: keys.length, err: String((err as any)?.message ?? err) });
@@ -762,6 +861,23 @@ export class MarketStateProvider {
   }
 
   private async refreshAmms(force = false, slot: number | null = null, reason = "scheduled"): Promise<void> {
+    // If not forced and all AMM snapshots are fresh, don't touch RPC HTTP.
+    if (!force) {
+      const now = Date.now();
+      let allFresh = this.trackedPools.length > 0;
+      for (const pool of this.trackedPools) {
+        const s = this.amms.get(pool.poolId);
+        if (!s) { allFresh = false; break; }
+        const age = now - (s.lastUpdateTs ?? 0);
+        if (age > this.config.snapshotTtlMs) { allFresh = false; break; }
+      }
+      if (allFresh) {
+        this.updateSnapshotHealth();
+        this.emitState();
+        return;
+      }
+    }
+
     if (this.refreshInFlight && !force) return;
 
     const now = Date.now();
@@ -838,7 +954,7 @@ export class MarketStateProvider {
         }
 
         const snap = this.amms.get(pool.poolId);
-        if (pool.poolKind === "cpmm" && snap) {
+        if (snap) {
           if (snap.baseVault) {
             vaultFetch.set(snap.baseVault, { pool, which: "base" });
           }
@@ -862,7 +978,7 @@ export class MarketStateProvider {
               return;
             }
             try {
-              this.handleRaydiumCpmmVault(meta.pool, meta.which, info, slot);
+              this.handleVaultAccount(meta.pool, meta.which, info, slot);
             } catch (err) {
               const isRateLimit = this.isRateLimitError(err);
               if (isRateLimit) this.refreshStats.rateLimited += 1;
@@ -903,9 +1019,11 @@ export class MarketStateProvider {
     } finally {
       this.refreshInFlight = null;
       if (this.pendingSlot != null) {
+        // WS-first: we only reschedule if we were degraded and still need HTTP
+        const stillDegraded = this.ammDegradedReasons.size > 0 || this.amms.size === 0;
         const pending = this.pendingSlot;
         this.pendingSlot = null;
-        this.scheduleAmmRefresh(pending, "pending");
+        if (stillDegraded) this.scheduleAmmRefresh(pending, "pending");
       }
     }
 
@@ -969,7 +1087,7 @@ export class MarketStateProvider {
       !meta.quoteVault;
 
     if (needPoolReload) {
-      const info = await this.conn.getAccountInfo(poolPk, "processed");
+      const info = await this.conn.getAccountInfo(poolPk, "confirmed");
       if (!info?.data) throw new Error("raydium_cpmm_account_missing");
       const state: any = LIQUIDITY_STATE_LAYOUT_V4.decode(info.data);
       baseVaultPk = new PublicKey(state.baseVault);
@@ -999,9 +1117,11 @@ export class MarketStateProvider {
     const baseAmount = new BN(baseInfo.amount.toString());
     const quoteAmount = new BN(quoteInfo.amount.toString());
 
-    const baseReserve = baseAmount.toNumber() / 10 ** baseDecimals;
-    const quoteReserve = quoteAmount.toNumber() / 10 ** quoteDecimals;
-    const price = baseReserve > 0 ? quoteReserve / baseReserve : null;
+    const baseAtomsStr = baseAmount.toString();
+    const quoteAtomsStr = quoteAmount.toString();
+    const baseReserveUi = Number(baseAmount.toString()) / 10 ** baseDecimals;
+    const quoteReserveUi = Number(quoteAmount.toString()) / 10 ** quoteDecimals;
+    const price = baseReserveUi > 0 ? quoteReserveUi / baseReserveUi : null;
 
     return {
       poolId: pool.poolId,
@@ -1013,8 +1133,12 @@ export class MarketStateProvider {
       quoteDecimals,
       baseVault: baseVaultPk.toBase58(),
       quoteVault: quoteVaultPk.toBase58(),
-      baseReserve,
-      quoteReserve,
+      baseReserve: baseReserveUi,
+      quoteReserve: quoteReserveUi,
+      baseReserveUi,
+      quoteReserveUi,
+      baseReserveAtoms: baseAtomsStr,
+      quoteReserveAtoms: quoteAtomsStr,
       lastUpdateTs: Date.now(),
       slot: null,
     };
@@ -1027,7 +1151,7 @@ export class MarketStateProvider {
       return null;
     }
 
-    const info = await this.conn.getAccountInfo(new PublicKey(pool.poolId), "processed");
+    const info = await this.conn.getAccountInfo(new PublicKey(pool.poolId), "confirmed");
     if (!info?.data) throw new Error("raydium_clmm_account_missing");
     const state: any = PoolInfoLayout.decode(info.data);
 
@@ -1047,6 +1171,22 @@ export class MarketStateProvider {
 
     const feeBps = pool.feeHint ?? (Number.isFinite(state.tradeFeeRate) ? Number(state.tradeFeeRate) * 10_000 : null);
 
+    const vaultAPk = new PublicKey(state.vaultA);
+    const vaultBPk = new PublicKey(state.vaultB);
+    const vaultInfos = await this.conn.getMultipleAccountsInfo([vaultAPk, vaultBPk], { commitment: "confirmed" });
+    if (!vaultInfos[0]?.data || !vaultInfos[1]?.data) throw new Error("raydium_clmm_vault_missing");
+    const vaultAInfo: any = SPL_ACCOUNT_LAYOUT.decode(vaultInfos[0].data);
+    const vaultBInfo: any = SPL_ACCOUNT_LAYOUT.decode(vaultInfos[1].data);
+    const amountA = new BN(vaultAInfo.amount.toString());
+    const amountB = new BN(vaultBInfo.amount.toString());
+
+    const baseAmount = baseIsA ? amountA : amountB;
+    const quoteAmount = baseIsA ? amountB : amountA;
+    const baseAtomsStr = baseAmount.toString();
+    const quoteAtomsStr = quoteAmount.toString();
+    const baseReserveUi = Number(baseAtomsStr) / 10 ** baseDecimals;
+    const quoteReserveUi = Number(quoteAtomsStr) / 10 ** quoteDecimals;
+
     return {
       poolId: pool.poolId,
       venue: pool.venue,
@@ -1055,6 +1195,14 @@ export class MarketStateProvider {
       feeBps,
       baseDecimals,
       quoteDecimals,
+      baseVault: (baseIsA ? vaultAPk : vaultBPk).toBase58(),
+      quoteVault: (baseIsA ? vaultBPk : vaultAPk).toBase58(),
+      baseReserve: baseReserveUi,
+      quoteReserve: quoteReserveUi,
+      baseReserveUi,
+      quoteReserveUi,
+      baseReserveAtoms: baseAtomsStr,
+      quoteReserveAtoms: quoteAtomsStr,
       lastUpdateTs: Date.now(),
       slot: null,
     };
@@ -1078,7 +1226,7 @@ export class MarketStateProvider {
       return null;
     }
 
-    const info = await this.conn.getAccountInfo(new PublicKey(pool.poolId), "processed");
+    const info = await this.conn.getAccountInfo(new PublicKey(pool.poolId), "confirmed");
     if (!info?.data) throw new Error("orca_whirlpool_missing");
     const whirlpool = WHIRLPOOL_CODER.decode("Whirlpool", info.data) as any;
 
@@ -1098,6 +1246,22 @@ export class MarketStateProvider {
 
     const feeBps = pool.feeHint ?? (Number.isFinite(whirlpool.feeRate) ? Number(whirlpool.feeRate) / 100 : null);
 
+    const vaultAPk = new PublicKey(whirlpool.tokenVaultA);
+    const vaultBPk = new PublicKey(whirlpool.tokenVaultB);
+    const vaultInfos = await this.conn.getMultipleAccountsInfo([vaultAPk, vaultBPk], { commitment: "confirmed" });
+    if (!vaultInfos[0]?.data || !vaultInfos[1]?.data) throw new Error("orca_whirlpool_vault_missing");
+    const vaultAInfo: any = SPL_ACCOUNT_LAYOUT.decode(vaultInfos[0].data);
+    const vaultBInfo: any = SPL_ACCOUNT_LAYOUT.decode(vaultInfos[1].data);
+    const amountA = new BN(vaultAInfo.amount.toString());
+    const amountB = new BN(vaultBInfo.amount.toString());
+
+    const baseAmount = baseIsA ? amountA : amountB;
+    const quoteAmount = baseIsA ? amountB : amountA;
+    const baseAtomsStr = baseAmount.toString();
+    const quoteAtomsStr = quoteAmount.toString();
+    const baseReserveUi = Number(baseAtomsStr) / 10 ** baseDecimals;
+    const quoteReserveUi = Number(quoteAtomsStr) / 10 ** quoteDecimals;
+
     return {
       poolId: pool.poolId,
       venue: pool.venue,
@@ -1106,6 +1270,14 @@ export class MarketStateProvider {
       feeBps,
       baseDecimals,
       quoteDecimals,
+      baseVault: (baseIsA ? vaultAPk : vaultBPk).toBase58(),
+      quoteVault: (baseIsA ? vaultBPk : vaultAPk).toBase58(),
+      baseReserve: baseReserveUi,
+      quoteReserve: quoteReserveUi,
+      baseReserveUi,
+      quoteReserveUi,
+      baseReserveAtoms: baseAtomsStr,
+      quoteReserveAtoms: quoteAtomsStr,
       lastUpdateTs: Date.now(),
       slot: null,
     };
@@ -1115,7 +1287,7 @@ export class MarketStateProvider {
     if (mint.equals(SOL_MINT)) return 9;
     if (mint.equals(USDC_MINT)) return 6;
     try {
-      const info = await this.conn.getParsedAccountInfo(mint, "processed");
+      const info = await this.conn.getParsedAccountInfo(mint, "confirmed");
       const dec = (info.value as any)?.data?.parsed?.info?.decimals;
       if (typeof dec === "number") return dec;
     } catch { /* noop */ }
@@ -1270,7 +1442,15 @@ function resolveAmmsPath(): string {
     fs.mkdirSync(path.dirname(env), { recursive: true });
     return env;
   }
-  return path.resolve(process.cwd(), "data", "logs", "amms", "runtime.jsonl");
+  const runRoot = (process.env.RUN_ROOT ?? "").trim();
+  if (runRoot) {
+    const resolved = path.resolve(process.cwd(), runRoot, "amms-runtime.jsonl");
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    return resolved;
+  }
+  const fallback = path.resolve(process.cwd(), "data", "logs", "amms", "runtime.jsonl");
+  fs.mkdirSync(path.dirname(fallback), { recursive: true });
+  return fallback;
 }
 
 function resolvePhoenixPath(): string {
@@ -1279,7 +1459,15 @@ function resolvePhoenixPath(): string {
     fs.mkdirSync(path.dirname(env), { recursive: true });
     return env;
   }
-  return path.resolve(process.cwd(), "data", "logs", "phoenix", "runtime.jsonl");
+  const runRoot = (process.env.RUN_ROOT ?? "").trim();
+  if (runRoot) {
+    const resolved = path.resolve(process.cwd(), runRoot, "phoenix-runtime.jsonl");
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    return resolved;
+  }
+  const fallback = path.resolve(process.cwd(), "data", "logs", "phoenix", "runtime.jsonl");
+  fs.mkdirSync(path.dirname(fallback), { recursive: true });
+  return fallback;
 }
 
 function serializeAmmSnapshot(snap: AmmSnapshot) {
@@ -1301,8 +1489,14 @@ function serializeAmmSnapshot(snap: AmmSnapshot) {
     quote_vault: snap.quoteVault ?? undefined,
     source: "provider",
     validation_passed: snap.price != null,
-    base_int: snap.baseReserve != null ? String(snap.baseReserve) : undefined,
-    quote_int: snap.quoteReserve != null ? String(snap.quoteReserve) : undefined,
+    base_ui: snap.baseReserveUi ?? snap.baseReserve ?? undefined,
+    quote_ui: snap.quoteReserveUi ?? snap.quoteReserve ?? undefined,
+    base_int: snap.baseReserveAtoms ?? (snap.baseReserve != null
+      ? String(Math.trunc((snap.baseReserve ?? 0) * 10 ** snap.baseDecimals))
+      : undefined),
+    quote_int: snap.quoteReserveAtoms ?? (snap.quoteReserve != null
+      ? String(Math.trunc((snap.quoteReserve ?? 0) * 10 ** snap.quoteDecimals))
+      : undefined),
   };
 }
 

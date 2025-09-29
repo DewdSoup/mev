@@ -12,8 +12,14 @@ export interface AmmSnapshot {
   /** optional raw vault pubkeys for CPMM pools */
   baseVault?: string;
   quoteVault?: string;
+  /** UI reserves (converted using decimals) */
   baseReserve?: number | null;
   quoteReserve?: number | null;
+  baseReserveUi?: number | null;
+  quoteReserveUi?: number | null;
+  /** raw atom balances as strings to avoid precision loss */
+  baseReserveAtoms?: string | null;
+  quoteReserveAtoms?: string | null;
   lastUpdateTs: number;
   ageMs?: number;
   slot?: number | null;

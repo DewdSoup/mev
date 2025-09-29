@@ -50,12 +50,16 @@ type QuoteRes =
 // Production constants (caps/guards)
 const MAX_REALISTIC_PROFIT_BPS = Number(process.env.MAX_REALISTIC_PROFIT_BPS ?? 100);
 const MIN_PROFITABLE_BPS = Number(process.env.MIN_PROFITABLE_BPS ?? 5);
+const MIN_NET_PROFIT_BPS = Number(process.env.MIN_NET_PROFIT_BPS ?? MIN_PROFITABLE_BPS);
 const MAX_DAILY_TRADES = Number(process.env.MAX_DAILY_TRADES ?? 50);
 const MAX_DAILY_VOLUME_QUOTE = Number(process.env.MAX_DAILY_VOLUME_QUOTE ?? 10000);
 const PRICE_VALIDATION_WINDOW_BPS = Number(process.env.PRICE_VALIDATION_WINDOW_BPS ?? 200);
 
 // Clamp for Orca exact-in/out to ensure SDK never sees 0
 const MIN_ORCA_BASE_SIZE = Number(process.env.MIN_ORCA_BASE_SIZE ?? "0.000001");
+const CLMM_PREFER_ADAPTER = envTrue("CLMM_PREFER_ADAPTER", false);
+const RATE_LIMIT_BACKOFF_MS = Math.max(250, Number(process.env.RATE_LIMIT_BACKOFF_MS ?? 1500));
+const MIN_PRICE_DELTA_BPS = Math.max(0, Number(process.env.MIN_PRICE_DELTA_BPS ?? 1));
 
 // ────────────────────────────────────────────────────────────────────────────
 // Staleness guard (inline helper)
@@ -102,6 +106,16 @@ let lastResetDay = new Date().getUTCDate();
 
 function nnum(x: any): number | undefined {
   return typeof x === "number" && Number.isFinite(x) ? x : undefined;
+}
+function parseAtoms(str: string | undefined): bigint | null {
+  if (!str) return null;
+  const normalized = str.trim();
+  if (!normalized || normalized.includes(".")) return null;
+  try {
+    return BigInt(normalized);
+  } catch {
+    return null;
+  }
 }
 function round(n: any, p?: number): number {
   const num = typeof n === "bigint" ? Number(n) : typeof n === "string" ? Number(n) : Number(n);
@@ -243,6 +257,15 @@ export class EdgeJoiner {
 
   private lastWaitLog = 0;
   private lastSig?: string;
+  private lastEvalContext?: { bid: number; ask: number; amms: Record<string, number> };
+  private lastEvalSig?: string;
+  private lastEvalAt = 0;
+  private probeSizeBase: number | undefined = (() => {
+    const raw = Number(process.env.FIXED_PROBE_BASE ?? "0.05");
+    return Number.isFinite(raw) && raw > 0 ? raw : undefined;
+  })();
+  private rateLimitedUntil = 0;
+  private lastRateLimitLog = 0;
 
   // config gating
   private allowedPools = new Set<string>(); // `${venue}:${id}`
@@ -324,14 +347,42 @@ export class EdgeJoiner {
     const quoteDecimals = nnum(obj?.quoteDecimals);
     const baseIntStr = typeof obj?.base_int === "string" ? obj.base_int : undefined;
     const quoteIntStr = typeof obj?.quote_int === "string" ? obj.quote_int : undefined;
+    const baseUi = nnum(obj?.base_ui);
+    const quoteUi = nnum(obj?.quote_ui);
 
     let reserves: AmmSnap["reserves"] | undefined;
-    if (baseDecimals != null && quoteDecimals != null && baseIntStr && quoteIntStr) {
-      const base = Number(baseIntStr) / Math.pow(10, baseDecimals);
-      const quote = Number(quoteIntStr) / Math.pow(10, quoteDecimals);
-      if (base > 0 && quote > 0 && Number.isFinite(base) && Number.isFinite(quote)) {
-        reserves = { base, quote, baseDecimals, quoteDecimals };
+    if (baseDecimals != null && quoteDecimals != null) {
+      const baseAtoms = baseIntStr ? parseAtoms(baseIntStr) : null;
+      const quoteAtoms = quoteIntStr ? parseAtoms(quoteIntStr) : null;
+      if (baseAtoms != null && quoteAtoms != null) {
+        const base = Number(baseAtoms) / Math.pow(10, baseDecimals);
+        const quote = Number(quoteAtoms) / Math.pow(10, quoteDecimals);
+        if (base > 0 && quote > 0 && Number.isFinite(base) && Number.isFinite(quote)) {
+          reserves = { base, quote, baseDecimals, quoteDecimals };
+        }
+      } else {
+        const fallbackBase = baseIntStr != null ? Number(baseIntStr) : baseUi;
+        const fallbackQuote = quoteIntStr != null ? Number(quoteIntStr) : quoteUi;
+        if (fallbackBase != null && fallbackQuote != null && fallbackBase > 0 && fallbackQuote > 0 && Number.isFinite(fallbackBase) && Number.isFinite(fallbackQuote)) {
+          reserves = { base: fallbackBase, quote: fallbackQuote, baseDecimals, quoteDecimals };
+        }
       }
+    }
+
+    if (reserves && (!(reserves.base > 0) || !(reserves.quote > 0))) {
+      reserves = undefined;
+    }
+    if (reserves && (reserves.base * Math.pow(10, reserves.baseDecimals) < 1 || reserves.quote * Math.pow(10, reserves.quoteDecimals) < 1)) {
+      // Defensive: discard obviously mis-scaled reserves (e.g., UI values sent as atoms)
+      logger.log("amm_reserve_underflow", {
+        venue,
+        ammId,
+        base: reserves.base,
+        quote: reserves.quote,
+        base_decimals: reserves.baseDecimals,
+        quote_decimals: reserves.quoteDecimals,
+      });
+      reserves = undefined;
     }
 
     // Prefer per-pool fee from payload; env fallback if missing.
@@ -543,7 +594,42 @@ export class EdgeJoiner {
     }
   }
 
+  private isRateLimited(): boolean {
+    return Date.now() < this.rateLimitedUntil;
+  }
+
+  private bumpRateLimited(meta?: any) {
+    const waitMs = Math.max(RATE_LIMIT_BACKOFF_MS, Number(meta?.wait_ms ?? 0));
+    this.rateLimitedUntil = Math.max(this.rateLimitedUntil, Date.now() + waitMs);
+    const now = Date.now();
+    if (now - this.lastRateLimitLog >= this.P.waitLogMs) {
+      this.lastRateLimitLog = now;
+      logger.log("joiner_rate_limited", { wait_ms: waitMs, until: new Date(this.rateLimitedUntil).toISOString() });
+    }
+  }
+
   private buildSizeGrid(refPx: number, reserves?: { base: number }): number[] {
+    if (this.probeSizeBase != null) {
+      const mins = [this.probeSizeBase];
+      if (Number.isFinite(this.P.decisionMinBase)) mins.push(this.P.decisionMinBase!);
+      if (Number.isFinite(this.C.decisionMinBase)) mins.push(this.C.decisionMinBase!);
+      if (Number.isFinite(this.P.minBase)) mins.push(this.P.minBase!);
+      if (Number.isFinite(this.P.minTradeBase)) mins.push(this.P.minTradeBase!);
+      if (Number.isFinite(this.P.tradeSizeBase)) mins.push(this.P.tradeSizeBase!);
+      let candidate = Math.max(...mins.filter((v) => Number.isFinite(v) && v > 0)) || this.probeSizeBase;
+      if (reserves && reserves.base > 0) {
+        const maxFrac = Number.isFinite(this.C.cpmmMaxPoolTradeFrac)
+          ? Math.max(0, Math.min(1, this.C.cpmmMaxPoolTradeFrac))
+          : undefined;
+        if (maxFrac && maxFrac > 0) {
+          const cap = reserves.base * maxFrac;
+          candidate = Math.min(candidate, cap);
+        }
+      }
+      if (!(candidate > 0)) return [];
+      return [Number(candidate.toFixed(9))];
+    }
+
     const explicitGrid = String(process.env.DECISION_SIZE_GRID ?? "").trim();
     if (explicitGrid) {
       const xs = explicitGrid.split(",").map(s => Number(s.trim())).filter(x => Number.isFinite(x) && x > 0);
@@ -593,18 +679,45 @@ export class EdgeJoiner {
     buyPx: number,
     sellPx: number,
     expectedPnl: number,
-    fixedCost: number
+    fixedCost: number,
+    netBps: number,
+    notional: number
   ): { valid: boolean; reason?: string } {
-    if (buyPx <= 0 || sellPx <= 0 || sizeBase <= 0) return { valid: false, reason: "invalid_prices_or_size" };
-    if (expectedPnl <= 0) return { valid: false, reason: "negative_expected_pnl" };
-    const grossSpread = (sellPx / buyPx - 1) * 10000;
-    if (grossSpread < MIN_PROFITABLE_BPS) return { valid: false, reason: `gross_spread_too_low_${grossSpread.toFixed(2)}bps` };
+    if (!(buyPx > 0 && sellPx > 0 && sizeBase > 0)) {
+      return { valid: false, reason: "invalid_prices_or_size" };
+    }
+    if (!(notional > 0) || !Number.isFinite(notional)) {
+      return { valid: false, reason: "invalid_notional" };
+    }
+    if (!Number.isFinite(expectedPnl)) {
+      return { valid: false, reason: "invalid_expected_pnl" };
+    }
+    if (!Number.isFinite(netBps)) {
+      return { valid: false, reason: "invalid_edge_bps" };
+    }
+    if (expectedPnl <= 0) {
+      return { valid: false, reason: "negative_expected_pnl" };
+    }
+    if (netBps <= 0) {
+      return { valid: false, reason: "non_positive_net_edge" };
+    }
+    if (netBps < MIN_NET_PROFIT_BPS) {
+      return { valid: false, reason: `net_edge_below_min_${netBps.toFixed(2)}bps` };
+    }
+    const grossSpread = (sellPx / buyPx - 1) * 10_000;
+    if (grossSpread < MIN_PROFITABLE_BPS) {
+      return { valid: false, reason: `gross_edge_below_min_${grossSpread.toFixed(2)}bps` };
+    }
     const calculatedPnl = (sellPx - buyPx) * sizeBase - fixedCost;
     const pnlDiff = Math.abs(calculatedPnl - expectedPnl);
-    if (pnlDiff > 0.001) return { valid: false, reason: `pnl_calculation_mismatch_${pnlDiff.toFixed(6)}` };
-    const notional = sizeBase * buyPx;
-    const profitBps = (expectedPnl / notional) * 10000;
-    if (profitBps > MAX_REALISTIC_PROFIT_BPS) return { valid: false, reason: `unrealistic_profit_${profitBps.toFixed(2)}bps` };
+    const tolerance = Math.max(1e-6, Math.abs(expectedPnl) * 0.001);
+    if (pnlDiff > tolerance) {
+      return { valid: false, reason: `pnl_mismatch_${pnlDiff.toFixed(6)}` };
+    }
+    const profitBps = (expectedPnl / notional) * 10_000;
+    if (profitBps > MAX_REALISTIC_PROFIT_BPS) {
+      return { valid: false, reason: `unrealistic_profit_${profitBps.toFixed(2)}bps` };
+    }
     return { valid: true };
   }
 
@@ -615,14 +728,32 @@ export class EdgeJoiner {
     sizeBase: number,
     fallbackMid: number
   ): Promise<{ px?: number; feeBps: number; used: "adapter" | "local" | "fallback"; meta?: any }> {
+    const logQuote = (origin: string, price: number | undefined, extras?: Record<string, unknown>) => {
+      try {
+        logger.log(price != null && Number.isFinite(price) ? "quote_debug" : "quote_debug_null", {
+          venue: amm.venue,
+          pool: amm.ammId,
+          side,
+          origin,
+          size_base: sizeBase,
+          fallback_mid: fallbackMid,
+          price: price ?? null,
+          ...(extras ?? {}),
+        });
+      } catch { /* ignore logging failures */ }
+    };
     const adapter = getAdapter(amm.venue);
     const slip = this.P.flatSlippageBps;
 
     const poolKind = String(amm.poolKind ?? "").toLowerCase();
     const isClmm = poolKind === "clmm";
 
-    // Prefer adapter (config-driven; fee-aware)
-    if (adapter?.quote) {
+    let adapterQuoteCached: QuoteRes | undefined;
+    const hasAdapter = typeof adapter?.quote === "function";
+
+    const runAdapterQuote = async (): Promise<QuoteRes> => {
+      if (adapterQuoteCached) return adapterQuoteCached;
+      if (!hasAdapter) return { ok: false, err: "adapter_missing" } as QuoteRes;
       try {
         const req: QuoteReq = {
           poolId: amm.ammId,
@@ -632,14 +763,30 @@ export class EdgeJoiner {
           baseMint: this.baseMint,
           quoteMint: this.quoteMint,
         };
-        // NOTE: adapter.quote expects (ctx, req)
-        const q: QuoteRes = await adapter.quote(undefined as any, req as any);
-        if ((q as any)?.ok && typeof (q as any).price === "number" && Number.isFinite((q as any).price)) {
-          const feeBps = Number.isFinite((q as any).feeBps) ? Number((q as any).feeBps) : amm.feeBps;
-          return { px: (q as any).price, feeBps, used: "adapter", meta: (q as any).meta };
-        }
+        adapterQuoteCached = await adapter!.quote(undefined as any, req as any);
+        return adapterQuoteCached;
       } catch (e) {
         logger.log("adapter_quote_error", { venue: amm.venue, pool: amm.ammId, err: String((e as any)?.message ?? e) });
+        adapterQuoteCached = { ok: false, err: String((e as any)?.message ?? e) } as QuoteRes;
+        return adapterQuoteCached!;
+      }
+    };
+
+    if (this.isRateLimited()) {
+      return { px: undefined, feeBps: amm.feeBps, used: "fallback", meta: { rate_limited: true, wait_ms: this.rateLimitedUntil - Date.now() } };
+    }
+
+    if (hasAdapter && (!isClmm || CLMM_PREFER_ADAPTER)) {
+      const q = await runAdapterQuote();
+      if ((q as any)?.ok && typeof (q as any).price === "number" && Number.isFinite((q as any).price)) {
+        const feeBps = Number.isFinite((q as any).feeBps) ? Number((q as any).feeBps) : amm.feeBps;
+        const price = Number((q as any).price);
+        logQuote("adapter", price, {
+          fee_bps: feeBps,
+          slip_bps: slip,
+          origin_meta: (q as any).meta ?? null,
+        });
+        return { px: price, feeBps, used: "adapter", meta: (q as any).meta };
       }
     }
 
@@ -655,8 +802,21 @@ export class EdgeJoiner {
         baseMint: this.baseMint,
         quoteMint: this.quoteMint,
         feeBpsHint: amm.feeBps,
+        reserves: amm.reserves
+          ? {
+              base: amm.reserves.base,
+              quote: amm.reserves.quote,
+              baseDecimals: amm.reserves.baseDecimals,
+              quoteDecimals: amm.reserves.quoteDecimals,
+            }
+          : undefined,
       });
       if (clmm.ok && Number.isFinite(clmm.price) && clmm.price > 0) {
+        logQuote("clmm_quoter", clmm.price, {
+          fee_bps: Number.isFinite(clmm.feeBps) ? clmm.feeBps : amm.feeBps,
+          slip_bps: slip,
+          source_meta: clmm.meta ?? null,
+        });
         return {
           px: clmm.price,
           feeBps: Number.isFinite(clmm.feeBps) && clmm.feeBps > 0 ? clmm.feeBps : amm.feeBps,
@@ -664,6 +824,50 @@ export class EdgeJoiner {
           meta: { source: "clmm_quoter", ...(clmm.meta ?? {}) },
         };
       }
+      if (!clmm.ok && (clmm.err === "rate_limited" || clmm.err === "rate_limited_cooldown")) {
+        this.bumpRateLimited(clmm.meta);
+        return { px: undefined, feeBps: amm.feeBps, used: "fallback", meta: { rate_limited: true, source: clmm.meta?.source ?? "clmm" } };
+      }
+      if (hasAdapter && !CLMM_PREFER_ADAPTER) {
+        const q = await runAdapterQuote();
+        if ((q as any)?.ok && typeof (q as any).price === "number" && Number.isFinite((q as any).price)) {
+          const feeBps = Number.isFinite((q as any).feeBps) ? Number((q as any).feeBps) : amm.feeBps;
+          const price = Number((q as any).price);
+          logQuote("adapter_fallback", price, {
+            fee_bps: feeBps,
+            slip_bps: slip,
+            origin_meta: (q as any).meta ?? null,
+          });
+          return { px: price, feeBps, used: "adapter", meta: (q as any).meta };
+        }
+      }
+
+      const mid = nnum(amm.px);
+      const feeBpsMid = Number.isFinite(amm.feeBps) ? Number(amm.feeBps) : this.P.ammFeeBps;
+      if (mid != null && mid > 0 && Number.isFinite(mid) && Number.isFinite(feeBpsMid)) {
+        const refMid = fallbackMid > 0 && Number.isFinite(fallbackMid) ? fallbackMid : mid;
+        const deviationBps = refMid > 0 ? Math.abs(mid - refMid) / refMid * 10_000 : 0;
+        if (deviationBps <= Math.max(100, PRICE_VALIDATION_WINDOW_BPS)) {
+          const feeFrac = Math.max(0, feeBpsMid) / 10_000;
+          const slipFrac = Math.max(0, slip) / 10_000;
+          const factor = side === "buy"
+            ? 1 + feeFrac + slipFrac
+            : 1 - feeFrac - slipFrac;
+          if (factor > 0) {
+            const pxMid = mid * factor;
+            if (Number.isFinite(pxMid) && pxMid > 0) {
+              logQuote("clmm_mid", pxMid, { fee_bps: feeBpsMid, slip_bps: slip, deviation_bps: deviationBps });
+              return {
+                px: pxMid,
+                feeBps: feeBpsMid,
+                used: "local",
+                meta: { source: "clmm_mid", mid, refMid, feeBps: feeBpsMid, slipBps: slip, deviationBps },
+              };
+            }
+          }
+        }
+      }
+
       logger.log("clmm_quote_fallback", {
         venue: amm.venue,
         pool: amm.ammId,
@@ -678,10 +882,16 @@ export class EdgeJoiner {
         // Orca CLMM: use the local Whirlpool quoter helpers if adapter is absent
         if (side === "buy") {
           const q = await orcaAvgBuyQuotePerBase(amm.ammId, Math.max(sizeBase, MIN_ORCA_BASE_SIZE), slip);
-          if (q.ok) return { px: q.price, feeBps: amm.feeBps, used: "local" };
+          if (q.ok) {
+            logQuote("orca_avg_buy", q.price, { fee_bps: amm.feeBps, slip_bps: slip });
+            return { px: q.price, feeBps: amm.feeBps, used: "local" };
+          }
         } else {
           const q = await orcaAvgSellQuotePerBase(amm.ammId, Math.max(sizeBase, MIN_ORCA_BASE_SIZE), slip);
-          if (q.ok) return { px: q.price, feeBps: amm.feeBps, used: "local" };
+          if (q.ok) {
+            logQuote("orca_avg_sell", q.price, { fee_bps: amm.feeBps, slip_bps: slip });
+            return { px: q.price, feeBps: amm.feeBps, used: "local" };
+          }
         }
       } else if (!isClmm) {
         // Raydium CPMM: closed-form reserves math
@@ -689,10 +899,24 @@ export class EdgeJoiner {
         if (hasRes) {
           if (side === "buy") {
             const px = this.cpmmBuyQuotePerBase(amm.reserves!.base, amm.reserves!.quote, sizeBase, amm.feeBps);
-            if (px != null) return { px, feeBps: amm.feeBps, used: "local" };
+            if (px != null) {
+              logQuote("cpmm_buy", px, {
+                fee_bps: amm.feeBps,
+                reserves_base: amm.reserves!.base,
+                reserves_quote: amm.reserves!.quote,
+              });
+              return { px, feeBps: amm.feeBps, used: "local" };
+            }
           } else {
             const px = this.cpmmSellQuotePerBase(amm.reserves!.base, amm.reserves!.quote, sizeBase, amm.feeBps);
-            if (px != null) return { px, feeBps: amm.feeBps, used: "local" };
+            if (px != null) {
+              logQuote("cpmm_sell", px, {
+                fee_bps: amm.feeBps,
+                reserves_base: amm.reserves!.base,
+                reserves_quote: amm.reserves!.quote,
+              });
+              return { px, feeBps: amm.feeBps, used: "local" };
+            }
           }
         }
       }
@@ -702,6 +926,7 @@ export class EdgeJoiner {
     const px = side === "buy"
       ? this.midBuyQuotePerBase(fallbackMid, amm.feeBps, slip)
       : this.midSellQuotePerBase(fallbackMid, amm.feeBps, slip);
+    logQuote("fallback_mid", px, { fee_bps: amm.feeBps, slip_bps: slip });
     return { px, feeBps: amm.feeBps, used: "fallback" };
   }
 
@@ -799,6 +1024,50 @@ export class EdgeJoiner {
       return;
     }
 
+    const stateSigParts: string[] = [];
+    if (Number.isFinite(bid) && Number.isFinite(ask)) {
+      stateSigParts.push(`phx:${bid.toFixed(6)}:${ask.toFixed(6)}`);
+    }
+    for (const a of validAmms) {
+      const mid = Number.isFinite(a.px) ? (a.px as number).toFixed(6) : "nan";
+      stateSigParts.push(`${a.venue}:${a.ammId}:${mid}:${a.ts ?? 0}`);
+    }
+    const evalSig = stateSigParts.join("|");
+    const bucketMs = Math.max(50, this.C.decisionBucketMs ?? 0);
+    let deltaBps = Number.POSITIVE_INFINITY;
+    if (this.lastEvalContext) {
+      const prev = this.lastEvalContext;
+      deltaBps = 0;
+      if (prev.bid > 0 && bid > 0) deltaBps = Math.max(deltaBps, Math.abs(bid / prev.bid - 1) * 10_000);
+      if (prev.ask > 0 && ask > 0) deltaBps = Math.max(deltaBps, Math.abs(ask / prev.ask - 1) * 10_000);
+      for (const a of validAmms) {
+        const key = `${a.venue}:${a.ammId}`;
+        const prevMid = prev.amms[key];
+        if (prevMid > 0 && a.px > 0) {
+          deltaBps = Math.max(deltaBps, Math.abs((a.px as number) / prevMid - 1) * 10_000);
+        }
+      }
+    }
+    if (this.lastEvalSig === evalSig && now - this.lastEvalAt < bucketMs) {
+      if (deltaBps !== Number.POSITIVE_INFINITY && deltaBps < MIN_PRICE_DELTA_BPS) {
+        return;
+      }
+    }
+    if (this.isRateLimited()) {
+      if (now - this.lastRateLimitLog >= this.P.waitLogMs) {
+        this.lastRateLimitLog = now;
+        logger.log("joiner_rate_limited_skip", { wait_ms: this.rateLimitedUntil - now });
+      }
+      return;
+    }
+    this.lastEvalSig = evalSig;
+    this.lastEvalAt = now;
+    this.lastEvalContext = {
+      bid,
+      ask,
+      amms: Object.fromEntries(validAmms.map((a) => [`${a.venue}:${a.ammId}`, Number(a.px ?? 0)])),
+    };
+
     // Emit a single edge_report snapshot (Phoenix vs latest valid AMM mid)
     const latestAmm = validAmms.sort((a, b) => b.ts - a.ts)[0];
     const ammPx = latestAmm?.px ?? (bid + ask) / 2;
@@ -884,6 +1153,17 @@ export class EdgeJoiner {
           .filter(x => x > 0 && Number.isFinite(x))
           .sort((a, b) => a - b);
 
+        try {
+          logger.log("size_probe_grid", {
+            symbol: this.symbol,
+            path,
+            src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
+            dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
+            size_count: sizes.length,
+            sizes,
+          });
+        } catch { /* noop */ }
+
         for (const s0 of sizes) {
           const sEff =
             (nodeSrc.kind === "amm" && nodeSrc.amm.venue === "orca") ||
@@ -899,6 +1179,7 @@ export class EdgeJoiner {
 
           if (buyPx != null && sellPx != null) {
             const pnl = (sellPx - buyPx) * sEff - this.P.fixedTxCostQuote;
+            const notional = buyPx * sEff;
 
             // Use node “mid”s for gross spread calc (compat with prior logs)
             const srcMid = nodeSrc.kind === "amm" ? nodeSrc.amm.px : ask;  // buying at PHX uses ask ref
@@ -906,7 +1187,33 @@ export class EdgeJoiner {
             const bpsGross = ((dstMid / srcMid) - 1) * 10_000;
             const bpsNet = ((sellPx / buyPx) - 1) * 10_000;
 
-            const ok = this.validateOpportunity(path, sEff, buyPx, sellPx, pnl, this.P.fixedTxCostQuote);
+            const ok = this.validateOpportunity(path, sEff, buyPx, sellPx, pnl, this.P.fixedTxCostQuote, bpsNet, notional);
+
+            const candidatePayload = {
+              symbol: this.symbol,
+              path,
+              src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
+              dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
+              size_base: sEff,
+              buy_px: buyPx,
+              sell_px: sellPx,
+              buy_quote_source: qBuy.used,
+              sell_quote_source: qSell.used,
+              buy_fee_bps: qBuy.feeBps,
+              sell_fee_bps: qSell.feeBps,
+              buy_meta: qBuy.meta ?? null,
+              sell_meta: qSell.meta ?? null,
+              pnl,
+              fixed_cost: this.P.fixedTxCostQuote,
+              edge_bps_gross: bpsGross,
+              edge_bps_net: bpsNet,
+              notional_quote: notional,
+              valid: ok.valid,
+              validation_reason: ok.reason ?? null,
+            };
+
+            try { logger.log("candidate_evaluated", candidatePayload); } catch { /* ignore */ }
+
             if (ok.valid) {
               if (path !== "AMM->AMM" || execAmmAmm) {
                 const snapSrc = nodeSrc.kind === "amm" ? nodeSrc.amm : latestAmm;   // keep payload shape
@@ -936,7 +1243,13 @@ export class EdgeJoiner {
               logger.log("opportunity_rejected", {
                 path,
                 venue: nodeSrc.kind === "amm" ? nodeSrc.amm.venue : "phx",
-                size: sEff, buy_px: buyPx, sell_px: sellPx, pnl, reason: ok.reason
+                size: sEff, buy_px: buyPx, sell_px: sellPx, pnl, reason: ok.reason,
+                src_origin: qBuy.used,
+                dst_origin: qSell.used,
+                src_fee_bps: qBuy.feeBps,
+                dst_fee_bps: qSell.feeBps,
+                expected_pnl: pnl,
+                notional_quote: notional,
               });
             }
           }
@@ -953,7 +1266,7 @@ export class EdgeJoiner {
         grid_count: 0,
         validation_enabled: true,
       });
-      this.onDecision(false, -1e9, -1e9, undefined);
+      this.onDecision(false, Number.NaN, Number.NaN, undefined);
       return;
     }
 

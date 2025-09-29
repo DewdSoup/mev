@@ -13,10 +13,18 @@ const __dirname = path.dirname(__filename);
 const SRC = (() => {
   const hinted = process.env.LOG_FILE?.trim();
   if (hinted) return path.resolve(process.cwd(), hinted);
-  return path.resolve(__dirname, "../../data/arb/logs/arb-runtime.log");
+  const runRoot = process.env.RUN_ROOT?.trim();
+  if (runRoot && runRoot.length) return path.resolve(process.cwd(), path.join(runRoot, "arb-runtime.jsonl"));
+  return path.resolve(__dirname, "../../data/runtime/arb-runtime.jsonl");
 })();
 
-const OUT_DIR = path.resolve(__dirname, "../../data/arb/ml");
+const OUT_DIR = (() => {
+  const explicit = process.env.ML_TAP_OUT?.trim() || process.env.ARB_ML_DIR?.trim();
+  if (explicit && explicit.length) return path.isAbsolute(explicit) ? explicit : path.resolve(process.cwd(), explicit);
+  const runRoot = process.env.RUN_ROOT?.trim();
+  if (runRoot && runRoot.length) return path.resolve(process.cwd(), runRoot);
+  return path.resolve(__dirname, "../../data/runtime");
+})();
 
 function dayStr(ts: number) {
   const d = new Date(ts);

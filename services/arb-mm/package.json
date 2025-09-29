@@ -24,12 +24,12 @@
     "start": "node dist/src/main.js",
     "start:prod": "node dist/src/main.js",
     "//_logs": "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 Log path unification (no code changes) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
-    "logs:link": "bash -lc 'set -e; REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd); DATA_ROOT=\"$REPO_ROOT/data\"; mkdir -p \"$DATA_ROOT/arb/logs\" \"$DATA_ROOT/amms\" \"$DATA_ROOT/phoenix\"; rm -rf \"$REPO_ROOT/packages/phoenix/logs\" \"$REPO_ROOT/packages/amms/logs\" \"$REPO_ROOT/services/arb-mm/logs\"'",
-    "logs:clean": "bash -lc 'set -e; REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd); rm -rf \"$REPO_ROOT/data/arb\" \"$REPO_ROOT/data/amms\" \"$REPO_ROOT/data/phoenix\"'",
+    "logs:link": ":",
+    "logs:clean": ":",
     "//_hooks": "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 Keep symlinks correct before local runs \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
-    "predev": "pnpm run logs:link",
-    "prestart": "pnpm run logs:link",
-    "prestart:prod": "pnpm run logs:link",
+    "predev": ":",
+    "prestart": ":",
+    "prestart:prod": ":",
     "live:multi": "tsx src/multipair.ts"
   },
   "dependencies": {
