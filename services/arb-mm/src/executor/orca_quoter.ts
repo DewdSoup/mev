@@ -77,6 +77,11 @@ function loadCache(): Record<string, any> | undefined {
     return j;
 }
 
+function clampBps(bps: number): number {
+    if (!Number.isFinite(bps)) return 0;
+    return Math.max(0, bps);
+}
+
 export async function orcaAvgBuyQuotePerBase(
     ammId: string,
     sizeBase: number,
@@ -90,22 +95,26 @@ export async function orcaAvgBuyQuotePerBase(
 
     const feeBps = Number.isFinite(Number(entry.feeBps))
         ? Number(entry.feeBps)
-        : Number(
-            process.env.ORCA_TRADE_FEE_BPS ??
-            process.env.AMM_TAKER_FEE_BPS ??
-            30
-        );
+        : Number(process.env.ORCA_TRADE_FEE_BPS ?? process.env.AMM_TAKER_FEE_BPS ?? 30);
 
-    const extra =
-        Math.max(0, Number(process.env.ORCA_QUOTER_EXTRA_BPS ?? 2)) / 10_000;
+    const extraBps = clampBps(Number(process.env.ORCA_QUOTER_EXTRA_BPS ?? 2));
+    const slipBps = clampBps(flatSlippageBps);
 
     // Prefer CPMM approx when reserves exist (still conservative)
+    if (Number.isFinite(entry.base) && Number.isFinite(entry.quote) && entry.base > 0 && entry.quote > 0) {
+        const cp = cpmmBuyQuotePerBase(Number(entry.base), Number(entry.quote), sizeBase, feeBps);
+        if (cp && Number.isFinite(cp) && cp > 0) {
+            const price = cp * (1 + extraBps / 10_000) * (1 + slipBps / 10_000);
+            return { ok: true, price };
+        }
+    }
+
+    // Fallback to px-only fudge
     const px = Number(entry.px ?? entry.px_str);
-    if (!Number.isFinite(px) || px <= 0)
-        return { ok: false, reason: "bad_cache" };
+    if (!Number.isFinite(px) || px <= 0) return { ok: false, reason: "bad_cache" };
 
     const fee = Math.max(0, feeBps) / 10_000;
-    const price = px * (1 + fee) * (1 + extra);
+    const price = px * (1 + fee) * (1 + extraBps / 10_000) * (1 + slipBps / 10_000);
     return Number.isFinite(price) && price > 0
         ? { ok: true, price }
         : { ok: false, reason: "px_only_bad" };
@@ -124,22 +133,26 @@ export async function orcaAvgSellQuotePerBase(
 
     const feeBps = Number.isFinite(Number(entry.feeBps))
         ? Number(entry.feeBps)
-        : Number(
-            process.env.ORCA_TRADE_FEE_BPS ??
-            process.env.AMM_TAKER_FEE_BPS ??
-            30
-        );
+        : Number(process.env.ORCA_TRADE_FEE_BPS ?? process.env.AMM_TAKER_FEE_BPS ?? 30);
 
-    const extra =
-        Math.max(0, Number(process.env.ORCA_QUOTER_EXTRA_BPS ?? 2)) / 10_000;
+    const extraBps = clampBps(Number(process.env.ORCA_QUOTER_EXTRA_BPS ?? 2));
+    const slipBps = clampBps(flatSlippageBps);
 
     // Prefer CPMM approx when reserves exist
+    if (Number.isFinite(entry.base) && Number.isFinite(entry.quote) && entry.base > 0 && entry.quote > 0) {
+        const cp = cpmmSellQuotePerBase(Number(entry.base), Number(entry.quote), sizeBase, feeBps);
+        if (cp && Number.isFinite(cp) && cp > 0) {
+            const price = cp * (1 - extraBps / 10_000) * Math.max(0, 1 - slipBps / 10_000);
+            return { ok: true, price };
+        }
+    }
+
+    // Fallback to px-only
     const px = Number(entry.px ?? entry.px_str);
-    if (!Number.isFinite(px) || px <= 0)
-        return { ok: false, reason: "bad_cache" };
+    if (!Number.isFinite(px) || px <= 0) return { ok: false, reason: "bad_cache" };
 
     const fee = Math.max(0, feeBps) / 10_000;
-    const price = px * (1 - fee) * (1 - extra);
+    const price = px * (1 - fee) * (1 - extraBps / 10_000) * Math.max(0, 1 - slipBps / 10_000);
     return Number.isFinite(price) && price > 0
         ? { ok: true, price }
         : { ok: false, reason: "px_only_bad" };

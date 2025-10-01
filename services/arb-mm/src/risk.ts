@@ -22,7 +22,7 @@ const GUARD_ERR_MAX = Number(process.env.GUARD_ERROR_BURST_MAX ?? 0);
 const GUARD_ERR_SECS = Number(process.env.GUARD_ERROR_BURST_SECS ?? 30);
 const GUARD_MIN_TPS = Number(process.env.GUARD_MIN_CHAIN_TPS ?? 0);
 const GUARD_DISABLE = String(process.env.GUARD_DISABLE ?? "0").toLowerCase() === "1";
-const ERR_LATCH     = String(process.env.GUARD_ERR_LATCH ?? "0").toLowerCase() === "1";
+const ERR_LATCH = String(process.env.GUARD_ERR_LATCH ?? "0").toLowerCase() === "1";
 
 // Optional: allow starting latched via env (default false)
 const KILL_SWITCH_START =

@@ -1,12 +1,12 @@
 // services/arb-mm/src/adapters/manifest.ts
 // Config-driven adapter manifest. Add new venues here, not in the router.
 
-import type { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
+import type { PublicKey, TransactionInstruction } from "@solana/web3.js";
 import { PublicKey as PK } from "@solana/web3.js";
 import { buildRaydiumCpmmSwapIx } from "../executor/buildRaydiumCpmmIx.js";
 import { buildOrcaWhirlpoolSwapIx } from "../executor/buildOrcaWhirlpoolIx.js";
 import { orcaAvgBuyQuotePerBase, orcaAvgSellQuotePerBase } from "../executor/orca_quoter.js";
-import type { AmmAdapter, QuoteReq, QuoteResp } from "./types.js";
+import type { AmmAdapter, QuoteResp } from "./types.js";
 
 const WSOL = (process.env.WSOL_MINT ?? "So11111111111111111111111111111111111111112").trim();
 const USDC = (process.env.USDC_MINT ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").trim();
@@ -32,7 +32,6 @@ const OrcaAdapter: AmmAdapter = {
                 : await orcaAvgSellQuotePerBase(req.poolId, size, slip);
 
             if (q.ok) {
-                // The Orca quoter returns only { ok, price } in your tree; fill the rest from env when helpful.
                 return {
                     ok: true,
                     price: q.price, // avg QUOTE per BASE
@@ -71,7 +70,6 @@ const OrcaAdapter: AmmAdapter = {
             slippageBps: Number(process.env.MAX_SLIPPAGE_BPS ?? 50),
         });
 
-        // Avoid unsafe property access on the union; throw a clean Error on failure.
         if (!(built && (built as any).ok === true && Array.isArray((built as any).ixs) && (built as any).ixs.length)) {
             const reason = (built as any)?.reason ?? "orca_whirlpool_ix_builder_failed";
             throw new Error(String(reason));
@@ -83,7 +81,7 @@ const OrcaAdapter: AmmAdapter = {
 // ────────────────────────────────────────────────────────────────────────────
 // Raydium CPMM — quote is not chain-sourced here (router can supply reserves).
 // We expose only the builder for now; router’s CPMM math handles EV.
-const RaydiumAdapter: AmmAdapter = {
+const RaydiumAdapter = {
     kind: "raydium",
 
     async quote(_conn, _req): Promise<QuoteResp> {
@@ -129,7 +127,7 @@ const RaydiumAdapter: AmmAdapter = {
         }
         return ixs;
     },
-};
+} satisfies AmmAdapter;
 
 // ────────────────────────────────────────────────────────────────────────────
 const MANIFEST: Record<string, AmmAdapter> = {

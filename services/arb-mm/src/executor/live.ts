@@ -26,6 +26,7 @@ import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from "@solana/spl-tok
 import { withRpcBackoff } from "../util/rpc_backoff.js";
 import { rpcSimFn as rpcSimTx } from "../tx/rpcSim.js";            // <- NEW
 import { canActuallySendNow } from "../tx/sendGate.js";           // <- NEW
+import { getRpcP95Ms } from "../runtime/metrics.js";              // <- NEW
 
 const __filename = fileURLToPath(import.meta.url);
 const __here = path.dirname(__filename);
@@ -45,10 +46,63 @@ const DEFAULT_ORCA_POOL_ID = (
 ).trim();
 
 const CONFIRM_LEVEL = (process.env.TX_CONFIRM_LEVEL as any) || "confirmed";
+
+/** ──────────────────────────────────────────────────────────────────────
+ *  Fee / cost constants (Step 2)
+ *  ────────────────────────────────────────────────────────────────────── */
 const CU_LIMIT = Number.isFinite(Number(process.env.SUBMIT_CU_LIMIT)) ? Number(process.env.SUBMIT_CU_LIMIT) : 400_000;
-const CU_PRICE = Number.isFinite(Number(process.env.TIP_MICROLAMPORTS_PER_CU)) ? Number(process.env.TIP_MICROLAMPORTS_PER_CU) : 0;
-const FIXED_TX_COST_QUOTE = Number(process.env.FIXED_TX_COST_QUOTE ?? "0") || 0;
+
+// Signature fee (lamports); Solana default is 5_000 lamports.
+const SIGNATURE_FEE_LAMPORTS = Number.isFinite(Number(process.env.SIGNATURE_FEE_LAMPORTS))
+  ? Number(process.env.SIGNATURE_FEE_LAMPORTS)
+  : 5_000;
+
+// Max μLamports/CU clamp (keeps us from overbidding by mistake)
+const TIP_MAX_MICROLAMPORTS_PER_CU = Number.isFinite(Number(process.env.TIP_MAX_MICROLAMPORTS_PER_CU))
+  ? Number(process.env.TIP_MAX_MICROLAMPORTS_PER_CU)
+  : 100_000;
+
+// Baseline μLamports/CU (used when latency is low)
+const TIP_BASE_MICROLAMPORTS_PER_CU = Number.isFinite(Number(process.env.TIP_MICROLAMPORTS_PER_CU))
+  ? Number(process.env.TIP_MICROLAMPORTS_PER_CU)
+  : 5_000;
+
+// Backward-compat fallback for environments that still want a fixed EV cost
+const FIXED_TX_COST_QUOTE_FALLBACK = Number(process.env.FIXED_TX_COST_QUOTE ?? "0") || 0;
+
+// Pre-sim units guess (only used to gate obviously unprofitable sends before sim)
+const EST_UNITS_BEFORE_SIM = Number.isFinite(Number(process.env.EST_UNITS_BEFORE_SIM))
+  ? Number(process.env.EST_UNITS_BEFORE_SIM)
+  : Math.floor(CU_LIMIT * 0.7);
+
+// Toggle: use dynamic fixed cost instead of FIXED_TX_COST_QUOTE_FALLBACK
+const USE_DYNAMIC_TX_COST = String(process.env.EXEC_USE_DYNAMIC_TX_COST ?? "1").trim() !== "0";
+
+// Extra guardrail for EV gate
 const PNL_SAFETY_BPS = Number(process.env.PNL_SAFETY_BPS ?? "0") || 0;
+
+/** ──────────────────────────────────────────────────────────────────────
+ *  Helpers (Step 3)
+ *  ────────────────────────────────────────────────────────────────────── */
+function computeAdaptiveCuPrice(): number {
+  const base = TIP_BASE_MICROLAMPORTS_PER_CU;
+  const p95 = getRpcP95Ms(); // smoothed in main.ts
+  const bump =
+    p95 > 1200 ? 6 :
+      p95 > 800 ? 4 :
+        p95 > 500 ? 2 :
+          1;
+  return Math.min(base * bump, TIP_MAX_MICROLAMPORTS_PER_CU);
+}
+
+function estimateFixedCostQuote(units: number, usedCuPriceMicro: number, refPxQuotePerBase: number): number {
+  // lamports for priority fee + base signature
+  const lamportsPriority = Math.ceil((units * usedCuPriceMicro) / 1_000_000);
+  const lamportsTotal = lamportsPriority + SIGNATURE_FEE_LAMPORTS;
+  const sol = lamportsTotal / 1_000_000_000; // 1e9 lamports per SOL
+  // Convert SOL cost to quote using the current (~mid) SOL/USDC
+  return sol * Math.max(0, refPxQuotePerBase || 0);
+}
 
 function envTrue(k: string): boolean {
   const v = String(process.env[k] ?? "").trim().toLowerCase();
@@ -307,6 +361,7 @@ export class LiveExecutor {
       )
         .trim()
         .toLowerCase();
+
       let sizeBase = Number(payload?.size_base ?? payload?.trade_size_base ?? 0);
       const phoenix = payload?.phoenix || {};
       const buy_px = Number(payload?.buy_px ?? 0);
@@ -319,31 +374,59 @@ export class LiveExecutor {
         sizeBase = MAX_FORCE_BASE;
       }
 
-      // Pre-send EV sanity (skip if forced)
-      const evQuote = (sell_px - buy_px) * sizeBase - FIXED_TX_COST_QUOTE;
+      // ── Adaptive price (Step 4) ────────────────────────────────────────
+      const usedCuPrice = computeAdaptiveCuPrice();
+
+      // ── Pre-send EV sanity (Step 5) ────────────────────────────────────
+      const avgPx =
+        (buy_px > 0 && sell_px > 0)
+          ? (buy_px + sell_px) / 2
+          : Number(process.env.DEFAULT_SOL_USD ?? 150);
+
+      const fixedCostPre = USE_DYNAMIC_TX_COST
+        ? estimateFixedCostQuote(EST_UNITS_BEFORE_SIM, usedCuPrice, avgPx)
+        : FIXED_TX_COST_QUOTE_FALLBACK;
+
+      const evQuotePre = (sell_px - buy_px) * sizeBase - fixedCostPre;
       const evBpsBase = (buy_px > 0 && sell_px > 0) ? ((sell_px / buy_px) - 1) * 10_000 : Number.NaN;
       const evBps = Number.isFinite(evBpsBase) ? evBpsBase : Number.NaN;
+
       if (!FORCE) {
-        if (!(evQuote > 0)) {
-          logger.log("submit_error", { where: "pre_send_ev_gate", error: "negative_expected_pnl_quote", sizeBase, buy_px, sell_px, ev_quote: evQuote });
+        if (!(evQuotePre > 0)) {
+          logger.log("submit_error", {
+            where: "pre_send_ev_gate",
+            error: "negative_expected_pnl_quote",
+            sizeBase,
+            buy_px,
+            sell_px,
+            ev_quote: evQuotePre,
+            fixed_cost_pre: fixedCostPre
+          });
           return;
         }
         const wantBps = (Number(process.env.TRADE_THRESHOLD_BPS ?? 0) || 0) + PNL_SAFETY_BPS;
         if (!Number.isFinite(evBps) || evBps < wantBps) {
-          logger.log("submit_error", { where: "pre_send_ev_gate", error: "insufficient_edge_bps", size_base: sizeBase, ev_bps: evBps, want_bps: wantBps });
+          logger.log("submit_error", {
+            where: "pre_send_ev_gate",
+            error: "insufficient_edge_bps",
+            size_base: sizeBase,
+            ev_bps: evBps,
+            want_bps: wantBps
+          });
           return;
         }
       } else {
-        const forceLog: Record<string, unknown> = {
+        logger.log("force_exec_enabled", {
           path: atomicPath,
           amm_src: ammVenue,
           size_base: sizeBase,
-          ev_quote: evQuote,
+          ev_quote_pre: evQuotePre,
           ev_bps: evBps,
-        };
-        if (isAmmAmm) forceLog.amm_dst = ammDstVenue;
-        logger.log("force_exec_enabled", forceLog);
+          fixed_cost_pre: fixedCostPre,
+          ...(isAmmAmm ? { amm_dst: ammDstVenue } : {})
+        });
       }
+
       if (!isAmmAmm && !phoenix?.market) {
         logger.log("submit_error", { where: "maybe_execute", error: "missing_phoenix_market" });
         return;
@@ -465,7 +548,7 @@ export class LiveExecutor {
         throw new Error(`unsupported_amm_venue_${venue}`);
       };
 
-      // ── Build legs ─────────────────────────────────────────────────────────
+      // ── Build legs ─────────────────────────────────────────────────────
       let phxIxs: TransactionInstruction[] = [];
       let ammSrcIxs: TransactionInstruction[] = [];
       let ammDstIxs: TransactionInstruction[] = [];
@@ -544,7 +627,7 @@ export class LiveExecutor {
         pushLuts(leg.lookupTables);
       }
 
-      // --------- PRE-TX BALANCES ----------
+      // ── PRE-TX BALANCES & LOG (Step 7a) ────────────────────────────────
       const pre = await getUiBalances(this.conn, this.payer.publicKey);
       logger.log("pre_tx_balances", {
         path: atomicPath,
@@ -553,14 +636,16 @@ export class LiveExecutor {
         size_base: sizeBase,
         buy_px,
         sell_px,
-        FIXED_TX_COST_QUOTE,
         PNL_SAFETY_BPS,
         forced: FORCE || undefined,
+        FIXED_TX_COST_QUOTE: USE_DYNAMIC_TX_COST ? undefined : FIXED_TX_COST_QUOTE_FALLBACK,
+        fixed_tx_cost_quote_est: fixedCostPre,
         ...pre,
       });
 
-      // --------- BUILD ATOMIC (for simulation) ----------
-      const preIxs = buildPreIxs(CU_LIMIT, CU_PRICE);
+      // ── BUILD ATOMIC (for simulation) (Step 4) ─────────────────────────
+      const preIxs = buildPreIxs(CU_LIMIT, usedCuPrice);
+
       const instructions = isAmmAmm
         ? [...preIxs, ...ammSrcIxs, ...ammDstIxs]
         : [...preIxs, ...phxIxs, ...ammSrcIxs];
@@ -583,8 +668,31 @@ export class LiveExecutor {
       const tx = new VersionedTransaction(msg);
       tx.sign([this.payer]);
 
-      // --------- RPC SIM ----------
+      // ── RPC SIM (Step 6) ───────────────────────────────────────────────
       const sim = await rpcSimTx(this.conn, tx, { sigVerify: true, commitment: "processed" });
+
+      // Compute final fixed cost using simulated units (fallback to pre-estimate)
+      const unitsUsed = Number.isFinite(Number(sim.unitsConsumed)) ? Number(sim.unitsConsumed) : EST_UNITS_BEFORE_SIM;
+      const fixedCostFinal = USE_DYNAMIC_TX_COST
+        ? estimateFixedCostQuote(unitsUsed, usedCuPrice, avgPx)
+        : FIXED_TX_COST_QUOTE_FALLBACK;
+
+      // Gate again if the dynamic cost made this unprofitable
+      const evQuoteFinal = (sell_px - buy_px) * sizeBase - fixedCostFinal;
+      if (!FORCE && !(evQuoteFinal > 0)) {
+        logger.log("submit_error", {
+          where: "rpc_sim_ev_gate",
+          error: "negative_expected_pnl_after_sim",
+          sizeBase,
+          buy_px,
+          sell_px,
+          ev_quote: evQuoteFinal,
+          fixed_cost_final: fixedCostFinal,
+          units_used: unitsUsed
+        });
+        return;
+      }
+
       logger.log("rpc_sim", {
         ok: sim.ok,
         units: sim.unitsConsumed,
@@ -603,7 +711,7 @@ export class LiveExecutor {
         return;
       }
 
-      // --------- SUBMIT ----------
+      // ── SUBMIT ─────────────────────────────────────────────────────────
       const only = isAmmAmm
         ? "both"
         : process.env.ONLY_PHX
@@ -642,13 +750,13 @@ export class LiveExecutor {
         shadow: false,
       });
 
-      // --------- CONFIRM ----------
+      // ── CONFIRM ────────────────────────────────────────────────────────
       const t0 = Date.now();
       const conf = await this.conn.confirmTransaction(sig, CONFIRM_LEVEL as any);
       const conf_ms = Date.now() - t0;
       const slot = (conf as any)?.context?.slot ?? null;
 
-      // --------- POST-TX BALANCES + REALIZED ----------
+      // ── POST-TX BALANCES + REALIZED (Step 7b) ─────────────────────────
       const post = await getUiBalances(this.conn, this.payer.publicKey);
       const realized = {
         realized_usdc_delta: Number((post.usdcUi - pre.usdcUi).toFixed(6)),
@@ -664,7 +772,7 @@ export class LiveExecutor {
         amm_dst: isAmmAmm ? ammDstVenue : undefined,
         size_base: sizeBase,
         buy_px, sell_px,
-        expected_ev_quote: Number(((sell_px - buy_px) * sizeBase - FIXED_TX_COST_QUOTE).toFixed(6)),
+        expected_ev_quote: Number(((sell_px - buy_px) * sizeBase - fixedCostFinal).toFixed(6)),
         ...realized
       });
 

@@ -49,6 +49,8 @@ import { prewarmPhoenix } from "./util/phoenix.js"; // warm Phoenix cache on boo
 import { MarketStateProvider } from "./market/index.js";
 import { loadPairsFromEnvOrDefault } from "./registry/pairs.js";
 import { rpcClient, rpc } from "@mev/rpc-facade";
+import { setRpcLatencies } from "./runtime/metrics.js";
+import { startWsMarkets } from "./provider/ws_markets.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -718,6 +720,8 @@ async function main() {
       if (LOG_ML) { try { emitRpcSample(ms, Boolean(s?.blocked)); } catch { } }
     }
     if (s?.blocked) rpcBlocked++;
+    // NEW: export smoothed latencies to the fee logic
+    setRpcLatencies(rpcMsP50, rpcMsP95);
   };
 
   // ──────────────────────────────────────────────────────────────────────
@@ -761,8 +765,31 @@ async function main() {
     onRpcSample
   );
 
+  // ──────────────────────────────────────────────────────────────────────
+  // WS Markets (live feed) → push AMM/Phoenix updates directly into joiner
+  // ──────────────────────────────────────────────────────────────────────
+  // ──────────────────────────────────────────────────────────────────────
+  // WS Markets (live feed) → push AMM/Phoenix updates directly into joiner
+  // ──────────────────────────────────────────────────────────────────────
+
+  // Enable WS feed if PAIRS_JSON is present
+  const useWsProvider = !!process.env.PAIRS_JSON;
+
+  if (useWsProvider) {
+    console.log("edge_input_source { source: 'ws_markets' }");
+    const { startWsMarkets } = await import("./provider/ws_markets.js");
+    await startWsMarkets({
+      httpUrl: process.env.RPC_URL,
+      wsUrl: process.env.RPC_WSS_URL || process.env.WSS_URL || process.env.WS_URL,
+      pairsPath: process.env.PAIRS_JSON,
+      joiner,
+    });
+  }
+
+
   // If provider is enabled, feed the joiner directly from in-memory snapshots
-  if (providerEnabled && marketProvider) {
+  // (disabled when WS provider is active to avoid double-feeding)
+  if (providerEnabled && marketProvider && !useWsProvider) {
     console.log("edge_input_source { source: 'provider' }");
     marketProvider.subscribe((state) => {
       try {
@@ -781,12 +808,16 @@ async function main() {
             feeBps: s.feeBps ?? undefined,
             base_vault: s.baseVault ?? undefined,
             quote_vault: s.quoteVault ?? undefined,
-            base_int: s.baseReserveAtoms ?? (s.baseReserve != null && s.baseDecimals != null
-              ? Math.trunc(s.baseReserve * 10 ** s.baseDecimals).toString()
-              : undefined),
-            quote_int: s.quoteReserveAtoms ?? (s.quoteReserve != null && s.quoteDecimals != null
-              ? Math.trunc(s.quoteReserve * 10 ** s.quoteDecimals).toString()
-              : undefined),
+            base_int:
+              s.baseReserveAtoms ??
+              (s.baseReserve != null && s.baseDecimals != null
+                ? Math.trunc(s.baseReserve * 10 ** s.baseDecimals).toString()
+                : undefined),
+            quote_int:
+              s.quoteReserveAtoms ??
+              (s.quoteReserve != null && s.quoteDecimals != null
+                ? Math.trunc(s.quoteReserve * 10 ** s.quoteDecimals).toString()
+                : undefined),
             base_ui: s.baseReserve ?? undefined,
             quote_ui: s.quoteReserve ?? undefined,
             slot: s.slot ?? undefined,
@@ -833,7 +864,8 @@ async function main() {
     });
   }
 
-  // Feed joiner from JSONL publishers and maintain local state (when provider is not enabled)
+  // Feed joiner from JSONL publishers and maintain local state
+  // (disabled when WS provider is active to avoid double-feeding)
   const POLL_MS = Number(process.env.EDGE_FOLLOW_POLL_MS ?? 500) || 500;
 
   const ammsFollower = new JsonlFollower(
@@ -896,15 +928,15 @@ async function main() {
     POLL_MS
   );
 
-  if (!providerEnabled) {
+  if (!providerEnabled && !useWsProvider) {
     await Promise.all([ammsFollower.start(), phxFollower.start()]);
   } else {
-    console.log("edge_input_source { source: 'provider' }");
+    console.log(`edge_input_source { source: '${providerEnabled ? "provider" : "ws_markets"}' }`);
   }
 
   // NO AUTO-STOP → run indefinitely until SIGINT/SIGTERM
 
-  // Graceful shutdown
+  // Graceful shutdown (unchanged)
   function shutdown(signal: string) {
     (async () => {
       try { ammsFollower.stop(); } catch { }

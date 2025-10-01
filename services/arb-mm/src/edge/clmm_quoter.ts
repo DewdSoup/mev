@@ -586,8 +586,9 @@ export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
       pool: args.poolId,
       side: args.side,
       size_base: args.sizeBase,
-      err: String(err?.message ?? err),
-    });
+      err: String(err?.message ?? err)
+    },
+    );
     return { ok: false, err: String(err?.message ?? err) };
   }
 }

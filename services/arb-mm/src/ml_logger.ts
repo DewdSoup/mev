@@ -43,14 +43,14 @@ function getBool(k: string, d = false) {
 function ensureDir(p: string) {
   try {
     fs.mkdirSync(p, { recursive: true });
-  } catch {}
+  } catch { }
 }
 function appendJsonl(obj: any) {
   if (!SESSION_LOGS_ENABLE) return;
   ensureDir(path.dirname(SESSION_FILE));
   try {
     fs.appendFileSync(SESSION_FILE, JSON.stringify(obj) + "\n");
-  } catch {}
+  } catch { }
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -143,8 +143,8 @@ export const logger = {
     // 2) ML-friendly line (include session_id)
     const now = Date.now();
     const rec = payload === undefined ? { ts: now, event, session_id: SESSION_ID }
-                                      : { ts: now, event, session_id: SESSION_ID, ...payload };
-    try { writeMlEvent(rec); } catch {}
+      : { ts: now, event, session_id: SESSION_ID, ...payload };
+    try { writeMlEvent(rec); } catch { }
 
     // 3) Per-session JSONL aggregator (human tail-able)
     appendJsonl(rec);
@@ -174,7 +174,7 @@ function writeSessionEnd() {
     stats: { ...stats },
     counts_by_path: { ...pathCounts },
   };
-  try { appendJsonl(out); } catch {}
+  try { appendJsonl(out); } catch { }
 }
 
 process.once("SIGINT", () => writeSessionEnd());

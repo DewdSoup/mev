@@ -53,7 +53,11 @@ const MIN_PROFITABLE_BPS = Number(process.env.MIN_PROFITABLE_BPS ?? 5);
 const MIN_NET_PROFIT_BPS = Number(process.env.MIN_NET_PROFIT_BPS ?? MIN_PROFITABLE_BPS);
 const MAX_DAILY_TRADES = Number(process.env.MAX_DAILY_TRADES ?? 50);
 const MAX_DAILY_VOLUME_QUOTE = Number(process.env.MAX_DAILY_VOLUME_QUOTE ?? 10000);
-const PRICE_VALIDATION_WINDOW_BPS = Number(process.env.PRICE_VALIDATION_WINDOW_BPS ?? 200);
+const PRICE_VALIDATION_WINDOW_BPS = Number(
+  process.env.PRICE_VALIDATION_WINDOW_BPS ??
+  process.env.PRICE_VALIDATION_MAX_SPREAD_BPS ??
+  200
+);
 
 // Clamp for Orca exact-in/out to ensure SDK never sees 0
 const MIN_ORCA_BASE_SIZE = Number(process.env.MIN_ORCA_BASE_SIZE ?? "0.000001");
@@ -219,7 +223,8 @@ export type RpcSimFn = (input: {
 // ────────────────────────────────────────────────────────────────────────────
 // Pairs config (broaden venues by config, not code)
 
-type VenueCfg = { kind: string; id: string; poolKind?: string };
+// ── types used by readPairsConfig() ─────────────────────────────────────────
+type VenueCfg = { kind: string; id: string; poolKind?: string; enabled?: boolean };
 type PairCfg = {
   symbol: string;
   baseMint: string;
@@ -227,6 +232,7 @@ type PairCfg = {
   phoenixMarket?: string;
   venues: VenueCfg[];
 };
+
 
 function readPairsConfig(): { pairs: PairCfg[] } | null {
   try {
@@ -261,8 +267,10 @@ export class EdgeJoiner {
   private lastEvalSig?: string;
   private lastEvalAt = 0;
   private probeSizeBase: number | undefined = (() => {
-    const raw = Number(process.env.FIXED_PROBE_BASE ?? "0.05");
-    return Number.isFinite(raw) && raw > 0 ? raw : undefined;
+    const raw = process.env.FIXED_PROBE_BASE;
+    if (raw == null || raw === "") return undefined; // no default → enable size grid
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
   })();
   private rateLimitedUntil = 0;
   private lastRateLimitLog = 0;
@@ -295,10 +303,12 @@ export class EdgeJoiner {
         this.phoenixMarket = first.phoenixMarket;
         for (const pair of cfg.pairs) {
           for (const v of pair.venues || []) {
+            if (v && v.enabled === false) continue;  // ← respect disabled pools
             const key = `${String(v.kind).toLowerCase()}:${v.id}`;
             this.allowedPools.add(key);
           }
         }
+
         logger.log("joiner_pairs_loaded", {
           symbol: this.symbol,
           pool_count: this.allowedPools.size,
@@ -804,11 +814,11 @@ export class EdgeJoiner {
         feeBpsHint: amm.feeBps,
         reserves: amm.reserves
           ? {
-              base: amm.reserves.base,
-              quote: amm.reserves.quote,
-              baseDecimals: amm.reserves.baseDecimals,
-              quoteDecimals: amm.reserves.quoteDecimals,
-            }
+            base: amm.reserves.base,
+            quote: amm.reserves.quote,
+            baseDecimals: amm.reserves.baseDecimals,
+            quoteDecimals: amm.reserves.quoteDecimals,
+          }
           : undefined,
       });
       if (clmm.ok && Number.isFinite(clmm.price) && clmm.price > 0) {
@@ -1397,12 +1407,12 @@ export class EdgeJoiner {
       amm_meta: { poolKind: best.amm.poolKind, feeBps: best.amm.feeBps },
       ...(best.path === "AMM->AMM"
         ? {
-            amm_dst_venue: best.ammDst?.venue,
-            amm_dst_pool_id: best.ammDst?.ammId,
-            amm_dst_meta: best.ammDst
-              ? { poolKind: best.ammDst.poolKind, feeBps: best.ammDst.feeBps }
-              : undefined,
-          }
+          amm_dst_venue: best.ammDst?.venue,
+          amm_dst_pool_id: best.ammDst?.ammId,
+          amm_dst_meta: best.ammDst
+            ? { poolKind: best.ammDst.poolKind, feeBps: best.ammDst.feeBps }
+            : undefined,
+        }
         : {}),
     });
 
