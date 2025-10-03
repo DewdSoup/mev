@@ -3,13 +3,13 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "main": "dist/src/main.js",
+  "main": "dist/src/bootstrap.js",
   "files": [
     "dist"
   ],
   "scripts": {
     "//": "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 Live reports / utilities \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
-    "dev": "tsx watch src/main.ts",
+    "dev": "tsx watch src/bootstrap.ts",
     "build": "tsc -b",
     "typecheck": "tsc --noEmit",
     "backtest": "tsx src/replay.ts",
@@ -21,8 +21,8 @@
     "dump:raydium": "tsx scripts/dump_raydium_pool_keys.ts",
     "phoenix:diag": "tsx src/diag.ts",
     "ml:tap": "tsx scripts/ml_tap.ts",
-    "start": "node dist/src/main.js",
-    "start:prod": "node dist/src/main.js",
+    "start": "node --enable-source-maps dist/src/bootstrap.js",
+    "start:prod": "node --enable-source-maps dist/src/bootstrap.js",
     "//_logs": "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 Log path unification (no code changes) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
     "logs:link": ":",
     "logs:clean": ":",

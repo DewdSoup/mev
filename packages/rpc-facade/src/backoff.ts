@@ -2,6 +2,13 @@ import { logger } from "@mev/storage";
 
 type AnyFn = (...args: any[]) => Promise<any>;
 
+export type RpcRateLimitInfo = {
+  label: string;
+  attempt: number;
+  waitMs: number;
+  error: unknown;
+};
+
 function envNum(name: string, def: number): number {
   const v = Number(process.env[name]);
   return Number.isFinite(v) && v > 0 ? v : def;
@@ -94,11 +101,13 @@ async function callWithRetry<T>(fn: AnyFn, opts?: {
   baseMs?: number;
   maxMs?: number;
   label?: string;
+  onRateLimit?: (info: RpcRateLimitInfo) => void;
 }): Promise<T> {
   const maxRetries = opts?.maxRetries ?? DEFAULT_MAX_RETRIES;
   const baseMs = opts?.baseMs ?? DEFAULT_BASE_MS;
   const maxMs = opts?.maxMs ?? DEFAULT_MAX_MS;
   const label = opts?.label ?? "rpc";
+  const onRateLimit = opts?.onRateLimit;
 
   let attempt = 0;
   while (true) {
@@ -130,17 +139,32 @@ async function callWithRetry<T>(fn: AnyFn, opts?: {
         if (rateLimited) logObj.rate_limited = true;
         logger.log("rpc_backoff_retry", logObj);
       }
+      if (rateLimited) {
+        try {
+          onRateLimit?.({ label, attempt, waitMs: wait, error: e });
+        } catch { /* ignore user callbacks */ }
+      }
       await sleep(wait);
     }
   }
 }
 
-export function withRpcBackoff(conn: any, opts?: { maxConcurrency?: number; maxRetries?: number; baseMs?: number; maxMs?: number }) {
+export function withRpcBackoff(
+  conn: any,
+  opts?: { maxConcurrency?: number; maxRetries?: number; baseMs?: number; maxMs?: number; onRateLimit?: (info: RpcRateLimitInfo) => void }
+) {
   const maxConcurrency = opts?.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
+  logger.log("rpc_backoff_init", {
+    max_concurrency: maxConcurrency,
+    max_retries: opts?.maxRetries ?? DEFAULT_MAX_RETRIES,
+    base_ms: opts?.baseMs ?? DEFAULT_BASE_MS,
+    max_ms: opts?.maxMs ?? DEFAULT_MAX_MS,
+  });
   const sem = new Semaphore(maxConcurrency);
   const maxRetries = opts?.maxRetries ?? DEFAULT_MAX_RETRIES;
   const baseMs = opts?.baseMs ?? DEFAULT_BASE_MS;
   const maxMs = opts?.maxMs ?? DEFAULT_MAX_MS;
+  const onRateLimit = opts?.onRateLimit;
 
   const wrap = (fnName: string) => {
     const orig = conn[fnName]?.bind(conn);
@@ -148,7 +172,13 @@ export function withRpcBackoff(conn: any, opts?: { maxConcurrency?: number; maxR
     return async (...args: any[]) => {
       await sem.acquire();
       try {
-        return await callWithRetry(() => orig(...args), { maxRetries, baseMs, maxMs, label: fnName });
+        return await callWithRetry(() => orig(...args), {
+          maxRetries,
+          baseMs,
+          maxMs,
+          label: fnName,
+          onRateLimit,
+        });
       } finally {
         sem.release();
       }

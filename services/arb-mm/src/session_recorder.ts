@@ -6,9 +6,11 @@ import path from "path";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { getSessionId, getSessionStats } from "./ml_logger.js";
 import type { AppConfig } from "./config.js";
+import { asPublicKey } from "./util/pubkey.js";
 
 const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const SKIP_BALANCE_READS = String(process.env.SKIP_BALANCE_READS ?? "1").trim() === "1";
 
 function stamp() {
   return new Date().toISOString().replace(/[:.]/g, "").replace("Z", "Z");
@@ -26,6 +28,7 @@ function findAta(owner: PublicKey, mint: PublicKey): PublicKey {
 }
 
 async function readTokenUi(conn: Connection, ata: PublicKey): Promise<number> {
+  if (SKIP_BALANCE_READS) return 0;
   try {
     const r = await conn.getTokenAccountBalance(ata, "processed");
     return r?.value?.uiAmount ?? 0;
@@ -34,6 +37,7 @@ async function readTokenUi(conn: Connection, ata: PublicKey): Promise<number> {
   }
 }
 async function readSol(conn: Connection, owner: PublicKey): Promise<number> {
+  if (SKIP_BALANCE_READS) return 0;
   try {
     return (await conn.getBalance(owner, "processed")) / 1e9;
   } catch {
@@ -42,6 +46,7 @@ async function readSol(conn: Connection, owner: PublicKey): Promise<number> {
 }
 
 export async function initSessionRecorder(conn: Connection, owner: PublicKey, cfg: AppConfig) {
+  const ownerPk = asPublicKey(owner) ?? owner;
   const liveDir = path.resolve(cfg.DATA_DIR, "live");
   ensureDir(liveDir);
 
@@ -50,11 +55,11 @@ export async function initSessionRecorder(conn: Connection, owner: PublicKey, cf
 
   const usdcMint = new PublicKey(cfg.USDC_MINT ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
   const wsolMint = new PublicKey(cfg.SOL_MINT ?? "So11111111111111111111111111111111111111112");
-  const usdcAta = cfg.USDC_ATA ? new PublicKey(cfg.USDC_ATA) : findAta(owner, usdcMint);
-  const wsolAta = cfg.WSOL_ATA ? new PublicKey(cfg.WSOL_ATA) : findAta(owner, wsolMint);
+  const usdcAta = asPublicKey(cfg.USDC_ATA) ?? findAta(ownerPk, usdcMint);
+  const wsolAta = asPublicKey(cfg.WSOL_ATA) ?? findAta(ownerPk, wsolMint);
 
   const start = {
-    sol: await readSol(conn, owner),
+    sol: await readSol(conn, ownerPk),
     usdc: await readTokenUi(conn, usdcAta),
     wsol: await readTokenUi(conn, wsolAta),
   };
@@ -66,7 +71,7 @@ export async function initSessionRecorder(conn: Connection, owner: PublicKey, cf
 
     const stopped_at = new Date();
     const end = {
-      sol: await readSol(conn, owner),
+      sol: await readSol(conn, ownerPk),
       usdc: await readTokenUi(conn, usdcAta),
       wsol: await readTokenUi(conn, wsolAta),
     };
@@ -81,7 +86,7 @@ export async function initSessionRecorder(conn: Connection, owner: PublicKey, cf
       session_id,
       started_at: started_at.toISOString(),
       stopped_at: stopped_at.toISOString(),
-      wallet: owner.toBase58(),
+      wallet: ownerPk.toBase58(),
       balances: { start, end, delta },
       stats: s,
     };

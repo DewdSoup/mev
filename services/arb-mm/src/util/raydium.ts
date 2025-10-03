@@ -181,7 +181,7 @@ function toPoolKeys(d: DiskPoolKeys): LiquidityPoolKeys {
 // ───────────────────────────────────────────────────────────────────────────────
 // On-chain fallback: decode the AMM state and build full pool keys (V4)
 // ───────────────────────────────────────────────────────────────────────────────
-async function derivePoolKeysFromOnchain(
+export async function derivePoolKeysFromOnchain(
   conn: Connection,
   ammId: PublicKey
 ): Promise<LiquidityPoolKeys> {
@@ -312,7 +312,7 @@ const FEE_TTL_MS = Math.max(
   Number(process.env.RAYDIUM_FEE_TTL_MS ?? 300_000)
 ); // 5m default
 
-async function resolveRaydiumFeeBpsCached(
+export async function resolveRaydiumFeeBpsCached(
   conn: Connection,
   pool: LiquidityPoolKeys,
   fallbackEnvBps: number

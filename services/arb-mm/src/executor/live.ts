@@ -78,6 +78,8 @@ const EST_UNITS_BEFORE_SIM = Number.isFinite(Number(process.env.EST_UNITS_BEFORE
 // Toggle: use dynamic fixed cost instead of FIXED_TX_COST_QUOTE_FALLBACK
 const USE_DYNAMIC_TX_COST = String(process.env.EXEC_USE_DYNAMIC_TX_COST ?? "1").trim() !== "0";
 
+const SKIP_BALANCE_READS = String(process.env.SKIP_BALANCE_READS ?? "1").trim() === "1";
+
 // Extra guardrail for EV gate
 const PNL_SAFETY_BPS = Number(process.env.PNL_SAFETY_BPS ?? "0") || 0;
 
@@ -208,6 +210,7 @@ const missingAtas = new Set<string>();
 async function safeTokenBalance(conn: Connection, pubkey: PublicKey): Promise<number> {
   const key = pubkey.toBase58();
   if (missingAtas.has(key)) return 0;
+  if (SKIP_BALANCE_READS) return 0;
   try {
     const res = await conn.getTokenAccountBalance(pubkey, "confirmed");
     return Number(res.value.uiAmount ?? 0);
@@ -232,6 +235,16 @@ async function getUiBalances(conn: Connection, owner: PublicKey): Promise<Balanc
 
   const wsolAta = wsolAtaEnv ? new PublicKey(wsolAtaEnv) : getAssociatedTokenAddressSync(WSOL_MINT, owner, false, TOKEN_PROGRAM_ID);
   const usdcAta = usdcAtaEnv ? new PublicKey(usdcAtaEnv) : getAssociatedTokenAddressSync(USDC_MINT, owner, false, TOKEN_PROGRAM_ID);
+
+  if (SKIP_BALANCE_READS) {
+    return {
+      solLamports: 0,
+      wsolUi: 0,
+      usdcUi: 0,
+      wsolAta: wsolAta.toBase58(),
+      usdcAta: usdcAta.toBase58(),
+    };
+  }
 
   const [lamports, wsolBal, usdcBal] = await Promise.all([
     conn.getBalance(owner, "confirmed"),

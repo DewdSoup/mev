@@ -17,12 +17,15 @@ import {
 } from "@solana/web3.js";
 import { AccountLayout, MintLayout } from "@solana/spl-token";
 import { LIQUIDITY_STATE_LAYOUT_V4 } from "@raydium-io/raydium-sdk";
-import { ParsableWhirlpool, PriceMath } from "@orca-so/whirlpools-sdk";
+import { ParsableWhirlpool, PriceMath, ParsableTickArray } from "@orca-so/whirlpools-sdk";
+import { PDAUtil, TickUtil } from "@orca-so/whirlpools-sdk";
+import type { TickArrayData } from "@orca-so/whirlpools-sdk";
 import BN from "bn.js";
 import Decimal from "decimal.js";
 
 import { logger } from "../ml_logger.js";
 import type { EdgeJoiner } from "../edge/joiner.js";
+import { cacheRaydiumFee, cacheOrcaFee } from "../util/fee_cache.js";
 
 type VenueCfg = { kind: string; id: string; poolKind?: string; enabled?: boolean; feeBps?: number };
 type PairCfg = {
@@ -43,7 +46,7 @@ const KEEPALIVE_MS = Math.max(60_000, Number(process.env.WS_KEEPALIVE_HEALTH_MS 
 
 // Freshness / TTLs
 const AMM_TTL_MS = Number(process.env.BOOK_TTL_MS ?? 6000);              // joiner TTL (keep > decision TTL)
-const ORCA_FORCE_POLL_MS = Math.max(1500, Number(process.env.ORCA_FORCE_POLL_MS ?? 2500)); // force a refresh if no WS within this window
+const ORCA_FORCE_POLL_MS = Math.max(900, Number(process.env.ORCA_FORCE_POLL_MS ?? 1200)); // force a refresh if no WS within this window
 
 function getenv(k: string) { const v = process.env[k]; return typeof v === "string" && v.trim() ? v.trim() : undefined; }
 function envTrue(k: string, d = false) {
@@ -98,10 +101,16 @@ async function getRaydiumVaultsAndDecimals(
         loadMintDecimals(http, quoteMint),
     ]);
     // CPmm fee: keep at 25bps unless you have dynamic config onchain
-    const feeBps =
-        Number.isFinite(Number(feeBpsHint)) ? Number(feeBpsHint) :
+    const tradeFeeNum = Number(s.tradeFeeNumerator ?? s.swapFeeNumerator ?? s.fees?.tradeFeeNumerator ?? NaN);
+    const tradeFeeDen = Number(s.tradeFeeDenominator ?? s.swapFeeDenominator ?? s.fees?.tradeFeeDenominator ?? NaN);
+    let feeBps = Number.isFinite(tradeFeeNum) && Number.isFinite(tradeFeeDen) && tradeFeeDen > 0
+        ? Math.round((tradeFeeNum / tradeFeeDen) * 10_000)
+        : NaN;
+    if (!Number.isFinite(feeBps) || feeBps <= 0) {
+        feeBps = Number.isFinite(Number(feeBpsHint)) ? Number(feeBpsHint) :
             Number.isFinite(Number(process.env.RAYDIUM_TRADE_FEE_BPS)) ? Number(process.env.RAYDIUM_TRADE_FEE_BPS) :
-                25;
+            25;
+    }
     return { baseVault, quoteVault, baseDecimals, quoteDecimals, feeBps };
 }
 
@@ -115,6 +124,23 @@ type OrcaContext = {
     decB: number;
     baseIsA: boolean;    // orientation vs (base, quote)
     feeBps: number;      // derived from whirlpool.feeRate / 100
+    tickSpacing: number;
+    programId: PublicKey;
+};
+
+type OrcaTickArrayState = {
+    startTick: number;
+    pubkey: PublicKey;
+    subId: number;
+    lastSlot?: number;
+    data?: TickArrayData | null;
+};
+
+type OrcaPoolState = {
+    ctx: OrcaContext;
+    lastPushMs: number;
+    activeTickIndex: number;
+    tickArrays: Map<number, OrcaTickArrayState>;
 };
 
 async function loadOrcaContext(
@@ -135,6 +161,10 @@ async function loadOrcaContext(
     const tokenMintB = new PublicKey(parsed.tokenMintB);
     const [decA, decB] = await Promise.all([loadMintDecimals(http, tokenMintA), loadMintDecimals(http, tokenMintB)]);
     const baseIsA = tokenMintA.equals(baseMint);
+    const tickSpacing = Number(parsed.tickSpacing ?? NaN);
+    if (!Number.isFinite(tickSpacing) || tickSpacing <= 0) {
+        throw new Error("orca_invalid_tick_spacing");
+    }
 
     // Orca: feeRate is "hundredths of a basis point"
     // => 30 bps = 3000, 4 bps = 400, etc.
@@ -145,7 +175,17 @@ async function loadOrcaContext(
                 Number.isFinite(Number(process.env.ORCA_TRADE_FEE_BPS)) ? Number(process.env.ORCA_TRADE_FEE_BPS) :
                     30);
 
-    return { whirlpool, tokenMintA, tokenMintB, decA, decB, baseIsA, feeBps };
+    return {
+        whirlpool,
+        tokenMintA,
+        tokenMintB,
+        decA,
+        decB,
+        baseIsA,
+        feeBps,
+        tickSpacing,
+        programId: acct.owner,
+    };
 }
 
 function computeOrcaQuotePerBaseFromSqrt(
@@ -154,12 +194,13 @@ function computeOrcaQuotePerBaseFromSqrt(
     decB: number,
     baseIsA: boolean
 ): number {
-    // A in B (Decimal-ish)
-    const priceAB = PriceMath.sqrtPriceX64ToPrice(sqrtPriceX64, decA, decB);
-    const p = Number(priceAB.toString());
+    // PriceMath returns tokenB per tokenA. When our BASE is mintA we want
+    // tokenB/tokenA (i.e. QUOTE per BASE). When BASE is mintB we need the
+    // inverse.
+    const priceBoverA = PriceMath.sqrtPriceX64ToPrice(sqrtPriceX64, decA, decB);
+    const p = Number(priceBoverA.toString());
     if (!Number.isFinite(p) || p <= 0) return NaN;
-    // We want QUOTE per BASE
-    return baseIsA ? (1 / p) : p;
+    return baseIsA ? p : 1 / p;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -169,7 +210,7 @@ export async function startWsMarkets(args: {
     wsUrl?: string;
     pairsPath?: string;
     joiner: EdgeJoiner;
-}): Promise<void> {
+}): Promise<{ close: () => Promise<void> }> {
     const httpUrl = args.httpUrl || getenv("RPC_URL") || getenv("HELIUS_HTTP")!;
     const wsUrl = args.wsUrl || getenv("RPC_WSS_URL") || getenv("WSS_URL") || getenv("WS_URL") || (httpUrl?.replace("https://", "wss://"))!;
     const pairsPath = args.pairsPath || getenv("PAIRS_JSON") || path.resolve(process.cwd(), "configs", "pairs.json");
@@ -187,7 +228,12 @@ export async function startWsMarkets(args: {
     const conf = JSON.parse(fs.readFileSync(pairsPath, "utf8")) as PairsFile;
     if (!conf?.pairs?.length) {
         logger.log("ws_provider_pairs_empty", { pairsPath });
-        return;
+        return {
+            close: async () => {
+                keepaliveTimer && clearInterval(keepaliveTimer);
+                orcaTimer && clearInterval(orcaTimer);
+            },
+        };
     }
 
     // Track subs to rewire on close
@@ -206,15 +252,127 @@ export async function startWsMarkets(args: {
     });
 
     // Keep-alive tick
-    setInterval(() => { http.getSlot(COMMITMENT).catch(() => undefined); }, KEEPALIVE_MS).unref?.();
+    const keepaliveTimer = setInterval(() => { http.getSlot(COMMITMENT).catch(() => undefined); }, KEEPALIVE_MS);
+    keepaliveTimer.unref?.();
 
     // ── Per-pool freshness state (for Orca forced refreshes)
-    const orcaState = new Map<string, { ctx: OrcaContext; lastPushMs: number }>();
+    const orcaState = new Map<string, OrcaPoolState>();
+
+    const ensureTickArrayLock = new Set<string>();
+
+    async function subscribeTickArray(
+        poolIdStr: string,
+        poolKey: PublicKey,
+        state: OrcaPoolState,
+        startTick: number
+    ) {
+        const existing = state.tickArrays.get(startTick);
+        if (existing && existing.subId !== -1) {
+            return;
+        }
+        const pendingKey = `${poolIdStr}:${startTick}`;
+        if (ensureTickArrayLock.has(pendingKey)) return;
+        ensureTickArrayLock.add(pendingKey);
+        try {
+            const { publicKey } = PDAUtil.getTickArray(state.ctx.programId, poolKey, startTick);
+            state.tickArrays.set(startTick, {
+                startTick,
+                pubkey: publicKey,
+                subId: -1,
+                data: existing?.data,
+                lastSlot: existing?.lastSlot,
+            });
+            const subId = await ws.onAccountChange(publicKey, (acc, context) => {
+                const entry = state.tickArrays.get(startTick);
+                if (!entry) return;
+                try {
+                    const parsed = ParsableTickArray.parse(publicKey, acc as any);
+                    entry.data = parsed;
+                } catch (e) {
+                    logger.log("orca_tick_array_parse_error", {
+                        pool: poolIdStr,
+                        start_tick: startTick,
+                        err: String((e as any)?.message ?? e),
+                    });
+                }
+                if (context?.slot != null) {
+                    entry.lastSlot = Number(context.slot);
+                    lastObservedSlot = Math.max(lastObservedSlot, Number(context.slot));
+                }
+            });
+            const entry = state.tickArrays.get(startTick);
+            if (entry) {
+                entry.subId = subId;
+                entry.pubkey = publicKey;
+            }
+            logger.log("orca_tick_array_subscribed", { pool: poolIdStr, start_tick: startTick, pda: publicKey.toBase58() });
+        } catch (e) {
+            state.tickArrays.delete(startTick);
+            logger.log("orca_tick_array_sub_error", {
+                pool: poolIdStr,
+                start_tick: startTick,
+                err: String((e as any)?.message ?? e),
+            });
+        } finally {
+            ensureTickArrayLock.delete(pendingKey);
+        }
+    }
+
+    async function unsubscribeTickArray(state: OrcaPoolState, startTick: number) {
+        const entry = state.tickArrays.get(startTick);
+        if (!entry) return;
+        state.tickArrays.delete(startTick);
+        if (entry.subId >= 0) {
+            try { await ws.removeAccountChangeListener(entry.subId); } catch { /* noop */ }
+        }
+        logger.log("orca_tick_array_unsubscribed", {
+            pool: state.ctx.whirlpool.toBase58(),
+            start_tick: startTick,
+        });
+    }
+
+    async function ensureTickArrays(
+        poolIdStr: string,
+        poolKey: PublicKey,
+        state: OrcaPoolState,
+        tickIndex: number
+    ) {
+        if (!Number.isFinite(tickIndex)) return;
+        const spacing = state.ctx.tickSpacing;
+        const desired = new Set<number>();
+        for (const offset of [0, -1, 1]) {
+            let startTick: number;
+            try {
+                startTick = TickUtil.getStartTickIndex(tickIndex, spacing, offset);
+            } catch {
+                continue;
+            }
+            desired.add(startTick);
+            if (!state.tickArrays.has(startTick)) {
+                await subscribeTickArray(poolIdStr, poolKey, state, startTick);
+            }
+        }
+        for (const startTick of [...state.tickArrays.keys()]) {
+            if (!desired.has(startTick)) {
+                void unsubscribeTickArray(state, startTick);
+            }
+        }
+    }
+
+    function latestTickArraySlot(state?: OrcaPoolState): number | undefined {
+        if (!state) return undefined;
+        let best = 0;
+        for (const entry of state.tickArrays.values()) {
+            if (entry.lastSlot && entry.lastSlot > best) best = entry.lastSlot;
+        }
+        return best > 0 ? best : undefined;
+    }
 
     // Force-poll any Orca pool that hasn't had a WS tick within ORCA_FORCE_POLL_MS
-    setInterval(async () => {
+    const orcaTimer = setInterval(async () => {
         const now = Date.now();
-        for (const { ctx, lastPushMs } of orcaState.values()) {
+        for (const [poolKeyStr, state] of orcaState.entries()) {
+            const { ctx, lastPushMs } = state;
             if (now - lastPushMs < ORCA_FORCE_POLL_MS) continue;
             try {
                 const acc = await http.getAccountInfo(ctx.whirlpool, COMMITMENT);
@@ -227,24 +385,35 @@ export async function startWsMarkets(args: {
                 const px = computeOrcaQuotePerBaseFromSqrt(sqrtBN, ctx.decA, ctx.decB, ctx.baseIsA);
                 if (!Number.isFinite(px) || px <= 0) continue;
 
+                const slotHint = latestTickArraySlot(state) ?? (lastObservedSlot || undefined);
                 args.joiner.upsertAmms({
                     venue: "orca",
                     ammId: ctx.whirlpool.toBase58(),
                     px,
                     ts: now,
-                    slot: lastObservedSlot || undefined,
+                    slot: slotHint,
                     feeBps: ctx.feeBps,
                     poolKind: "clmm",
                     baseDecimals: ctx.baseIsA ? ctx.decA : ctx.decB,
                     quoteDecimals: ctx.baseIsA ? ctx.decB : ctx.decA,
                     source: "ws+poll",
                 });
-                orcaState.set(ctx.whirlpool.toBase58(), { ctx, lastPushMs: now });
+                state.lastPushMs = now;
+                const tickIdx = Number(parsed?.tickCurrentIndex);
+                if (Number.isFinite(tickIdx)) {
+                    state.activeTickIndex = tickIdx;
+                    await ensureTickArrays(poolKeyStr, ctx.whirlpool, state, tickIdx);
+                }
+                logger.log("orca_force_poll", {
+                    pool: poolKeyStr,
+                    waited_ms: now - lastPushMs,
+                });
             } catch (e) {
-                logger.log("orca_force_poll_error", { pool: ctx.whirlpool.toBase58(), err: String((e as any)?.message ?? e) });
+                logger.log("orca_force_poll_error", { pool: poolKeyStr, err: String((e as any)?.message ?? e) });
             }
         }
-    }, Math.min(ORCA_FORCE_POLL_MS, 2000)).unref?.();
+    }, Math.min(ORCA_FORCE_POLL_MS, 2000));
+    orcaTimer.unref?.();
 
     // Main wire function (idempotent)
     const wireAll = async () => {
@@ -262,9 +431,15 @@ export async function startWsMarkets(args: {
             // ── Raydium CPMM
             if (kind === "raydium" && (v.poolKind ?? "cpmm").toLowerCase() === "cpmm") {
                 const meta = await getRaydiumVaultsAndDecimals(http, poolId, baseMint, quoteMint, feeBpsHint);
+                cacheRaydiumFee(poolId, meta.feeBps);
+                logger.log("fee_model_ray", {
+                    pool: poolId.toBase58(),
+                    fee_bps: meta.feeBps,
+                    source: "onchain",
+                });
                 const state = { base: 0n, quote: 0n };
 
-                const push = (now: number) => {
+                const push = (now: number, slotOverride?: number) => {
                     if (state.base <= 0n || state.quote <= 0n) return;
                     const baseUi = atomsToUi(state.base, meta.baseDecimals);
                     const quoteUi = atomsToUi(state.quote, meta.quoteDecimals);
@@ -275,7 +450,7 @@ export async function startWsMarkets(args: {
                         ammId: poolId.toBase58(),
                         px,
                         ts: now,
-                        slot: lastObservedSlot || undefined,
+                        slot: slotOverride ?? (lastObservedSlot || undefined),
                         feeBps: meta.feeBps,
                         poolKind: "cpmm",
                         baseDecimals: meta.baseDecimals,
@@ -287,13 +462,21 @@ export async function startWsMarkets(args: {
                 };
 
                 // WS: vault balances (2-arg signature)
-                const subBase = await ws.onAccountChange(meta.baseVault, (acc) => {
-                    try { state.base = decodeSplAmount(acc.data); push(Date.now()); } catch { }
+                const subBase = await ws.onAccountChange(meta.baseVault, (acc, context) => {
+                    if (context?.slot != null) lastObservedSlot = Math.max(lastObservedSlot, Number(context.slot));
+                    try {
+                        state.base = decodeSplAmount(acc.data);
+                        push(Date.now(), context?.slot != null ? Number(context.slot) : undefined);
+                    } catch { }
                 });
                 addSub(subBase, "ray_base_vault", meta.baseVault);
 
-                const subQuote = await ws.onAccountChange(meta.quoteVault, (acc) => {
-                    try { state.quote = decodeSplAmount(acc.data); push(Date.now()); } catch { }
+                const subQuote = await ws.onAccountChange(meta.quoteVault, (acc, context) => {
+                    if (context?.slot != null) lastObservedSlot = Math.max(lastObservedSlot, Number(context.slot));
+                    try {
+                        state.quote = decodeSplAmount(acc.data);
+                        push(Date.now(), context?.slot != null ? Number(context.slot) : undefined);
+                    } catch { }
                 });
                 addSub(subQuote, "ray_quote_vault", meta.quoteVault);
 
@@ -319,6 +502,26 @@ export async function startWsMarkets(args: {
             // ── Orca CLMM (Whirlpool)
             if (kind === "orca" && (v.poolKind ?? "clmm").toLowerCase() === "clmm") {
                 const ctx = await loadOrcaContext(http, poolId, baseMint, quoteMint, feeBpsHint);
+                cacheOrcaFee(poolId, ctx.feeBps);
+                logger.log("fee_model_orca", {
+                    pool: poolId.toBase58(),
+                    fee_bps: ctx.feeBps,
+                    source: "onchain",
+                });
+
+                const poolKeyStr = poolId.toBase58();
+                let poolState = orcaState.get(poolKeyStr);
+                if (!poolState) {
+                    poolState = {
+                        ctx,
+                        lastPushMs: 0,
+                        activeTickIndex: 0,
+                        tickArrays: new Map<number, OrcaTickArrayState>(),
+                    };
+                    orcaState.set(poolKeyStr, poolState);
+                } else {
+                    poolState.ctx = ctx;
+                }
 
                 // Prime once from HTTP
                 try {
@@ -330,26 +533,36 @@ export async function startWsMarkets(args: {
                         if (!sqrtBN.isZero()) {
                             const px = computeOrcaQuotePerBaseFromSqrt(sqrtBN, ctx.decA, ctx.decB, ctx.baseIsA);
                             if (Number.isFinite(px) && px > 0) {
+                                const now = Date.now();
+                                const slotHint = latestTickArraySlot(poolState) ?? (lastObservedSlot || undefined);
                                 args.joiner.upsertAmms({
                                     venue: "orca",
                                     ammId: poolId.toBase58(),
                                     px,
-                                    ts: Date.now(),
-                                    slot: lastObservedSlot || undefined,
+                                    ts: now,
+                                    slot: slotHint,
                                     feeBps: ctx.feeBps,
                                     poolKind: "clmm",
                                     baseDecimals: ctx.baseIsA ? ctx.decA : ctx.decB,
                                     quoteDecimals: ctx.baseIsA ? ctx.decB : ctx.decA,
                                     source: "prime",
                                 });
-                                orcaState.set(poolId.toBase58(), { ctx, lastPushMs: Date.now() });
+                                poolState.lastPushMs = now;
+                                const tickIdx = Number(parsed?.tickCurrentIndex);
+                                if (Number.isFinite(tickIdx)) {
+                                    poolState.activeTickIndex = tickIdx;
+                                    await ensureTickArrays(poolKeyStr, poolId, poolState, tickIdx);
+                                }
                             }
                         }
                     }
-                } catch { }
+                } catch (e) {
+                    logger.log("orca_prime_error", { pool: poolKeyStr, err: String((e as any)?.message ?? e) });
+                }
 
                 // WS: whirlpool account (2-arg signature)
-                const subId = await ws.onAccountChange(poolId, (acc) => {
+                const subId = await ws.onAccountChange(poolId, (acc, context) => {
+                    if (context?.slot != null) lastObservedSlot = Math.max(lastObservedSlot, Number(context.slot));
                     try {
                         const parsed: any = ParsableWhirlpool.parse(poolId, { ...acc, owner: acc.owner, data: acc.data });
                         const sqrtRaw = parsed?.sqrtPrice ?? 0;
@@ -360,19 +573,29 @@ export async function startWsMarkets(args: {
                         if (!Number.isFinite(px) || px <= 0) return;
 
                         const now = Date.now();
+                        const state = orcaState.get(poolKeyStr);
+                        const slotFromCtx = context?.slot != null ? Number(context.slot) : undefined;
+                        const slotHint = slotFromCtx ?? latestTickArraySlot(state) ?? (lastObservedSlot || undefined);
                         args.joiner.upsertAmms({
                             venue: "orca",
                             ammId: poolId.toBase58(),
                             px,
                             ts: now,
-                            slot: lastObservedSlot || undefined,
+                            slot: slotHint,
                             feeBps: ctx.feeBps,   // exact per-pool fee (feeRate/100)
                             poolKind: "clmm",
                             baseDecimals: ctx.baseIsA ? ctx.decA : ctx.decB,
                             quoteDecimals: ctx.baseIsA ? ctx.decB : ctx.decA,
                             source: "ws",
                         });
-                        orcaState.set(poolId.toBase58(), { ctx, lastPushMs: now });
+                        if (state) {
+                            state.lastPushMs = now;
+                            const tickIdx = Number(parsed?.tickCurrentIndex);
+                            if (Number.isFinite(tickIdx)) {
+                                state.activeTickIndex = tickIdx;
+                                void ensureTickArrays(poolKeyStr, poolId, state, tickIdx);
+                            }
+                        }
                     } catch (e) {
                         logger.log("orca_ws_decode_error", { pool: poolId.toBase58(), err: String((e as any)?.message ?? e) });
                     }
@@ -391,12 +614,15 @@ export async function startWsMarkets(args: {
     };
 
     // Rewire on open/close
-    (ws as any)._rpcWebSocket?.on?.("open", () => {
+    let reconnectTimer: NodeJS.Timeout | null = null;
+    const onOpen = () => {
         logger.log("ws_open", { wsUrl });
-    });
-    (ws as any)._rpcWebSocket?.on?.("close", async () => {
+    };
+    const onClose = () => {
         logger.log("ws_closed", { wsUrl });
-        setTimeout(async () => {
+        if (reconnectTimer) return;
+        reconnectTimer = setTimeout(async () => {
+            reconnectTimer = null;
             try {
                 await clearSubs();
                 await wireAll();
@@ -404,8 +630,34 @@ export async function startWsMarkets(args: {
                 logger.log("ws_rewire_error", { err: String((e as any)?.message ?? e) });
             }
         }, WS_RETRY_MS);
-    });
+        reconnectTimer?.unref?.();
+    };
+    (ws as any)._rpcWebSocket?.on?.("open", onOpen);
+    (ws as any)._rpcWebSocket?.on?.("close", onClose);
 
     await wireAll();
     logger.log("ws_provider_ready", { httpUrl, wsUrl, pairsPath });
+
+    return {
+        close: async () => {
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+            keepaliveTimer && clearInterval(keepaliveTimer);
+            orcaTimer && clearInterval(orcaTimer);
+            try { await clearSubs(); } catch { }
+            for (const state of orcaState.values()) {
+                for (const entry of state.tickArrays.values()) {
+                    if (entry.subId >= 0) {
+                        try { await ws.removeAccountChangeListener(entry.subId); } catch { }
+                    }
+                }
+                state.tickArrays.clear();
+            }
+            orcaState.clear();
+            try { (ws as any)._rpcWebSocket?.off?.("open", onOpen); } catch { }
+            try { (ws as any)._rpcWebSocket?.off?.("close", onClose); } catch { }
+        },
+    };
 }

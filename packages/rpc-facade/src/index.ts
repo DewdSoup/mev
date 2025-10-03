@@ -9,7 +9,7 @@ import type {
   GetMultipleAccountsConfig,
 } from "@solana/web3.js";
 import { logger } from "@mev/storage";
-import { withRpcBackoff } from "./backoff.js";
+import { withRpcBackoff, type RpcRateLimitInfo } from "./backoff.js";
 
 const DEFAULT_HTTP_ENDPOINT = String(process.env.RPC_URL ?? process.env.RPC_PRIMARY ?? "").trim();
 const DEFAULT_WS_ENDPOINT = process.env.RPC_WSS_URL?.trim();
@@ -47,25 +47,44 @@ type QueueItem<T> = {
 };
 
 class TokenBucketLimiter {
-  private readonly capacity: number;
-  private readonly ratePerMs: number;
+  private capacity: number;
+  private ratePerMs: number;
   private readonly debounceMs: number;
   private tokens: number;
   private lastRefill: number;
   private queue: Array<QueueItem<any>> = [];
   private processing = false;
   public queueDepth = 0;
+  private readonly onDepthSample?: (depth: number) => void;
+  private currentRps: number;
+  private currentBurst: number;
 
   constructor(opts: { rps: number; burst: number; debounceMs: number; onDepthSample?: (depth: number) => void }) {
-    const rps = Math.max(1, opts.rps);
-    this.capacity = Math.max(1, opts.burst);
-    this.ratePerMs = rps / 1000;
     this.debounceMs = Math.max(0, opts.debounceMs);
-    this.tokens = this.capacity;
-    this.lastRefill = Date.now();
     this.onDepthSample = opts.onDepthSample;
+    this.capacity = 1;
+    this.ratePerMs = 1 / 1000;
+    this.tokens = 1;
+    this.lastRefill = Date.now();
+    this.currentRps = 1;
+    this.currentBurst = 1;
+    this.updateLimits(opts.rps, opts.burst);
+    this.tokens = this.capacity;
   }
-  private readonly onDepthSample?: (depth: number) => void;
+
+  updateLimits(rps: number, burst?: number) {
+    const safeRps = Math.max(1, Number.isFinite(rps) ? Number(rps) : 1);
+    const safeBurst = Math.max(1, Number.isFinite(burst ?? this.currentBurst) ? Number(burst ?? this.currentBurst) : 1);
+    this.capacity = safeBurst;
+    this.currentBurst = safeBurst;
+    this.currentRps = safeRps;
+    this.ratePerMs = safeRps / 1000;
+    this.tokens = Math.min(this.tokens, this.capacity);
+  }
+
+  describeLimits() {
+    return { rps: this.currentRps, burst: this.currentBurst };
+  }
 
   async run<T>(label: string, work: () => Promise<T>, disable: boolean): Promise<T> {
     if (disable) return work();
@@ -324,13 +343,26 @@ export class RpcFacade {
   private readonly limiterDisabled: boolean;
   private readonly proxy: Connection;
   private readonly metrics: RpcMetrics;
+  private limiterMaxRps: number;
+  private limiterMaxBurst: number;
+  private limiterCurrentRps: number;
+  private limiterCurrentBurst: number;
+  private readonly rampDownFactor = 0.8;
+  private readonly rampDownCooldownMs: number;
+  private readonly rampUpIntervalMs: number;
+  private readonly rampUpStep: number;
+  private lastRampDownTs = 0;
+  private lastRampUpTs = 0;
+  private lastRateLimitTs = 0;
+  private readonly onBackoffRateLimit = (info: RpcRateLimitInfo) => {
+    this.registerRateLimit("backoff", info);
+  };
 
   constructor(private readonly opts: RpcFacadeOptions = DEFAULT_OPTS) {
     this.rawConnection = new Connection(DEFAULT_HTTP_ENDPOINT, {
       commitment: "processed",
       wsEndpoint: DEFAULT_WS_ENDPOINT,
     });
-    this.backoffConnection = withRpcBackoff(this.rawConnection);
     this.metrics = new RpcMetrics(opts.metricsIntervalMs);
     this.limiter = new TokenBucketLimiter({
       rps: opts.rps,
@@ -338,9 +370,20 @@ export class RpcFacade {
       debounceMs: opts.debounceMs,
       onDepthSample: (depth) => this.metrics.recordQueueDepth(depth),
     });
+    this.limiterDisabled = !opts.limiterEnabled || envBool("RPC_FACADE_PASSTHROUGH", false);
+    this.limiterMaxRps = Math.max(1, opts.rps);
+    this.limiterMaxBurst = Math.max(1, opts.burst);
+    this.limiterCurrentRps = this.limiterMaxRps;
+    this.limiterCurrentBurst = this.limiterMaxBurst;
+    this.rampDownCooldownMs = envNum("RPC_FACADE_RAMP_DOWN_COOLDOWN_MS", 2000, 250, 30_000);
+    this.rampUpIntervalMs = envNum("RPC_FACADE_RAMP_UP_INTERVAL_MS", 5000, 500, 60_000);
+    const rampPct = envNum("RPC_FACADE_RAMP_UP_PCT", 5, 1, 50);
+    this.rampUpStep = Math.max(1, Math.round((this.limiterMaxRps * rampPct) / 100));
+    this.backoffConnection = withRpcBackoff(this.rawConnection, {
+      onRateLimit: this.onBackoffRateLimit,
+    });
     this.blockhashCache = new BlockhashCache(opts.blockhashTtlMs);
     this.batcher = new AccountBatcher(this, opts.batchDelayMs, opts.batchMax);
-    this.limiterDisabled = !opts.limiterEnabled || envBool("RPC_FACADE_PASSTHROUGH", false);
     this.proxy = this.buildProxy();
     logger.log("rpc_facade_init", {
       http: maskUrlForLogs(DEFAULT_HTTP_ENDPOINT),
@@ -361,14 +404,93 @@ export class RpcFacade {
     return this.proxy;
   }
 
+  private onLimiterSuccess() {
+    if (this.limiterDisabled) return;
+    this.maybeRampUp();
+  }
+
+  private isRateLimitError(err: unknown): boolean {
+    if (!err) return false;
+    const code = (err as any)?.code;
+    if (code === -32429) return true;
+    const msg = String((err as any)?.message ?? err ?? "").toLowerCase();
+    return msg.includes("429") || msg.includes("rate limit") || msg.includes("too many requests");
+  }
+
+  private registerRateLimit(
+    source: "facade" | "backoff",
+    info?: Partial<RpcRateLimitInfo> & { error?: unknown }
+  ) {
+    if (this.limiterDisabled) return;
+    const now = Date.now();
+    this.lastRateLimitTs = now;
+    if (now - this.lastRampDownTs < this.rampDownCooldownMs) {
+      return;
+    }
+    const nextRps = Math.max(1, Math.floor(this.limiterCurrentRps * this.rampDownFactor));
+    if (nextRps >= this.limiterCurrentRps) {
+      this.lastRampDownTs = now;
+      this.lastRampUpTs = now;
+      return;
+    }
+    const ratio = this.limiterMaxRps > 0 ? nextRps / this.limiterMaxRps : 1;
+    const nextBurst = Math.max(1, Math.round(this.limiterMaxBurst * ratio));
+    this.limiter.updateLimits(nextRps, nextBurst);
+    this.limiterCurrentRps = nextRps;
+    this.limiterCurrentBurst = nextBurst;
+    this.lastRampDownTs = now;
+    this.lastRampUpTs = now;
+    logger.log("rpc_limiter_adjust", {
+      reason: "rate_limit",
+      source,
+      rps: nextRps,
+      burst: nextBurst,
+      cap_rps: this.limiterMaxRps,
+      cap_burst: this.limiterMaxBurst,
+      label: info?.label,
+      attempt: info?.attempt,
+      wait_ms: info?.waitMs,
+      error: info?.error ? String((info.error as any)?.message ?? info.error) : undefined,
+    });
+  }
+
+  private maybeRampUp() {
+    if (this.limiterDisabled) return;
+    if (this.limiterCurrentRps >= this.limiterMaxRps) return;
+    const now = Date.now();
+    if (now - this.lastRampUpTs < this.rampUpIntervalMs) return;
+    if (this.lastRateLimitTs && now - this.lastRateLimitTs < this.rampUpIntervalMs) return;
+    const nextRps = Math.min(this.limiterMaxRps, this.limiterCurrentRps + this.rampUpStep);
+    if (nextRps <= this.limiterCurrentRps) return;
+    const ratio = this.limiterMaxRps > 0 ? nextRps / this.limiterMaxRps : 1;
+    const nextBurst = Math.max(1, Math.round(this.limiterMaxBurst * ratio));
+    this.limiter.updateLimits(nextRps, nextBurst);
+    this.limiterCurrentRps = nextRps;
+    this.limiterCurrentBurst = nextBurst;
+    this.lastRampUpTs = now;
+    logger.log("rpc_limiter_adjust", {
+      reason: "ramp_up",
+      source: "facade",
+      rps: nextRps,
+      burst: nextBurst,
+      cap_rps: this.limiterMaxRps,
+      cap_burst: this.limiterMaxBurst,
+    });
+  }
+
   async exec<T>(label: string, work: () => Promise<T>): Promise<T> {
     const metricsLabel = label || "unknown";
     this.metrics.recordCall(metricsLabel);
     return this.limiter.run(label, async () => {
       try {
-        return await work();
+        const result = await work();
+        this.onLimiterSuccess();
+        return result;
       } catch (err) {
         this.metrics.recordError(metricsLabel);
+        if (this.isRateLimitError(err)) {
+          this.registerRateLimit("facade", { label, error: err });
+        }
         throw err;
       }
     }, this.limiterDisabled);

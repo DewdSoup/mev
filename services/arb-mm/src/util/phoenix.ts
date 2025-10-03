@@ -144,6 +144,28 @@ async function ensureMarketState(client: PhoenixClient, market: string | PublicK
 
 export { ensureMarketState as ensurePhoenixMarketState };
 
+export async function getPhoenixTakerFeeBps(conn: Connection, market: string | PublicKey): Promise<number | null> {
+    try {
+        const client = await getPhoenixClient(conn, [market]);
+        const state: any = await ensureMarketState(client, market);
+        const candidates = [
+            state?.takerFeeBps,
+            state?.data?.takerFeeBps,
+            state?.state?.takerFeeBps,
+            state?.header?.takerFeeBps,
+            state?.marketState?.takerFeeBps,
+            state?.config?.takerFeeBps,
+        ];
+        for (const c of candidates) {
+            const fee = Number(c);
+            if (Number.isFinite(fee) && fee >= 0) return fee;
+        }
+    } catch (err) {
+        logger.log("phoenix_fee_fetch_error", { market: asKey(market), err: String((err as any)?.message ?? err) });
+    }
+    return null;
+}
+
 export async function prewarmPhoenix(conn: Connection, markets: (string | PublicKey)[]): Promise<void> {
     const client = await getPhoenixClient(conn, markets);
     const results = await Promise.allSettled(markets.map((m) => ensureMarketState(client, m)));

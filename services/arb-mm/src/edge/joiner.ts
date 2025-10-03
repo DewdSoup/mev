@@ -12,15 +12,12 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 import { logger } from "../ml_logger.js";
-import { synthFromMid, type PhoenixBook } from "../syntheticPhoenix.js";
+import { type PhoenixBook } from "../syntheticPhoenix.js";
 import { emitFeature, featureFromEdgeAndDecision } from "../feature_sink.js";
 import { noteDecision } from "../risk.js";
 import type { SlipMode } from "../config.js";
 import {
-  optimizeSize,
-  type CpmmReserves as SizeCpmmReserves,
   type PhoenixBook as SizePhoenixBook,
-  type SizeOptInputs,
 } from "../executor/size.js";
 import {
   orcaAvgBuyQuotePerBase,
@@ -28,6 +25,7 @@ import {
 } from "../executor/orca_quoter.js";
 import { quoteClmm } from "./clmm_quoter.js";
 import Decimal from "decimal.js";
+import { getCachedOrcaFee, getCachedRaydiumFee } from "../util/fee_cache.js";
 
 Decimal.set({ precision: 40, rounding: Decimal.ROUND_HALF_EVEN });
 
@@ -71,21 +69,48 @@ function envInt(name: string, def: number) {
   const n = Number(process.env[name]);
   return Number.isFinite(n) ? n : def;
 }
-const AMM_SLOT_MAX_LAG = envInt("AMM_SLOT_MAX_LAG", 8);
-const AMM_SNAPSHOT_MAX_AGE_MS = envInt("AMM_SNAPSHOT_MAX_AGE_MS", envInt("PRICE_STALENESS_MS", 5000));
+const AMM_SLOT_MAX_LAG = envInt("AMM_SLOT_MAX_LAG", 2);
+const AMM_SNAPSHOT_FALLBACK_AGE_MS = envInt(
+  "AMM_SNAPSHOT_FALLBACK_AGE_MS",
+  envInt("PRICE_STALENESS_MS", 4000)
+);
 
-function staleReason(
+type FreshnessCheck = {
+  ok: boolean;
+  reason?: string;
+  skew?: number;
+  ageMs?: number;
+};
+
+function checkAmmFreshness(
   snap: { ts: number; slot?: number | null; venue: string; ammId: string },
-  phoenixSlot?: number | null,
-  now = Date.now()
-): string | null {
-  const ageMs = Math.max(0, now - (snap.ts || 0));
-  if (ageMs > AMM_SNAPSHOT_MAX_AGE_MS) return `age_ms>${AMM_SNAPSHOT_MAX_AGE_MS}`;
-  if (snap.slot != null && phoenixSlot != null) {
-    const lag = phoenixSlot - snap.slot;
-    if (lag > AMM_SLOT_MAX_LAG) return `slot_lag>${AMM_SLOT_MAX_LAG} (amm=${snap.slot} phoenix=${phoenixSlot})`;
+  phoenixSlot: number | null | undefined,
+  now: number,
+  slotSkewMax: number,
+  fallbackAgeMs: number,
+  bookTtlMs?: number
+): FreshnessCheck {
+  const slot = snap.slot != null ? Number(snap.slot) : null;
+  const hasSlot = slot != null && Number.isFinite(slot);
+  const phxSlot = phoenixSlot != null && Number.isFinite(phoenixSlot) ? Number(phoenixSlot) : null;
+
+  if (hasSlot && phxSlot != null) {
+    const skew = Math.abs(slot! - phxSlot);
+    if (skew > slotSkewMax) {
+      return { ok: false, reason: `slot_skew>${slotSkewMax}`, skew };
+    }
+    return { ok: true, skew };
   }
-  return null;
+
+  const ageMs = Math.max(0, now - (snap.ts || 0));
+  const ttl = typeof bookTtlMs === "number" && Number.isFinite(bookTtlMs)
+    ? Math.max(100, bookTtlMs)
+    : null;
+  const limit = Math.max(100, ttl != null ? Math.min(fallbackAgeMs, ttl) : fallbackAgeMs);
+  if (ageMs > limit) {
+    return { ok: false, reason: `age_ms>${limit}`, ageMs };
+  }
+  return { ok: true, ageMs };
 }
 
 function envTrue(name: string, def?: boolean): boolean {
@@ -190,8 +215,8 @@ export type DecisionHookDetails = {
   amm_pool_id?: string;       // exact pool to hit
   amm_dst_venue?: string;     // for AMM->AMM
   amm_dst_pool_id?: string;   // for AMM->AMM
-  amm_meta?: { poolKind?: string; feeBps?: number };
-  amm_dst_meta?: { poolKind?: string; feeBps?: number };
+  amm_meta?: { poolKind?: string; feeBps?: number; slot?: number | null; ts?: number };
+  amm_dst_meta?: { poolKind?: string; feeBps?: number; slot?: number | null; ts?: number };
 };
 
 export type DecisionHook = (
@@ -219,6 +244,18 @@ export type RpcSimFn = (input: {
   rpc_units?: number;
   prioritization_fee?: number;
 } | undefined>;
+
+type PathCandidate = {
+  path: "AMM->PHX" | "PHX->AMM" | "AMM->AMM";
+  amm: AmmSnap;
+  ammDst?: AmmSnap;
+  size: number;
+  buyPx: number;
+  sellPx: number;
+  bpsGross: number;
+  bpsNet: number;
+  pnlNet: number;
+};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Pairs config (broaden venues by config, not code)
@@ -268,7 +305,7 @@ export class EdgeJoiner {
   private lastEvalAt = 0;
   private probeSizeBase: number | undefined = (() => {
     const raw = process.env.FIXED_PROBE_BASE;
-    if (raw == null || raw === "") return undefined; // no default → enable size grid
+    if (raw == null || raw === "") return undefined; // no default → allow dynamic sizing
     const n = Number(raw);
     return Number.isFinite(n) && n > 0 ? n : undefined;
   })();
@@ -283,6 +320,7 @@ export class EdgeJoiner {
   private phoenixMarket?: string;
   private phoenixSnapshotDir?: string;
   private phxSnapshotLastMtime = 0;
+  private phxSnapshotPersistMs = 0;
   private phoenixSnapshotTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -323,6 +361,23 @@ export class EdgeJoiner {
     else this.phoenixSnapshotDir = path.resolve(process.cwd(), "data", "cache", "phoenix");
 
     this.loadPhoenixSnapshot(true);
+
+    try {
+      const effectiveAgeMs = Math.max(
+        100,
+        this.C.bookTtlMs != null && Number.isFinite(this.C.bookTtlMs)
+          ? Math.min(AMM_SNAPSHOT_FALLBACK_AGE_MS, this.C.bookTtlMs)
+          : AMM_SNAPSHOT_FALLBACK_AGE_MS
+      );
+      logger.log("joiner_freshness_config", {
+        book_ttl_ms: this.C.bookTtlMs,
+        slot_skew_max: AMM_SLOT_MAX_LAG,
+        fallback_age_ms: AMM_SNAPSHOT_FALLBACK_AGE_MS,
+        effective_age_ms: effectiveAgeMs,
+      });
+    } catch {
+      /* ignore logging failures */
+    }
 
     const snapshotPollMs = envInt("PHOENIX_SNAPSHOT_POLL_MS", 5000);
     if (snapshotPollMs > 0 && this.phoenixMarket) {
@@ -400,12 +455,19 @@ export class EdgeJoiner {
       nnum(obj?.feeBps) ??
       nnum(obj?.fee_bps) ??
       nnum(obj?.amm_fee_bps);
+    const cachedFee = (() => {
+      if (venue === "raydium") return getCachedRaydiumFee(ammId) ?? null;
+      if (venue === "orca") return getCachedOrcaFee(ammId) ?? null;
+      return null;
+    })();
     const feeFallback =
-      venue === "raydium"
-        ? Number(process.env.RAYDIUM_TRADE_FEE_BPS ?? this.P.ammFeeBps ?? 25)
-        : venue === "orca"
-          ? Number(process.env.ORCA_TRADE_FEE_BPS ?? this.P.ammFeeBps ?? 30)
-          : Number(this.P.ammFeeBps ?? 25);
+      cachedFee ?? (
+        venue === "raydium"
+          ? Number(process.env.RAYDIUM_TRADE_FEE_BPS ?? this.P.ammFeeBps ?? 25)
+          : venue === "orca"
+            ? Number(process.env.ORCA_TRADE_FEE_BPS ?? this.P.ammFeeBps ?? 30)
+            : Number(this.P.ammFeeBps ?? 25)
+      );
     const feeBps = feeFromPayload ?? feeFallback;
 
     const tsFromPayload = nnum(obj?.ts);
@@ -458,6 +520,9 @@ export class EdgeJoiner {
           ...(bidsArr && bidsArr.length ? { levels_bids: bidsArr } : {}),
           ...(asksArr && asksArr.length ? { levels_asks: asksArr } : {}),
         } as any;
+        if (bidsArr && bidsArr.length && asksArr && asksArr.length) {
+          this.persistPhoenixSnapshot(obj);
+        }
       }
     } else if (ev === "phoenix_mid") {
       const px = nnum(obj?.px) ?? (typeof obj?.px_str === "string" ? Number(obj.px_str) : undefined);
@@ -475,6 +540,7 @@ export class EdgeJoiner {
           source: "book",
           book_method: String(obj?.source ?? "unknown"),
         } as any;
+        this.persistPhoenixSnapshot(obj);
       }
     }
     void this.maybeReport();
@@ -488,6 +554,12 @@ export class EdgeJoiner {
     if (!this.phoenixMarket || !this.phoenixSnapshotDir) return;
     try {
       const file = path.join(this.phoenixSnapshotDir, `${this.phoenixMarket}.json`);
+      if (!fs.existsSync(file)) {
+        if (force) {
+          logger.log("phoenix_snapshot_missing", { file, market: this.phoenixMarket });
+        }
+        return;
+      }
       const st = fs.statSync(file);
       if (!force && st.mtimeMs <= this.phxSnapshotLastMtime) return;
       const raw = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -495,24 +567,54 @@ export class EdgeJoiner {
       this.upsertPhoenix({ event: "phoenix_l2", data: raw });
       logger.log("phoenix_snapshot_loaded", { file, mtime_ms: st.mtimeMs });
     } catch (e) {
-      if (force) {
+      const err = e as NodeJS.ErrnoException;
+      if (force && err?.code !== "ENOENT") {
         logger.log("phoenix_snapshot_load_error", {
           dir: this.phoenixSnapshotDir,
           market: this.phoenixMarket,
-          error: String((e as any)?.message ?? e),
+          error: String(err?.message ?? err),
         });
       }
     }
+  }
+
+  private persistPhoenixSnapshot(data: any): void {
+    if (!this.phoenixMarket || !this.phoenixSnapshotDir) return;
+    const bids = Array.isArray(data?.levels_bids) ? data.levels_bids : [];
+    const asks = Array.isArray(data?.levels_asks) ? data.levels_asks : [];
+    if (!bids.length || !asks.length) return;
+    try {
+      const now = Date.now();
+      if (now - this.phxSnapshotPersistMs < 250) return;
+      const file = path.join(this.phoenixSnapshotDir, `${this.phoenixMarket}.json`);
+      fs.mkdirSync(this.phoenixSnapshotDir, { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(data ?? {}));
+      this.phxSnapshotPersistMs = now;
+      this.phxSnapshotLastMtime = now;
+    } catch (e) {
+      logger.log("phoenix_snapshot_persist_error", {
+        market: this.phoenixMarket,
+        error: String((e as any)?.message ?? e),
+      });
+    }
+  }
+
+  close(): void {
+    if (this.phoenixSnapshotTimer) {
+      clearInterval(this.phoenixSnapshotTimer);
+      this.phoenixSnapshotTimer = null;
+    }
+    try {
+      if (this.phxBook) {
+        this.persistPhoenixSnapshot({ event: "phoenix_l2", ...this.phxBook });
+      }
+    } catch { /* ignore */ }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
   private getFreshBook(): (PhoenixBook & { ts: number; book_method?: string; levels_bids?: DepthSide[]; levels_asks?: DepthSide[] }) | null {
     const now = Date.now();
     if (this.phxBook && now - this.phxBook.ts <= this.C.bookTtlMs) return this.phxBook;
-    if (this.phxMid) {
-      const synth = synthFromMid(this.phxMid.px, this.phxMid.ts);
-      if (synth) return { ...synth, ts: Date.now() } as any;
-    }
     return null;
   }
 
@@ -618,34 +720,7 @@ export class EdgeJoiner {
     }
   }
 
-  private buildSizeGrid(refPx: number, reserves?: { base: number }): number[] {
-    if (this.probeSizeBase != null) {
-      const mins = [this.probeSizeBase];
-      if (Number.isFinite(this.P.decisionMinBase)) mins.push(this.P.decisionMinBase!);
-      if (Number.isFinite(this.C.decisionMinBase)) mins.push(this.C.decisionMinBase!);
-      if (Number.isFinite(this.P.minBase)) mins.push(this.P.minBase!);
-      if (Number.isFinite(this.P.minTradeBase)) mins.push(this.P.minTradeBase!);
-      if (Number.isFinite(this.P.tradeSizeBase)) mins.push(this.P.tradeSizeBase!);
-      let candidate = Math.max(...mins.filter((v) => Number.isFinite(v) && v > 0)) || this.probeSizeBase;
-      if (reserves && reserves.base > 0) {
-        const maxFrac = Number.isFinite(this.C.cpmmMaxPoolTradeFrac)
-          ? Math.max(0, Math.min(1, this.C.cpmmMaxPoolTradeFrac))
-          : undefined;
-        if (maxFrac && maxFrac > 0) {
-          const cap = reserves.base * maxFrac;
-          candidate = Math.min(candidate, cap);
-        }
-      }
-      if (!(candidate > 0)) return [];
-      return [Number(candidate.toFixed(9))];
-    }
-
-    const explicitGrid = String(process.env.DECISION_SIZE_GRID ?? "").trim();
-    if (explicitGrid) {
-      const xs = explicitGrid.split(",").map(s => Number(s.trim())).filter(x => Number.isFinite(x) && x > 0);
-      return Array.from(new Set(xs)).sort((a, b) => a - b);
-    }
-
+  private computeMinTradeBase(refPx: number): number {
     const floorFromEnv = envNum("DECISION_MIN_BASE");
     const floorFromCtor =
       this.P.decisionMinBase ??
@@ -659,28 +734,218 @@ export class EdgeJoiner {
       ? (10_000 * this.P.fixedTxCostQuote) / (refPx * targetBps)
       : 0;
 
-    const floor = Math.max(
+    return Math.max(
       1e-6,
       floorFromEnv ?? floorFromCtor ?? sizeoptMin ?? dynMin ?? this.P.tradeSizeBase
     );
+  }
 
-    const absMax = envNum("SIZEOPT_ABS_MAX_BASE");
-    const maxFrac = envNum("SIZEOPT_MAX_POOL_FRAC") ?? this.C.cpmmMaxPoolTradeFrac;
-    const poolCap = reserves ? reserves.base * maxFrac : (absMax ?? floor * 8);
-    const upper = Math.max(floor, Math.min(poolCap, absMax ?? Number.POSITIVE_INFINITY));
+  private pickTradeSize(args: {
+    path: "AMM->PHX" | "PHX->AMM" | "AMM->AMM";
+    nodeSrc: VenueNode;
+    nodeDst: VenueNode;
+    refPx: number;
+  }): number | undefined {
+    const minBase = this.computeMinTradeBase(args.refPx);
+    const liveOverrideRaw = envNum("LIVE_SIZE_BASE");
+    const liveOverride = liveOverrideRaw != null && Number.isFinite(liveOverrideRaw) && liveOverrideRaw > 0 ? liveOverrideRaw : undefined;
+    const basePreferred = this.probeSizeBase ?? liveOverride ?? this.P.tradeSizeBase;
+    const preferred = basePreferred != null && Number.isFinite(basePreferred) && basePreferred > 0 ? basePreferred : undefined;
 
-    const steps = Math.max(5, Math.min(15, Number(process.env.SIZEOPT_PROBE_STEPS ?? 9)));
-    const ratio = Math.pow(upper / floor, 1 / Math.max(1, steps - 1));
-    const out: number[] = [];
-    let v = floor;
-    for (let i = 0; i < steps; i++) {
-      out.push(v); v = v * ratio;
+    let size = preferred ?? minBase;
+    if (size < minBase) size = minBase;
+
+    const absMaxRaw = envNum("SIZEOPT_ABS_MAX_BASE");
+    const absMax = absMaxRaw != null && Number.isFinite(absMaxRaw) && absMaxRaw > 0 ? absMaxRaw : undefined;
+    if (absMax && size > absMax) size = absMax;
+
+    const fracRaw = envNum("SIZEOPT_MAX_POOL_FRAC");
+    const fracCandidate = fracRaw != null && Number.isFinite(fracRaw) ? fracRaw : this.C.cpmmMaxPoolTradeFrac;
+    const maxFrac = Math.max(0, Math.min(1, fracCandidate));
+
+    const applyCap = (node: VenueNode | undefined) => {
+      if (!node || node.kind !== "amm") return;
+      const reserves = node.amm.reserves;
+      if (!reserves || !(reserves.base > 0) || !Number.isFinite(reserves.base)) return;
+      if (!(maxFrac > 0)) return;
+      const cap = reserves.base * maxFrac;
+      if (cap > 0) size = Math.min(size, cap);
+    };
+
+    if (args.path === "AMM->PHX") {
+      applyCap(args.nodeSrc);
+    } else if (args.path === "PHX->AMM") {
+      applyCap(args.nodeDst);
+    } else {
+      applyCap(args.nodeSrc);
+      applyCap(args.nodeDst);
     }
-    if (this.P.tradeSizeBase > floor && this.P.tradeSizeBase < upper) out.push(this.P.tradeSizeBase);
 
-    const uniq = Array.from(new Set(out.map(x => Number(x.toFixed(9))))).filter(x => x > 0 && Number.isFinite(x));
-    uniq.sort((a, b) => a - b);
-    return uniq;
+    if (!(size > 0) || !Number.isFinite(size)) return undefined;
+    if (absMax && size > absMax) size = absMax;
+    if (size < minBase) return undefined;
+
+    return Number(size.toFixed(9));
+  }
+
+  private enforceVenueMinSize(size: number, src: VenueNode, dst: VenueNode): number | undefined {
+    if (!(size > 0) || !Number.isFinite(size)) return undefined;
+    if (
+      (src.kind === "amm" && src.amm.venue === "orca") ||
+      (dst.kind === "amm" && dst.amm.venue === "orca")
+    ) {
+      return Math.max(size, MIN_ORCA_BASE_SIZE);
+    }
+    return size;
+  }
+
+  private async evaluatePathCandidate(args: {
+    nodeSrc: VenueNode;
+    nodeDst: VenueNode;
+    path: PathCandidate["path"];
+    bid: number;
+    ask: number;
+    midRef: number;
+    trackAmmAmm: boolean;
+    execAmmAmm: boolean;
+    latestAmm: AmmSnap | undefined;
+  }): Promise<PathCandidate | null> {
+    const { nodeSrc, nodeDst, path, bid, ask, midRef, trackAmmAmm, execAmmAmm, latestAmm } = args;
+
+    const pickedSize = this.pickTradeSize({ path, nodeSrc, nodeDst, refPx: midRef });
+    if (!(pickedSize && pickedSize > 0)) {
+      try {
+        logger.log("size_probe_skip", {
+          symbol: this.symbol,
+          path,
+          reason: "size_not_available",
+          src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
+          dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
+        });
+      } catch { /* noop */ }
+      return null;
+    }
+
+    const adjusted = this.enforceVenueMinSize(pickedSize, nodeSrc, nodeDst);
+    if (!(adjusted && adjusted > 0)) {
+      try {
+        logger.log("size_probe_skip", {
+          symbol: this.symbol,
+          path,
+          reason: "size_adjustment_failed",
+          src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
+          dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
+        });
+      } catch { /* noop */ }
+      return null;
+    }
+
+    const size = Number(adjusted.toFixed(9));
+
+    try {
+      logger.log("size_probe", {
+        symbol: this.symbol,
+        path,
+        src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
+        dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
+        size_base: size,
+        size_raw: pickedSize,
+        min_base: this.computeMinTradeBase(midRef),
+      });
+    } catch { /* noop */ }
+
+    const qBuy = await this.quoteNodeAvgPerBase(nodeSrc, "buy", size, midRef);
+    const qSell = await this.quoteNodeAvgPerBase(nodeDst, "sell", size, midRef);
+    const buyPx = qBuy.px;
+    const sellPx = qSell.px;
+
+    if (buyPx == null || sellPx == null) return null;
+
+    const pnl = (sellPx - buyPx) * size - this.P.fixedTxCostQuote;
+    const notional = buyPx * size;
+    const srcMid = nodeSrc.kind === "amm" ? nodeSrc.amm.px : ask;
+    const dstMid = nodeDst.kind === "amm" ? nodeDst.amm.px : bid;
+    const bpsGross = ((dstMid / srcMid) - 1) * 10_000;
+    const bpsNet = ((sellPx / buyPx) - 1) * 10_000;
+
+    const ok = this.validateOpportunity(path, size, buyPx, sellPx, pnl, this.P.fixedTxCostQuote, bpsNet, notional);
+
+    const candidatePayload = {
+      symbol: this.symbol,
+      path,
+      src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
+      dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
+      size_base: size,
+      buy_px: buyPx,
+      sell_px: sellPx,
+      buy_quote_source: qBuy.used,
+      sell_quote_source: qSell.used,
+      buy_fee_bps: qBuy.feeBps,
+      sell_fee_bps: qSell.feeBps,
+      buy_meta: qBuy.meta ?? null,
+      sell_meta: qSell.meta ?? null,
+      pnl,
+      fixed_cost: this.P.fixedTxCostQuote,
+      edge_bps_gross: bpsGross,
+      edge_bps_net: bpsNet,
+      notional_quote: notional,
+      valid: ok.valid,
+      validation_reason: ok.reason ?? null,
+    };
+
+    try { logger.log("candidate_evaluated", candidatePayload); } catch { /* ignore */ }
+
+    if (!ok.valid) {
+      logger.log("opportunity_rejected", {
+        path,
+        venue: nodeSrc.kind === "amm" ? nodeSrc.amm.venue : "phx",
+        size,
+        buy_px: buyPx,
+        sell_px: sellPx,
+        pnl,
+        reason: ok.reason,
+        src_origin: qBuy.used,
+        dst_origin: qSell.used,
+        src_fee_bps: qBuy.feeBps,
+        dst_fee_bps: qSell.feeBps,
+        expected_pnl: pnl,
+        notional_quote: notional,
+      });
+      return null;
+    }
+
+    if (path === "AMM->AMM" && !execAmmAmm) {
+      if (trackAmmAmm) {
+        logger.log("amm_amm_tracked", {
+          symbol: this.symbol,
+          src: (nodeSrc as any).amm?.venue ?? "phx",
+          dst: (nodeDst as any).amm?.venue ?? "phx",
+          size_base: round(size, 9),
+          buy_px: round(buyPx),
+          sell_px: round(sellPx),
+          edge_bps_net: round(bpsNet, 4),
+          expected_pnl: round(pnl, 6),
+          note: "not executable in this phase",
+        });
+      }
+      return null;
+    }
+
+    const snapSrc = nodeSrc.kind === "amm" ? nodeSrc.amm : latestAmm;
+    const snapDst = nodeDst.kind === "amm" ? nodeDst.amm : undefined;
+    if (!snapSrc) return null;
+
+    return {
+      path,
+      amm: snapSrc,
+      ammDst: snapDst,
+      size,
+      buyPx,
+      sellPx,
+      bpsGross,
+      bpsNet,
+      pnlNet: pnl,
+    };
   }
 
   private validateOpportunity(
@@ -1003,23 +1268,36 @@ export class EdgeJoiner {
     if (!(bid > 0 && ask > 0)) return;
 
     // Filter AMM snapshots by staleness + config allow-list
-    const validAmms: AmmSnap[] = [];
+    const freshAmms: AmmSnap[] = [];
+    const staleAmms: { snap: AmmSnap; reason: string; skew?: number; ageMs?: number }[] = [];
     for (const a of this.amms.values()) {
-      const reason = staleReason({ ts: a.ts, slot: a.slot ?? null, venue: a.venue, ammId: a.ammId }, this.phxSlot ?? null, now);
-      if (reason) {
+      const freshness = checkAmmFreshness(
+        { ts: a.ts, slot: a.slot ?? null, venue: a.venue, ammId: a.ammId },
+        this.phxSlot ?? null,
+        now,
+        AMM_SLOT_MAX_LAG,
+        AMM_SNAPSHOT_FALLBACK_AGE_MS,
+        this.C.bookTtlMs
+      );
+      if (!freshness.ok) {
         logger.log("amm_snapshot_ignored", {
           venue: a.venue,
           ammId: a.ammId,
-          reason,
+          reason: freshness.reason,
           ts: a.ts,
           slot: a.slot ?? null,
           phoenix_slot: this.phxSlot ?? null,
+          slot_skew: freshness.skew,
+          age_ms: freshness.ageMs,
         });
+        staleAmms.push({ snap: a, reason: freshness.reason ?? "stale", skew: freshness.skew, ageMs: freshness.ageMs });
         continue;
       }
       if (this.allowedPools.size && !this.allowedPools.has(`${a.venue}:${a.ammId}`)) continue;
-      validAmms.push(a);
+      freshAmms.push(a);
     }
+    const validAmms: AmmSnap[] = freshAmms;
+
     if (validAmms.length === 0) {
       if (now - this.lastWaitLog >= this.P.waitLogMs) {
         this.lastWaitLog = now;
@@ -1028,7 +1306,7 @@ export class EdgeJoiner {
           have_orca: false,
           have_phoenix_mid: !!this.phxMid,
           have_phoenix_book: !!this.phxBook,
-          reason: "all_amm_snapshots_stale_or_not_in_config",
+          reason: staleAmms.length ? "all_amm_snapshots_stale" : "no_amms",
         });
       }
       return;
@@ -1079,7 +1357,7 @@ export class EdgeJoiner {
     };
 
     // Emit a single edge_report snapshot (Phoenix vs latest valid AMM mid)
-    const latestAmm = validAmms.sort((a, b) => b.ts - a.ts)[0];
+    const latestAmm = validAmms.slice().sort((a, b) => b.ts - a.ts)[0];
     const ammPx = latestAmm?.px ?? (bid + ask) / 2;
 
     const toPhoenixSellBps = (ammPx / bid - 1) * 10_000;
@@ -1115,18 +1393,6 @@ export class EdgeJoiner {
     }
 
     // ── Unified 2-leg path enumerator (PHX<->AMM and AMM<->AMM) ─────────────
-    type Candidate = {
-      path: "AMM->PHX" | "PHX->AMM" | "AMM->AMM";
-      amm: AmmSnap;
-      ammDst?: AmmSnap; // for AMM->AMM
-      size: number;
-      buyPx: number;
-      sellPx: number;
-      bpsGross: number;
-      bpsNet: number;
-      pnlNet: number;
-    };
-
     const nodes: VenueNode[] = [
       { kind: "phx" as const, id: "phoenix" as const, feeBps: this.P.phoenixFeeBps },
       ...validAmms.map((a) => ({
@@ -1137,7 +1403,16 @@ export class EdgeJoiner {
       })),
     ];
 
-    const candidates: Candidate[] = [];
+    const candidates: PathCandidate[] = [];
+    const trackAmmAmm = envTrue("TRACK_AMM_AMM", true);
+    const execAmmAmm = envTrue("EXECUTE_AMM_AMM", false);
+    const midRef = (bid + ask) / 2;
+    const pathStats: Record<PathCandidate["path"], number> = {
+      "PHX->AMM": 0,
+      "AMM->PHX": 0,
+      "AMM->AMM": 0,
+    };
+
     for (const nodeSrc of nodes) {
       for (const nodeDst of nodes) {
         if (nodeSrc === nodeDst) continue;
@@ -1145,126 +1420,41 @@ export class EdgeJoiner {
         if (nodeSrc.kind === "phx" && nodeDst.kind === "phx") continue;
 
         // Path label compatible with rest of pipeline
-        const path: Candidate["path"] =
+        const path: PathCandidate["path"] =
           nodeSrc.kind === "phx" && nodeDst.kind === "amm" ? "PHX->AMM" :
             nodeSrc.kind === "amm" && nodeDst.kind === "phx" ? "AMM->PHX" :
               "AMM->AMM";
 
-        // Execution gates
-        const trackAmmAmm = envTrue("TRACK_AMM_AMM", true);
-        const execAmmAmm = envTrue("EXECUTE_AMM_AMM", false);
         if (path === "AMM->AMM" && !trackAmmAmm && !execAmmAmm) continue;
 
-        // Size grid (cap by reserves if AMM on source)
-        const midRef = (bid + ask) / 2;
-        const srcRes = nodeSrc.kind === "amm" ? nodeSrc.amm.reserves : undefined;
-        const grid = this.buildSizeGrid(midRef, srcRes ? { base: srcRes.base } : undefined);
-        const sizes = Array.from(new Set(grid.map(x => Number(x.toFixed(9)))))
-          .filter(x => x > 0 && Number.isFinite(x))
-          .sort((a, b) => a - b);
+        const candidate = await this.evaluatePathCandidate({
+          nodeSrc,
+          nodeDst,
+          path,
+          bid,
+          ask,
+          midRef,
+          trackAmmAmm,
+          execAmmAmm,
+          latestAmm,
+        });
 
-        try {
-          logger.log("size_probe_grid", {
-            symbol: this.symbol,
-            path,
-            src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
-            dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
-            size_count: sizes.length,
-            sizes,
-          });
-        } catch { /* noop */ }
-
-        for (const s0 of sizes) {
-          const sEff =
-            (nodeSrc.kind === "amm" && nodeSrc.amm.venue === "orca") ||
-              (nodeDst.kind === "amm" && nodeDst.amm.venue === "orca")
-              ? Math.max(s0, MIN_ORCA_BASE_SIZE)
-              : s0;
-
-          // Buy at source, sell at dest (BASE as the moving asset)
-          const qBuy = await this.quoteNodeAvgPerBase(nodeSrc, "buy", sEff, midRef);
-          const qSell = await this.quoteNodeAvgPerBase(nodeDst, "sell", sEff, midRef);
-          const buyPx = qBuy.px;
-          const sellPx = qSell.px;
-
-          if (buyPx != null && sellPx != null) {
-            const pnl = (sellPx - buyPx) * sEff - this.P.fixedTxCostQuote;
-            const notional = buyPx * sEff;
-
-            // Use node “mid”s for gross spread calc (compat with prior logs)
-            const srcMid = nodeSrc.kind === "amm" ? nodeSrc.amm.px : ask;  // buying at PHX uses ask ref
-            const dstMid = nodeDst.kind === "amm" ? nodeDst.amm.px : bid;  // selling at PHX uses bid ref
-            const bpsGross = ((dstMid / srcMid) - 1) * 10_000;
-            const bpsNet = ((sellPx / buyPx) - 1) * 10_000;
-
-            const ok = this.validateOpportunity(path, sEff, buyPx, sellPx, pnl, this.P.fixedTxCostQuote, bpsNet, notional);
-
-            const candidatePayload = {
-              symbol: this.symbol,
-              path,
-              src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
-              dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
-              size_base: sEff,
-              buy_px: buyPx,
-              sell_px: sellPx,
-              buy_quote_source: qBuy.used,
-              sell_quote_source: qSell.used,
-              buy_fee_bps: qBuy.feeBps,
-              sell_fee_bps: qSell.feeBps,
-              buy_meta: qBuy.meta ?? null,
-              sell_meta: qSell.meta ?? null,
-              pnl,
-              fixed_cost: this.P.fixedTxCostQuote,
-              edge_bps_gross: bpsGross,
-              edge_bps_net: bpsNet,
-              notional_quote: notional,
-              valid: ok.valid,
-              validation_reason: ok.reason ?? null,
-            };
-
-            try { logger.log("candidate_evaluated", candidatePayload); } catch { /* ignore */ }
-
-            if (ok.valid) {
-              if (path !== "AMM->AMM" || execAmmAmm) {
-                const snapSrc = nodeSrc.kind === "amm" ? nodeSrc.amm : latestAmm;   // keep payload shape
-                const snapDst = nodeDst.kind === "amm" ? nodeDst.amm : undefined;
-                candidates.push({
-                  path,
-                  amm: snapSrc!,
-                  ammDst: snapDst,
-                  size: sEff,
-                  buyPx, sellPx,
-                  bpsGross, bpsNet, pnlNet: pnl,
-                });
-              } else if (trackAmmAmm && path === "AMM->AMM") {
-                logger.log("amm_amm_tracked", {
-                  symbol: this.symbol,
-                  src: (nodeSrc as any).amm?.venue ?? "phx",
-                  dst: (nodeDst as any).amm?.venue ?? "phx",
-                  size_base: round(sEff, 9),
-                  buy_px: round(buyPx),
-                  sell_px: round(sellPx),
-                  edge_bps_net: round(bpsNet, 4),
-                  expected_pnl: round(pnl, 6),
-                  note: "not executable in this phase",
-                });
-              }
-            } else {
-              logger.log("opportunity_rejected", {
-                path,
-                venue: nodeSrc.kind === "amm" ? nodeSrc.amm.venue : "phx",
-                size: sEff, buy_px: buyPx, sell_px: sellPx, pnl, reason: ok.reason,
-                src_origin: qBuy.used,
-                dst_origin: qSell.used,
-                src_fee_bps: qBuy.feeBps,
-                dst_fee_bps: qSell.feeBps,
-                expected_pnl: pnl,
-                notional_quote: notional,
-              });
-            }
-          }
+        if (candidate) {
+          pathStats[path] = (pathStats[path] ?? 0) + 1;
+          candidates.push(candidate);
         }
       }
+    }
+
+    try {
+      logger.log("path_candidate_counts", {
+        symbol: this.symbol,
+        phx_to_amm: pathStats["PHX->AMM"],
+        amm_to_phx: pathStats["AMM->PHX"],
+        amm_to_amm: pathStats["AMM->AMM"],
+      });
+    } catch {
+      /* ignore logging failures */
     }
 
     // Choose the best candidate among all paths
@@ -1273,7 +1463,7 @@ export class EdgeJoiner {
       if (this.C.logSimFields) logger.log("would_not_trade", {
         symbol: this.symbol,
         reason: "no_profitable_opportunities_found",
-        grid_count: 0,
+        size_grid_count: 1,
         validation_enabled: true,
       });
       this.onDecision(false, Number.NaN, Number.NaN, undefined);
@@ -1295,11 +1485,20 @@ export class EdgeJoiner {
       slippage_mode: this.C.activeSlippageMode,
       phoenix_source: "book",
       phoenix_book_method: (book as any).book_method ?? "unknown",
+      phoenix_slot: this.phxSlot ?? null,
       buy_px: round(best.buyPx),
       sell_px: round(best.sellPx),
       edge_bps_net: round(best.bpsNet, 4),
       expected_pnl: round(best.pnlNet, 6),
       fees_bps: { phoenix: this.P.phoenixFeeBps, amm: best.amm.feeBps, ...(best.ammDst ? { amm_dst: best.ammDst.feeBps } : {}) },
+      amm_slot: best.amm.slot ?? null,
+      amm_ts: best.amm.ts ?? null,
+      ...(best.ammDst
+        ? {
+          amm_dst_slot: best.ammDst.slot ?? null,
+          amm_dst_ts: best.ammDst.ts ?? null,
+        }
+        : {}),
       fixed_tx_cost_quote: round(this.P.fixedTxCostQuote, 6),
       decision_min_base:
         envNum("DECISION_MIN_BASE") ??
@@ -1308,7 +1507,7 @@ export class EdgeJoiner {
         envNum("SIZEOPT_MIN_BASE") ??
         this.P.minBase ??
         this.P.minTradeBase,
-      size_grid_count: 0,
+      size_grid_count: 1,
       validation_enabled: true,
     };
 
@@ -1404,13 +1603,13 @@ export class EdgeJoiner {
       recommended_size_base: best.size,
       amm_venue: best.amm.venue,
       amm_pool_id: best.amm.ammId,
-      amm_meta: { poolKind: best.amm.poolKind, feeBps: best.amm.feeBps },
+      amm_meta: { poolKind: best.amm.poolKind, feeBps: best.amm.feeBps, slot: best.amm.slot ?? null, ts: best.amm.ts },
       ...(best.path === "AMM->AMM"
         ? {
           amm_dst_venue: best.ammDst?.venue,
           amm_dst_pool_id: best.ammDst?.ammId,
           amm_dst_meta: best.ammDst
-            ? { poolKind: best.ammDst.poolKind, feeBps: best.ammDst.feeBps }
+            ? { poolKind: best.ammDst.poolKind, feeBps: best.ammDst.feeBps, slot: best.ammDst.slot ?? null, ts: best.ammDst.ts }
             : undefined,
         }
         : {}),

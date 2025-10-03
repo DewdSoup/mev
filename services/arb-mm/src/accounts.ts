@@ -16,6 +16,8 @@ function loadKeypairFromFile(p: string): Keypair {
   return Keypair.fromSecretKey(sk);
 }
 
+const SKIP_BALANCE_READS = String(process.env.SKIP_BALANCE_READS ?? "1").trim() === "1";
+
 export async function initAccounts(conn: Connection): Promise<WalletCtx> {
   const keyPath = process.env.WALLET_KEYPAIR_PATH!;
   const owner = loadKeypairFromFile(keyPath);
@@ -27,14 +29,16 @@ export async function initAccounts(conn: Connection): Promise<WalletCtx> {
   const wsolAta = getAssociatedTokenAddressSync(WSOL_MINT, owner.publicKey, true);
 
   let lastBalances: { usdc: number; wsol: number } | undefined;
-  try {
-    const [usdcBal, wsolBal] = await Promise.all([
-      conn.getTokenAccountBalance(usdcAta, "processed").then(r => Number(r?.value?.uiAmount ?? 0)).catch(() => 0),
-      conn.getTokenAccountBalance(wsolAta, "processed").then(r => Number(r?.value?.uiAmount ?? 0)).catch(() => 0),
-    ]);
-    lastBalances = { usdc: usdcBal, wsol: wsolBal };
-  } catch {
-    // keep lastBalances undefined
+  if (!SKIP_BALANCE_READS) {
+    try {
+      const [usdcBal, wsolBal] = await Promise.all([
+        conn.getTokenAccountBalance(usdcAta, "processed").then(r => Number(r?.value?.uiAmount ?? 0)).catch(() => 0),
+        conn.getTokenAccountBalance(wsolAta, "processed").then(r => Number(r?.value?.uiAmount ?? 0)).catch(() => 0),
+      ]);
+      lastBalances = { usdc: usdcBal, wsol: wsolBal };
+    } catch {
+      // keep lastBalances undefined
+    }
   }
 
   // With exactOptionalPropertyTypes, omit optional fields if undefined:

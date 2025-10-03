@@ -107,6 +107,7 @@ export class PublisherSupervisor {
         logger.log("pubsv_poll_error", { error: String(e) });
       }
     }, pollMs);
+    this.interval.unref?.();
 
     logger.log("pubsv_started", { pollMs, freshnessMs });
   }

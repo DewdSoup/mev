@@ -12,7 +12,6 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import * as dotenv from "dotenv";
 import { PublicKey, Keypair } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
 import { logger } from "@mev/storage";
@@ -43,39 +42,24 @@ import {
   type PhoenixBook as PxBook,
   type CpmmReserves,
 } from "./executor/size.js";
-import { tryAssertRaydiumFeeBps } from "./util/raydium.js";
 import { PublisherSupervisor } from "./publishers/supervisor.js";
 import { prewarmPhoenix } from "./util/phoenix.js"; // warm Phoenix cache on boot
 import { MarketStateProvider } from "./market/index.js";
 import { loadPairsFromEnvOrDefault } from "./registry/pairs.js";
-import { rpcClient, rpc } from "@mev/rpc-facade";
 import { setRpcLatencies } from "./runtime/metrics.js";
 import { startWsMarkets } from "./provider/ws_markets.js";
+import {
+  ensureRaydiumFee,
+  ensurePhoenixFee,
+  ensureOrcaFee,
+  getCachedRaydiumFee,
+  getCachedPhoenixFee,
+  getCachedOrcaFee,
+} from "./util/fee_cache.js";
+import { asPublicKey } from "./util/pubkey.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// ────────────────────────────────────────────────────────────────────────────
-// Load ONLY .env.live and force LIVE mode
-// ────────────────────────────────────────────────────────────────────────────
-(function loadExactEnvLive() {
-  // Prefer repo root .env.live; fallback to service-level .env.live
-  const repoRoot = path.resolve(__dirname, "..", "..", "..");
-  const repoEnvLive = path.resolve(repoRoot, ".env.live");
-  const svcEnvLive = path.resolve(__dirname, "..", "..", ".env.live");
-  const chosen = fs.existsSync(repoEnvLive) ? repoEnvLive : svcEnvLive;
-  if (!fs.existsSync(chosen)) {
-    console.error("[env] .env.live not found; expected at", repoEnvLive, "or", svcEnvLive);
-  } else {
-    dotenv.config({ path: chosen, override: true });
-  }
-  // Force live-only mode regardless of previous state
-  process.env.LIVE_TRADING = "1";
-  process.env.SHADOW_TRADING = "0";
-
-  // Prevent config.ts from re-loading any env files (including .env)
-  process.env.__ENV_LIVE_LOCKED = "1";
-})();
 
 // ────────────────────────────────────────────────────────────────────────────
 /** helpers / constants */
@@ -90,9 +74,16 @@ function envNum(name: string, def?: number): number | undefined {
   return Number.isFinite(n) ? n : def;
 }
 function tryPubkey(s?: string | null): PublicKey | undefined {
-  if (!s) return undefined;
-  try { return new PublicKey(s.trim()); } catch { return undefined; }
+  return asPublicKey(s ?? undefined);
 }
+const warnedKeys = new Set<string>();
+const missingAtaCache = new Set<string>();
+function warnOnce(key: string, fn: () => void) {
+  if (warnedKeys.has(key)) return;
+  warnedKeys.add(key);
+  fn();
+}
+const SKIP_BALANCE_READS = String(process.env.SKIP_BALANCE_READS ?? "1") === "1";
 function ensureDir(p: string) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
 }
@@ -134,6 +125,7 @@ class JsonlFollower {
     await this.openAtEOF();
     this.watch();
     this.poller = setInterval(() => this.readNewBytes(), this.pollMs);
+    this.poller.unref?.();
   }
 
   stop() {
@@ -205,8 +197,10 @@ class JsonlFollower {
 // ────────────────────────────────────────────────────────────────────────────
 /** health loop */
 // ────────────────────────────────────────────────────────────────────────────
-async function startHealth(conn: Connection) {
-  async function sampleTps(): Promise<number> {
+function startHealth(conn: Connection): () => void {
+  let stopped = false;
+
+  const sampleTps = async (): Promise<number> => {
     try {
       const samples = await conn.getRecentPerformanceSamples(1);
       if (!samples?.length) return 0;
@@ -216,9 +210,10 @@ async function startHealth(conn: Connection) {
     } catch {
       return 0;
     }
-  }
+  };
 
-  setInterval(async () => {
+  const timer = setInterval(async () => {
+    if (stopped) return;
     try {
       const [slot, version, tps] = await Promise.all([
         conn.getSlot("processed"),
@@ -245,6 +240,13 @@ async function startHealth(conn: Connection) {
       });
     }
   }, 3000);
+  timer.unref?.();
+
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+  };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -273,15 +275,23 @@ async function sumMintBalance(
   conn: Connection,
   owner: PublicKey,
   mint: PublicKey,
-  preferredAta?: PublicKey
+  preferredAta?: string | PublicKey
 ): Promise<number> {
-  if (preferredAta) {
-    try {
-      const r = await conn.getTokenAccountBalance(preferredAta, "confirmed");
-      const amt = Number(r?.value?.uiAmount ?? 0);
-      if (Number.isFinite(amt)) return amt;
-    } catch {
-      /* fallthrough */
+  if (SKIP_BALANCE_READS) return 0;
+  const ataPk = asPublicKey(preferredAta);
+  if (ataPk) {
+    const ataKey = ataPk.toBase58();
+    if (!missingAtaCache.has(ataKey)) {
+      try {
+        const r = await conn.getTokenAccountBalance(ataPk, "confirmed");
+        const amt = Number(r?.value?.uiAmount ?? 0);
+        if (Number.isFinite(amt)) return amt;
+      } catch (err) {
+        missingAtaCache.add(ataKey);
+        warnOnce(`missing_ata_${ataKey}`, () =>
+          logger.log("missing_ata", { ata: ataKey, mint: mint.toBase58(), err: String((err as any)?.message ?? err) })
+        );
+      }
     }
   }
   try {
@@ -307,10 +317,14 @@ async function readBalances(
   owner: PublicKey,
   ataHints?: { wsol?: PublicKey; usdc?: PublicKey }
 ) {
+  if (SKIP_BALANCE_READS) {
+    return { sol: 0, wsol: 0, usdc: 0 };
+  }
+  const ownerPk = asPublicKey(owner) ?? owner;
   const [solLamports, wsol, usdc] = await Promise.all([
-    conn.getBalance(owner, "confirmed").catch(() => 0),
-    sumMintBalance(conn, owner, WSOL_MINT, ataHints?.wsol),
-    sumMintBalance(conn, owner, USDC_MINT, ataHints?.usdc),
+    conn.getBalance(ownerPk, "confirmed").catch(() => 0),
+    sumMintBalance(conn, ownerPk, WSOL_MINT, ataHints?.wsol),
+    sumMintBalance(conn, ownerPk, USDC_MINT, ataHints?.usdc),
   ]);
   return { sol: solLamports / 1e9, wsol, usdc };
 }
@@ -403,6 +417,18 @@ async function main() {
   const { loadConfig, RPC, maskUrl, resolveFeeBps } = await import("./config.js");
   const CFG = loadConfig();
 
+  if (!process.env.PAIRS_JSON || !process.env.PAIRS_JSON.trim()) {
+    const defaultPairs = path.resolve(process.cwd(), "configs", "pairs.json");
+    if (fs.existsSync(defaultPairs)) process.env.PAIRS_JSON = defaultPairs;
+  }
+
+  logger.log("arb_limiter_config", {
+    limiter_enabled: String(process.env.RPC_FACADE_LIMITER ?? "1"),
+    rps: Number(process.env.RPC_FACADE_RPS ?? "NaN"),
+    burst: Number(process.env.RPC_FACADE_BURST ?? "NaN"),
+    backoff_max_concurrency: Number(process.env.RPC_BACKOFF_MAX_CONCURRENCY ?? "NaN"),
+  });
+
   // Explicit boot banner (live-only)
   console.log(
     [
@@ -425,7 +451,7 @@ async function main() {
 
   // Embedded publishers (optional; auto when enabled)
   const providerEnabled = String(process.env.ENABLE_MARKET_PROVIDER ?? "0") === "1";
-  const enableEmbedded = !providerEnabled && String(process.env.ENABLE_EMBEDDED_PUBLISHERS ?? "1") === "1";
+  const enableEmbedded = String(process.env.ENABLE_EMBEDDED_PUBLISHERS ?? "1") === "1";
 
   const sup = new PublisherSupervisor({
     enable: enableEmbedded,
@@ -436,6 +462,8 @@ async function main() {
     repoRoot: path.resolve(__dirname, "..", "..", ".."),
   });
   sup.start();
+
+  const { rpcClient, rpc } = await import("@mev/rpc-facade");
 
   // Attach WS endpoint (Phoenix publisher will poll if SDK lacks subs)
   const conn = rpcClient;
@@ -489,7 +517,7 @@ async function main() {
     }
   }
 
-  startHealth(conn).catch(() => { });
+  const stopHealth = startHealth(conn);
   initRisk();
 
   // Live-only (forced above)
@@ -514,8 +542,8 @@ async function main() {
     await (liveExec as any).startPhoenix?.();
 
     const ownerPk = envOwner ?? (payer.publicKey as PublicKey);
-    const wsolAtaHint = envWsolAta ?? (accounts as any)?.atas?.wsol;
-    const usdcAtaHint = envUsdcAta ?? (accounts as any)?.atas?.usdc;
+    const wsolAtaHint = asPublicKey(envWsolAta ?? (accounts as any)?.atas?.wsol);
+    const usdcAtaHint = asPublicKey(envUsdcAta ?? (accounts as any)?.atas?.usdc);
 
     console.log(
       `START_PREF owner=${ownerPk.toBase58()} ` +
@@ -534,6 +562,8 @@ async function main() {
 
   const RAYDIUM_POOL =
     (process.env.RAYDIUM_POOL_ID ?? process.env.RAYDIUM_POOL_ID_SOL_USDC ?? "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2").trim();
+  const ORCA_POOL =
+    (process.env.ORCA_POOL_ID ?? process.env.ORCA_POOL ?? "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ").trim();
   const PHX_MARKET =
     (CFG.PHOENIX_MARKET || process.env.PHOENIX_MARKET_ID || "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg").trim();
 
@@ -541,13 +571,45 @@ async function main() {
   try { await prewarmPhoenix(conn, [PHX_MARKET]); } catch (e) { logger.log("phoenix_prewarm_error", { error: String(e) }); }
 
   let AMM_FEE_BPS = resolveFeeBps("AMM", RAYDIUM_POOL, CFG.AMM_TAKER_FEE_BPS);
-  const PHX_FEE_BPS = resolveFeeBps("PHOENIX", PHX_MARKET, CFG.PHOENIX_TAKER_FEE_BPS);
+  const cachedRayFee = getCachedRaydiumFee(RAYDIUM_POOL);
+  if (cachedRayFee != null) AMM_FEE_BPS = cachedRayFee;
+  AMM_FEE_BPS = await ensureRaydiumFee(conn, RAYDIUM_POOL, AMM_FEE_BPS);
+  process.env.RAYDIUM_TRADE_FEE_BPS = String(AMM_FEE_BPS);
+  logger.log("fee_model_ray", {
+    pool: RAYDIUM_POOL,
+    fee_bps: AMM_FEE_BPS,
+    source: "onchain",
+  });
 
-  AMM_FEE_BPS = await tryAssertRaydiumFeeBps(conn, RAYDIUM_POOL, AMM_FEE_BPS);
+  let ORCA_FEE_FALLBACK = Number(process.env.ORCA_TRADE_FEE_BPS ?? CFG.AMM_TAKER_FEE_BPS);
+  if (!Number.isFinite(ORCA_FEE_FALLBACK) || ORCA_FEE_FALLBACK <= 0) ORCA_FEE_FALLBACK = AMM_FEE_BPS;
+  let ORCA_FEE_BPS = resolveFeeBps("AMM", ORCA_POOL, ORCA_FEE_FALLBACK);
+  const cachedOrcaFee = getCachedOrcaFee(ORCA_POOL);
+  if (cachedOrcaFee != null) ORCA_FEE_BPS = cachedOrcaFee;
+  ORCA_FEE_BPS = await ensureOrcaFee(conn, ORCA_POOL, ORCA_FEE_BPS);
+  process.env.ORCA_TRADE_FEE_BPS = String(ORCA_FEE_BPS);
+  logger.log("fee_model_orca", {
+    pool: ORCA_POOL,
+    fee_bps: ORCA_FEE_BPS,
+    source: "onchain",
+  });
+
+  let PHX_FEE_BPS = resolveFeeBps("PHOENIX", PHX_MARKET, CFG.PHOENIX_TAKER_FEE_BPS);
+  const cachedPhxFee = getCachedPhoenixFee(PHX_MARKET);
+  if (cachedPhxFee != null) PHX_FEE_BPS = cachedPhxFee;
+  PHX_FEE_BPS = await ensurePhoenixFee(conn, PHX_MARKET, PHX_FEE_BPS);
+  process.env.PHOENIX_TAKER_FEE_BPS = String(PHX_FEE_BPS);
+  logger.log("fee_model_phx", {
+    market: PHX_MARKET,
+    fee_bps: PHX_FEE_BPS,
+    source: "onchain",
+  });
 
   logger.log("fee_config", {
     raydium_pool: RAYDIUM_POOL,
     amm_fee_bps: AMM_FEE_BPS,
+    orca_pool: ORCA_POOL,
+    orca_fee_bps: ORCA_FEE_BPS,
     phoenix_market: PHX_MARKET,
     phoenix_fee_bps: PHX_FEE_BPS,
   });
@@ -741,7 +803,7 @@ async function main() {
       minBase: CFG.DECISION_MIN_BASE,
       minTradeBase: CFG.DECISION_MIN_BASE,
 
-      phoenixFeeBps: resolveFeeBps("PHOENIX", PHX_MARKET, CFG.PHOENIX_TAKER_FEE_BPS),
+      phoenixFeeBps: PHX_FEE_BPS,
       ammFeeBps: AMM_FEE_BPS,
       fixedTxCostQuote: CFG.FIXED_TX_COST_QUOTE,
     },
@@ -766,19 +828,18 @@ async function main() {
   );
 
   // ──────────────────────────────────────────────────────────────────────
-  // WS Markets (live feed) → push AMM/Phoenix updates directly into joiner
+  // Market inputs (WS, provider, JSONL fallback)
   // ──────────────────────────────────────────────────────────────────────
-  // ──────────────────────────────────────────────────────────────────────
-  // WS Markets (live feed) → push AMM/Phoenix updates directly into joiner
-  // ──────────────────────────────────────────────────────────────────────
-
-  // Enable WS feed if PAIRS_JSON is present
+  const inputSources: string[] = [];
   const useWsProvider = !!process.env.PAIRS_JSON;
+  const providerFeedAmmsWhenWs = String(process.env.PROVIDER_FEED_AMMS_WITH_WS ?? process.env.PROVIDER_FEED_AMMS_WHEN_WS ?? "0").trim() === "1";
+  const providerIncludeAmms = !useWsProvider || providerFeedAmmsWhenWs;
+  let wsHandle: Awaited<ReturnType<typeof startWsMarkets>> | null = null;
 
   if (useWsProvider) {
-    console.log("edge_input_source { source: 'ws_markets' }");
+    inputSources.push("ws_markets");
     const { startWsMarkets } = await import("./provider/ws_markets.js");
-    await startWsMarkets({
+    wsHandle = await startWsMarkets({
       httpUrl: process.env.RPC_URL,
       wsUrl: process.env.RPC_WSS_URL || process.env.WSS_URL || process.env.WS_URL,
       pairsPath: process.env.PAIRS_JSON,
@@ -786,55 +847,61 @@ async function main() {
     });
   }
 
-
-  // If provider is enabled, feed the joiner directly from in-memory snapshots
-  // (disabled when WS provider is active to avoid double-feeding)
-  if (providerEnabled && marketProvider && !useWsProvider) {
-    console.log("edge_input_source { source: 'provider' }");
+  if (providerEnabled && marketProvider) {
+    inputSources.push(
+      useWsProvider && !providerIncludeAmms ? "provider(phoenix)" : "provider"
+    );
     marketProvider.subscribe((state) => {
       try {
-        // AMMs → mirror "amms_price" payload and keep LAST_CPMM fresh when reserves available
-        for (const s of state.amms) {
-          const obj = {
-            event: "amms_price",
-            symbol: "SOL/USDC",
-            venue: s.venue,
-            ammId: s.poolId,
-            poolKind: s.poolKind,
-            ts: s.lastUpdateTs,
-            baseDecimals: s.baseDecimals,
-            quoteDecimals: s.quoteDecimals,
-            px: s.price ?? undefined,
-            feeBps: s.feeBps ?? undefined,
-            base_vault: s.baseVault ?? undefined,
-            quote_vault: s.quoteVault ?? undefined,
-            base_int:
-              s.baseReserveAtoms ??
-              (s.baseReserve != null && s.baseDecimals != null
-                ? Math.trunc(s.baseReserve * 10 ** s.baseDecimals).toString()
-                : undefined),
-            quote_int:
-              s.quoteReserveAtoms ??
-              (s.quoteReserve != null && s.quoteDecimals != null
-                ? Math.trunc(s.quoteReserve * 10 ** s.quoteDecimals).toString()
-                : undefined),
-            base_ui: s.baseReserve ?? undefined,
-            quote_ui: s.quoteReserve ?? undefined,
-            slot: s.slot ?? undefined,
-            source: "provider",
-            validation_passed: s.price != null,
-          };
-          joiner.upsertAmms(obj);
+        if (providerIncludeAmms) {
+          for (const s of state.amms) {
+            const obj = {
+              event: "amms_price",
+              symbol: "SOL/USDC",
+              venue: s.venue,
+              ammId: s.poolId,
+              poolKind: s.poolKind,
+              ts: s.lastUpdateTs,
+              baseDecimals: s.baseDecimals,
+              quoteDecimals: s.quoteDecimals,
+              px: s.price ?? undefined,
+              feeBps: s.feeBps ?? undefined,
+              base_vault: s.baseVault ?? undefined,
+              quote_vault: s.quoteVault ?? undefined,
+              base_int:
+                s.baseReserveAtoms ??
+                (s.baseReserve != null && s.baseDecimals != null
+                  ? Math.trunc(s.baseReserve * 10 ** s.baseDecimals).toString()
+                  : undefined),
+              quote_int:
+                s.quoteReserveAtoms ??
+                (s.quoteReserve != null && s.quoteDecimals != null
+                  ? Math.trunc(s.quoteReserve * 10 ** s.quoteDecimals).toString()
+                  : undefined),
+              base_ui: s.baseReserve ?? undefined,
+              quote_ui: s.quoteReserve ?? undefined,
+              slot: s.slot ?? undefined,
+              source: "provider",
+              validation_passed: s.price != null,
+            };
+            joiner.upsertAmms(obj);
 
-          // update local CPMM view when we have reserves
-          try {
-            if (s.baseReserve != null && s.quoteReserve != null) {
-              LAST_CPMM = { base: s.baseReserve, quote: s.quoteReserve };
-            }
-          } catch { /* ignore */ }
+            try {
+              if (s.baseReserve != null && s.quoteReserve != null) {
+                LAST_CPMM = { base: s.baseReserve, quote: s.quoteReserve };
+              }
+            } catch { /* ignore */ }
+          }
+        } else {
+          for (const s of state.amms) {
+            try {
+              if (s.baseReserve != null && s.quoteReserve != null) {
+                LAST_CPMM = { base: s.baseReserve, quote: s.quoteReserve };
+              }
+            } catch { /* ignore */ }
+          }
         }
 
-        // Phoenix → mirror "phoenix_l2" payload and keep LAST_BOOK/LAST_PHX_MID fresh
         for (const p of state.phoenix) {
           const obj = {
             event: "phoenix_l2",
@@ -928,72 +995,88 @@ async function main() {
     POLL_MS
   );
 
-  if (!providerEnabled && !useWsProvider) {
+  let followersStarted = false;
+  if (!useWsProvider && (!providerEnabled || !marketProvider)) {
+    inputSources.push("jsonl_followers");
     await Promise.all([ammsFollower.start(), phxFollower.start()]);
-  } else {
-    console.log(`edge_input_source { source: '${providerEnabled ? "provider" : "ws_markets"}' }`);
+    followersStarted = true;
   }
 
-  // NO AUTO-STOP → run indefinitely until SIGINT/SIGTERM
+  if (inputSources.length) {
+    console.log(`edge_input_source { sources: [${inputSources.join(", ")}] }`);
+  }
 
-  // Graceful shutdown (unchanged)
-  function shutdown(signal: string) {
-    (async () => {
+  let shuttingDown = false;
+  const shutdown = async (tag: string, err?: unknown) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    try {
+      logger.log("arb_shutdown_start", {
+        tag,
+        error: err ? String((err as any)?.message ?? err) : undefined,
+      });
+    } catch { }
+
+    try { stopHealth(); } catch { }
+
+    try { await wsHandle?.close(); } catch (e) {
+      logger.log("arb_shutdown_ws_error", { err: String((e as any)?.message ?? e) });
+    }
+
+    try { joiner.close(); } catch { }
+    try { sup.stop(); } catch { }
+    try { await marketProvider?.stop(); } catch { }
+    if (followersStarted) {
       try { ammsFollower.stop(); } catch { }
       try { phxFollower.stop(); } catch { }
-      try { sup.stop(); } catch { }
-      try { await marketProvider?.stop(); } catch { }
+    }
 
+    if (!SKIP_BALANCE_READS && accounts) {
       try {
-        if (accounts) {
-          const ownerPk =
-            tryPubkey(process.env.WALLET_PUBKEY) ?? ((accounts as any).owner as PublicKey);
-          const wsolAtaHint =
-            tryPubkey(process.env.WSOL_ATA) ?? (accounts as any)?.atas?.wsol;
-          const usdcAtaHint =
-            tryPubkey(process.env.USDC_ATA) ?? (accounts as any)?.atas?.usdc;
-
-          END_BAL = await readBalances(conn, ownerPk, { wsol: wsolAtaHint, usdc: usdcAtaHint });
-          logger.log("balances_end", END_BAL);
-          console.log(`END    SOL=${END_BAL.sol}  WSOL=${END_BAL.wsol}  USDC=${END_BAL.usdc}`);
-          const dsol = roundN(END_BAL.sol - (START_BAL?.sol ?? 0), 9);
-          const dwsol = roundN(END_BAL.wsol - (START_BAL?.wsol ?? 0), 9);
-          const dusdc = roundN(END_BAL.usdc - (START_BAL?.usdc ?? 0), 6);
-          console.log(`DELTA  dSOL=${dsol}  dWSOL=${dwsol}  dUSDC=${dusdc}`);
-        }
+        const ownerPk = envOwner ?? ((accounts as any).owner as PublicKey);
+        const wsolAtaHintSafe = asPublicKey(envWsolAta ?? (accounts as any)?.atas?.wsol ?? process.env.WSOL_ATA);
+        const usdcAtaHintSafe = asPublicKey(envUsdcAta ?? (accounts as any)?.atas?.usdc ?? process.env.USDC_ATA);
+        END_BAL = await readBalances(conn, ownerPk, {
+          wsol: wsolAtaHintSafe ?? undefined,
+          usdc: usdcAtaHintSafe ?? undefined,
+        });
+        logger.log("balances_end", END_BAL);
       } catch (e) {
-        console.log("END BAL ERROR", e);
+        logger.log("balances_end_error", { err: String((e as any)?.message ?? e) });
       }
-      if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
-      logger.log("arb_shutdown", { ok: true, signal, live_only: true });
-      process.exit(0);
-    })().catch(() => {
-      if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
-      process.exit(0);
-    });
-  }
+    }
 
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("beforeExit", () => { if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE); });
-  process.on("exit", () => { if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE); });
+    if (!wroteSummary) {
+      try { writeLiveSummarySync(CFG, ML_EVENTS_FILE); wroteSummary = true; } catch { }
+    }
+
+    logger.log("arb_shutdown", { ok: !err, tag, live_only: true });
+    process.exit(err ? 1 : 0);
+  };
+
+  ["SIGINT", "SIGTERM", "SIGHUP"].forEach((sig) => {
+    process.on(sig, () => {
+      void shutdown(sig as NodeJS.Signals);
+    });
+  });
+
   process.on("uncaughtException", (e) => {
     if (isRateLimitError(e)) {
       logger.log("arb_rate_limit", { error: String(e) });
       return;
     }
-    logger.log("arb_fatal", { error: String(e) });
-    if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
-    process.exit(1);
+    console.error(e);
+    void shutdown("uncaughtException", e);
   });
-  process.on("unhandledRejection", (e) => {
-    if (isRateLimitError(e)) {
-      logger.log("arb_rate_limit", { error: String(e) });
+
+  process.on("unhandledRejection", (reason) => {
+    if (isRateLimitError(reason)) {
+      logger.log("arb_rate_limit", { error: String(reason) });
       return;
     }
-    logger.log("arb_fatal", { error: String(e) });
-    if (!wroteSummary) writeLiveSummarySync(CFG, ML_EVENTS_FILE);
-    process.exit(1);
+    console.error(reason);
+    void shutdown("unhandledRejection", reason);
   });
 }
 
