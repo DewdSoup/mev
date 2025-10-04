@@ -100,8 +100,8 @@ for var in DATA_DIR ARB_DATA_DIR ARB_REPORTS_DIR ARB_REPORTS_LIVE_DIR ARB_LIVE_D
   export "$var=$RUNTIME_ROOT"
 done
 
-export EDGE_AMMS_JSONL="$RUNTIME_ROOT/amms-runtime.jsonl"
-export EDGE_PHOENIX_JSONL="$RUNTIME_ROOT/phoenix-runtime.jsonl"
+export EDGE_AMMS_JSONL="$RUNTIME_ROOT/amms-feed.jsonl"
+export EDGE_PHOENIX_JSONL="$RUNTIME_ROOT/phoenix-feed.jsonl"
 export LOG_FILE="$RUNTIME_ROOT/arb-runtime.jsonl"
 export ML_EVENTS_FILE="$RUNTIME_ROOT/ml-events.jsonl"
 export SHADOW_TRADING=0

@@ -10,6 +10,7 @@ import type { Connection } from "@solana/web3.js";
 import { getEnabledAdapters } from "./adapters/registry.js";
 import type { AmmAdapter, ReserveSnapshot } from "./adapters/types.js";
 import { logger } from "./logger.js";
+import { getRunRoot } from "@mev/storage";
 import { rpcClient } from "@mev/rpc-facade";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -74,6 +75,17 @@ function resolveOutPath(): string {
     return explicit;
   }
 
+  let runRoot = getenv("RUN_ROOT", "").trim();
+  if (!runRoot) {
+    runRoot = getRunRoot();
+  }
+  if (runRoot) {
+    const resolved = path.join(runRoot, "amms-feed.jsonl");
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    process.env.EDGE_AMMS_JSONL = resolved;
+    return resolved;
+  }
+
   // Compute defaults relative to repo root
   const repoRoot = path.resolve(__here, "..", "..", ".."); // from packages/amms/src → repo
   const ammsDirHint = getenv("AMMS_DATA_DIR");
@@ -82,7 +94,7 @@ function resolveOutPath(): string {
     : path.join(repoRoot, "data", "amms");
 
   fs.mkdirSync(ammsDir, { recursive: true });
-  return path.join(ammsDir, "runtime.jsonl");
+  return path.join(ammsDir, "feed.jsonl");
 }
 
 class JsonlWriter {

@@ -62,6 +62,7 @@ const MIN_ORCA_BASE_SIZE = Number(process.env.MIN_ORCA_BASE_SIZE ?? "0.000001");
 const CLMM_PREFER_ADAPTER = envTrue("CLMM_PREFER_ADAPTER", false);
 const RATE_LIMIT_BACKOFF_MS = Math.max(250, Number(process.env.RATE_LIMIT_BACKOFF_MS ?? 1500));
 const MIN_PRICE_DELTA_BPS = Math.max(0, Number(process.env.MIN_PRICE_DELTA_BPS ?? 1));
+const ALLOW_STALE_DECISIONS = envTrue("ALLOW_STALE_DECISIONS", true);
 
 // ────────────────────────────────────────────────────────────────────────────
 // Staleness guard (inline helper)
@@ -167,6 +168,9 @@ type AmmSnap = {
   reserves?: { base: number; quote: number; baseDecimals: number; quoteDecimals: number };
   feeBps: number;
   poolKind?: string;
+  degraded?: boolean;
+  degradedReason?: string | null;
+  stale?: boolean;
 };
 
 // Unified node abstraction for 2-leg paths
@@ -812,31 +816,33 @@ export class EdgeJoiner {
   }): Promise<PathCandidate | null> {
     const { nodeSrc, nodeDst, path, bid, ask, midRef, trackAmmAmm, execAmmAmm, latestAmm } = args;
 
-    const pickedSize = this.pickTradeSize({ path, nodeSrc, nodeDst, refPx: midRef });
-    if (!(pickedSize && pickedSize > 0)) {
+    const describeNode = (node: VenueNode): string =>
+      node.kind === "amm" ? `${node.amm.venue}:${node.amm.ammId}` : node.id;
+
+    const logPathSkip = (reason: string, extras?: Record<string, unknown>) => {
       try {
-        logger.log("size_probe_skip", {
+        logger.log("path_candidate_skip", {
           symbol: this.symbol,
           path,
-          reason: "size_not_available",
-          src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
-          dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
+          src: describeNode(nodeSrc),
+          dst: describeNode(nodeDst),
+          reason,
+          ...(extras ?? {}),
         });
-      } catch { /* noop */ }
+      } catch {
+        /* ignore */
+      }
+    };
+
+    const pickedSize = this.pickTradeSize({ path, nodeSrc, nodeDst, refPx: midRef });
+    if (!(pickedSize && pickedSize > 0)) {
+      logPathSkip("size_not_available");
       return null;
     }
 
     const adjusted = this.enforceVenueMinSize(pickedSize, nodeSrc, nodeDst);
     if (!(adjusted && adjusted > 0)) {
-      try {
-        logger.log("size_probe_skip", {
-          symbol: this.symbol,
-          path,
-          reason: "size_adjustment_failed",
-          src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
-          dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
-        });
-      } catch { /* noop */ }
+      logPathSkip("size_adjustment_failed");
       return null;
     }
 
@@ -859,7 +865,15 @@ export class EdgeJoiner {
     const buyPx = qBuy.px;
     const sellPx = qSell.px;
 
-    if (buyPx == null || sellPx == null) return null;
+    if (buyPx == null || sellPx == null) {
+      logPathSkip("quote_missing", {
+        buy_origin: qBuy.used,
+        sell_origin: qSell.used,
+        buy_meta: qBuy.meta ?? null,
+        sell_meta: qSell.meta ?? null,
+      });
+      return null;
+    }
 
     const pnl = (sellPx - buyPx) * size - this.P.fixedTxCostQuote;
     const notional = buyPx * size;
@@ -908,6 +922,11 @@ export class EdgeJoiner {
         dst_origin: qSell.used,
         src_fee_bps: qBuy.feeBps,
         dst_fee_bps: qSell.feeBps,
+        expected_pnl: pnl,
+        notional_quote: notional,
+      });
+      logPathSkip(ok.reason ?? "validation_failed", {
+        edge_bps_net: bpsNet,
         expected_pnl: pnl,
         notional_quote: notional,
       });
@@ -1279,22 +1298,49 @@ export class EdgeJoiner {
         AMM_SNAPSHOT_FALLBACK_AGE_MS,
         this.C.bookTtlMs
       );
+      let snapshot: AmmSnap | null = null;
       if (!freshness.ok) {
-        logger.log("amm_snapshot_ignored", {
-          venue: a.venue,
-          ammId: a.ammId,
-          reason: freshness.reason,
-          ts: a.ts,
-          slot: a.slot ?? null,
-          phoenix_slot: this.phxSlot ?? null,
-          slot_skew: freshness.skew,
-          age_ms: freshness.ageMs,
-        });
-        staleAmms.push({ snap: a, reason: freshness.reason ?? "stale", skew: freshness.skew, ageMs: freshness.ageMs });
-        continue;
+        const reason = freshness.reason ?? "stale";
+        const canUseStale = ALLOW_STALE_DECISIONS && (
+          reason.startsWith("slot_skew") ||
+          reason.startsWith("age_ms") ||
+          reason.includes("slot") ||
+          reason.includes("age")
+        );
+        if (canUseStale) {
+          const degraded: AmmSnap = { ...a, degraded: true, degradedReason: reason };
+          degraded.stale = true;
+          logger.log("amm_snapshot_degraded", {
+            venue: degraded.venue,
+            ammId: degraded.ammId,
+            reason,
+            ts: degraded.ts,
+            slot: degraded.slot ?? null,
+            phoenix_slot: this.phxSlot ?? null,
+            slot_skew: freshness.skew,
+            age_ms: freshness.ageMs,
+          });
+          snapshot = degraded;
+        } else {
+          logger.log("amm_snapshot_ignored", {
+            venue: a.venue,
+            ammId: a.ammId,
+            reason,
+            ts: a.ts,
+            slot: a.slot ?? null,
+            phoenix_slot: this.phxSlot ?? null,
+            slot_skew: freshness.skew,
+            age_ms: freshness.ageMs,
+          });
+          staleAmms.push({ snap: a, reason, skew: freshness.skew, ageMs: freshness.ageMs });
+          continue;
+        }
+      } else {
+        snapshot = a;
       }
-      if (this.allowedPools.size && !this.allowedPools.has(`${a.venue}:${a.ammId}`)) continue;
-      freshAmms.push(a);
+      if (!snapshot) continue;
+      if (this.allowedPools.size && !this.allowedPools.has(`${snapshot.venue}:${snapshot.ammId}`)) continue;
+      freshAmms.push(snapshot);
     }
     const validAmms: AmmSnap[] = freshAmms;
 
@@ -1412,6 +1458,7 @@ export class EdgeJoiner {
       "AMM->PHX": 0,
       "AMM->AMM": 0,
     };
+    const bestPerPath = new Map<PathCandidate["path"], PathCandidate>();
 
     for (const nodeSrc of nodes) {
       for (const nodeDst of nodes) {
@@ -1442,8 +1489,60 @@ export class EdgeJoiner {
         if (candidate) {
           pathStats[path] = (pathStats[path] ?? 0) + 1;
           candidates.push(candidate);
+          const prevBest = bestPerPath.get(path);
+          if (!prevBest || candidate.pnlNet > prevBest.pnlNet) {
+            bestPerPath.set(path, candidate);
+          }
         }
       }
+    }
+
+    try {
+      const paths: Record<string, unknown> = {};
+      const summarizeCandidate = (path: PathCandidate["path"], cand: PathCandidate | undefined, count: number) => {
+        const key = path === "PHX->AMM"
+          ? "phx_to_amm"
+          : path === "AMM->PHX"
+            ? "amm_to_phx"
+            : "amm_to_amm";
+
+        if (!cand) {
+          paths[key] = { available: false, candidates: count };
+          return;
+        }
+
+        const summary: Record<string, unknown> = {
+          available: true,
+          candidates: count,
+          edge_bps_net: round(cand.bpsNet, 4),
+          pnl_quote: round(cand.pnlNet, 6),
+          size_base: round(cand.size, 9),
+        };
+
+        if (path === "PHX->AMM") {
+          summary.src = "phoenix";
+          summary.dst = `${cand.amm.venue}:${cand.amm.ammId}`;
+        } else if (path === "AMM->PHX") {
+          summary.src = `${cand.amm.venue}:${cand.amm.ammId}`;
+          summary.dst = "phoenix";
+        } else {
+          summary.src = `${cand.amm.venue}:${cand.amm.ammId}`;
+          summary.dst = cand.ammDst ? `${cand.ammDst.venue}:${cand.ammDst.ammId}` : "unknown";
+        }
+
+        paths[key] = summary;
+      };
+
+      summarizeCandidate("PHX->AMM", bestPerPath.get("PHX->AMM"), pathStats["PHX->AMM"] ?? 0);
+      summarizeCandidate("AMM->PHX", bestPerPath.get("AMM->PHX"), pathStats["AMM->PHX"] ?? 0);
+      summarizeCandidate("AMM->AMM", bestPerPath.get("AMM->AMM"), pathStats["AMM->AMM"] ?? 0);
+
+      logger.log("path_best_snapshot", {
+        symbol: this.symbol,
+        ...paths,
+      });
+    } catch {
+      /* ignore logging failures */
     }
 
     try {

@@ -606,6 +606,7 @@ class ReadonlyWallet {
 
 let orcaCtxCache: Promise<{ ctx: WhirlpoolContext; programId: PublicKey }> | null = null;
 let orcaClientCache: Promise<ReturnType<typeof buildWhirlpoolClient>> | null = null;
+const ORCA_ABSURD_IMPACT_BPS = Number(process.env.ORCA_ABSURD_IMPACT_BPS ?? 100_000);
 
 async function getOrcaContext(): Promise<{ ctx: WhirlpoolContext; client: ReturnType<typeof buildWhirlpoolClient>; programId: PublicKey }> {
   if (!orcaCtxCache) {
@@ -720,6 +721,26 @@ export async function quoteOrcaWhirlpool(args: QuoteArgs): Promise<QuoteResult> 
         estimatedEndTick: quote.estimatedEndTickIndex,
       };
 
+      const impact = typeof meta.priceImpactBps === "number" ? meta.priceImpactBps : null;
+      if (impact != null && Math.abs(impact) > ORCA_ABSURD_IMPACT_BPS) {
+        logger.log("orca_whirlpool_quote_rejected", {
+          pool: args.poolId,
+          side: args.side,
+          size_base: args.sizeBase,
+          reason: "absurd_price_impact",
+          price_impact_bps: impact,
+          estimated_end_tick: meta.estimatedEndTick,
+        });
+        return {
+          ok: false,
+          err: "missing_tick_array",
+          meta: {
+            priceImpactBps: impact,
+            estimatedEndTick: meta.estimatedEndTick,
+          },
+        };
+      }
+
       const quoteResult: QuoteResult = { ok: true, price, feeBps, meta };
       rememberQuote(key, quoteResult);
       return quoteResult;
@@ -762,6 +783,26 @@ export async function quoteOrcaWhirlpool(args: QuoteArgs): Promise<QuoteResult> 
       })(),
       estimatedEndTick: quote.estimatedEndTickIndex,
     };
+
+    const impact = typeof meta.priceImpactBps === "number" ? meta.priceImpactBps : null;
+    if (impact != null && Math.abs(impact) > ORCA_ABSURD_IMPACT_BPS) {
+      logger.log("orca_whirlpool_quote_rejected", {
+        pool: args.poolId,
+        side: args.side,
+        size_base: args.sizeBase,
+        reason: "absurd_price_impact",
+        price_impact_bps: impact,
+        estimated_end_tick: meta.estimatedEndTick,
+      });
+      return {
+        ok: false,
+        err: "missing_tick_array",
+        meta: {
+          priceImpactBps: impact,
+          estimatedEndTick: meta.estimatedEndTick,
+        },
+      };
+    }
 
     const quoteResult: QuoteResult = { ok: true, price, feeBps, meta };
     rememberQuote(key, quoteResult);

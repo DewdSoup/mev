@@ -25,16 +25,16 @@ import type {
 } from "./types.js";
 import { getPhoenixClient, ensurePhoenixMarketState } from "../util/phoenix.js";
 
-const DEFAULT_REFRESH_MS = Number(process.env.MARKET_PROVIDER_REFRESH_MS ?? 1_000);
+const DEFAULT_REFRESH_MS = Number(process.env.MARKET_PROVIDER_REFRESH_MS ?? 600);
 const DEFAULT_REFRESH_DEBOUNCE_MS = Number(
   process.env.AMM_REFRESH_DEBOUNCE_MS ??
   process.env.MARKET_PROVIDER_REFRESH_DEBOUNCE_MS ??
-  350
+  150
 );
 const DEFAULT_AMM_BATCH_MAX = Number(process.env.AMM_BATCH_MAX_ACCOUNTS ?? 64);
 const DEFAULT_PHOENIX_REFRESH_MS = Number(process.env.MARKET_PROVIDER_PHOENIX_REFRESH_MS ?? 1_000);
-const DEFAULT_STALE_MS = Number(process.env.MARKET_PROVIDER_STALE_MS ?? 5_000);
-const DEFAULT_SNAPSHOT_TTL_MS = Number(process.env.AMM_SNAPSHOT_TTL_MS ?? DEFAULT_STALE_MS);
+const DEFAULT_STALE_MS = Number(process.env.MARKET_PROVIDER_STALE_MS ?? 6_000);
+const DEFAULT_SNAPSHOT_TTL_MS = Number(process.env.AMM_SNAPSHOT_TTL_MS ?? DEFAULT_STALE_MS ?? 6_000);
 const DEFAULT_PHOENIX_DEPTH = Number(process.env.MARKET_PROVIDER_PHOENIX_DEPTH ?? 3);
 const DEFAULT_TELEMETRY_MS = Number(process.env.MARKET_PROVIDER_TELEMETRY_MS ?? 15_000);
 
@@ -77,6 +77,31 @@ class JsonlWriter {
   }
 }
 
+class TextWriter {
+  private stream: fs.WriteStream | null = null;
+  constructor(private readonly filePath: string) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, "");
+    this.stream = fs.createWriteStream(filePath, {
+      flags: "a",
+      encoding: "utf8",
+      mode: 0o644,
+    });
+  }
+  write(line: string) {
+    if (!this.stream) return;
+    try {
+      this.stream.write(line + "\n");
+    } catch (err) {
+      logger.log("market_provider_text_writer_error", { err: String((err as any)?.message ?? err) });
+    }
+  }
+  close() {
+    try { this.stream?.end(); } catch { /* noop */ }
+    this.stream = null;
+  }
+}
+
 export class MarketStateProvider {
   private readonly conn: Connection;
   private readonly pairs: PairSpec[];
@@ -97,6 +122,15 @@ export class MarketStateProvider {
   private readonly phoenixSubs = new Map<string, number>();
   private readonly accountSubs = new Map<number, string>();
   private readonly phoenixInflight = new Map<string, Promise<void>>();
+
+  private readonly snapshotLogBps: number;
+  private readonly snapshotLogHeartbeatMs: number;
+  private readonly snapshotLogLastTs = new Map<string, number>();
+  private readonly phoenixLogLastTs = new Map<string, number>();
+  private readonly refreshLogCooldownMs: number;
+  private lastRefreshLogTs = 0;
+  private readonly phoenixLogCooldownMs: number;
+  private lastPhoenixLogTs = 0;
 
   private emitScheduled = false;
 
@@ -120,6 +154,7 @@ export class MarketStateProvider {
   private phoenixTimer: NodeJS.Timeout | null = null;
 
   private ammsWriter: JsonlWriter | null = null;
+  private ammsTextWriter: TextWriter | null = null;
   private phoenixWriter: JsonlWriter | null = null;
 
   private started = false;
@@ -140,6 +175,18 @@ export class MarketStateProvider {
     } as Required<MarketProviderConfig>;
     this.trackedPools = this.collectPools();
     this.trackedMarkets = this.collectMarkets();
+
+    const logBpsRaw = Number(process.env.MARKET_PROVIDER_SNAPSHOT_LOG_BPS ?? 0.5);
+    this.snapshotLogBps = Number.isFinite(logBpsRaw) && logBpsRaw >= 0 ? logBpsRaw : 0.5;
+
+    const heartbeatRaw = Number(process.env.MARKET_PROVIDER_SNAPSHOT_LOG_HEARTBEAT_MS ?? 15_000);
+    this.snapshotLogHeartbeatMs = Number.isFinite(heartbeatRaw) && heartbeatRaw >= 0 ? heartbeatRaw : 15_000;
+
+    const refreshCooldownRaw = Number(process.env.MARKET_PROVIDER_REFRESH_LOG_COOLDOWN_MS ?? this.config.refreshMs);
+    this.refreshLogCooldownMs = Number.isFinite(refreshCooldownRaw) && refreshCooldownRaw >= 0 ? refreshCooldownRaw : this.config.refreshMs;
+
+    const phoenixCooldownRaw = Number(process.env.MARKET_PROVIDER_PHOENIX_LOG_COOLDOWN_MS ?? this.config.phoenixRefreshMs);
+    this.phoenixLogCooldownMs = Number.isFinite(phoenixCooldownRaw) && phoenixCooldownRaw >= 0 ? phoenixCooldownRaw : this.config.phoenixRefreshMs;
   }
 
   getTrackedPools(): TrackedPoolMeta[] {
@@ -169,7 +216,29 @@ export class MarketStateProvider {
     if (this.started) return;
     this.started = true;
 
+    try {
+      const poolDetails = this.trackedPools.map((pool) => ({
+        pool: pool.poolId,
+        venue: pool.venue,
+        pool_kind: pool.poolKind,
+        fee_hint: Number.isFinite(pool.feeHint) ? pool.feeHint : undefined,
+      }));
+      const marketDetails = this.trackedMarkets.map((m) => ({ market: m.market, symbol: m.symbol }));
+      logger.log("market_provider_tracking", {
+        pools_tracked: poolDetails.length,
+        markets_tracked: marketDetails.length,
+        refresh_ms: this.config.refreshMs,
+        phoenix_refresh_ms: this.config.phoenixRefreshMs,
+        snapshot_ttl_ms: this.config.snapshotTtlMs,
+        pools: poolDetails,
+        markets: marketDetails,
+      });
+    } catch {
+      /* logging best-effort */
+    }
+
     this.ammsWriter = new JsonlWriter(resolveAmmsPath());
+    this.ammsTextWriter = new TextWriter(resolveAmmsTextPath());
     this.phoenixWriter = new JsonlWriter(resolvePhoenixPath());
 
     await this.warmupAccounts();
@@ -233,6 +302,8 @@ export class MarketStateProvider {
     this.phoenixClient = null;
 
     this.ammsWriter?.close();
+    this.ammsTextWriter?.close();
+    this.ammsTextWriter = null;
     this.phoenixWriter?.close();
 
     this.started = false;
@@ -407,6 +478,7 @@ export class MarketStateProvider {
   }
 
   private commitAmmSnapshot(pool: TrackedPoolMeta, snap: AmmSnapshot, slot: number | null): void {
+    const prev = this.amms.get(pool.poolId);
     const now = Date.now();
     snap.lastUpdateTs = now;
     snap.slot = slot ?? snap.slot ?? null;
@@ -419,7 +491,170 @@ export class MarketStateProvider {
     this.clearAmmDegraded(pool.poolId);
     this.amms.set(pool.poolId, snap);
     this.ammsWriter?.write("amms_price", serializeAmmSnapshot(snap));
+    try {
+      const slotStr = snap.slot != null ? ` slot=${snap.slot}` : "";
+      const feeStr = snap.feeBps != null ? ` fee_bps=${snap.feeBps}` : "";
+      const priceStr = snap.price != null ? `${snap.price}` : "NaN";
+      this.ammsTextWriter?.write(
+        `${new Date(now).toISOString()} venue=${snap.venue} pool=${pool.poolId} price=${priceStr}${slotStr}${feeStr}`
+      );
+    } catch {
+      /* best-effort */
+    }
+    this.logAmmSnapshotChange(pool, prev ?? null, snap);
     this.requestEmit();
+  }
+
+  private logAmmSnapshotChange(pool: TrackedPoolMeta, prev: AmmSnapshot | null, snap: AmmSnapshot): void {
+    const poolId = pool.poolId;
+    const now = Date.now();
+    const lastLogged = this.snapshotLogLastTs.get(poolId) ?? 0;
+    const heartbeatDue = this.snapshotLogHeartbeatMs > 0 && now - lastLogged >= this.snapshotLogHeartbeatMs;
+
+    const reasons: string[] = [];
+    if (!prev) reasons.push("initial");
+
+    const prevSlot = prev?.slot ?? null;
+    if (snap.slot != null && snap.slot !== prevSlot) reasons.push("slot");
+
+    if (snap.feeBps != null && snap.feeBps !== (prev?.feeBps ?? null)) reasons.push("fee");
+
+    let priceDeltaBps: number | null = null;
+    if (
+      prev?.price != null && prev.price > 0 &&
+      snap.price != null && snap.price > 0
+    ) {
+      priceDeltaBps = Math.abs((snap.price / prev.price) - 1) * 10_000;
+      if (priceDeltaBps >= this.snapshotLogBps) {
+        reasons.push(`price_${priceDeltaBps.toFixed(3)}bps`);
+      }
+    } else if (prev && prev?.price !== snap.price) {
+      reasons.push("price_change");
+    }
+
+    const prevTs = prev?.lastUpdateTs ?? 0;
+    if (!prev && !reasons.length) reasons.push("initial");
+    if (prevTs && now - prevTs > this.snapshotLogHeartbeatMs * 2 && !reasons.length) {
+      reasons.push("resync");
+    }
+    if (heartbeatDue && !reasons.length) reasons.push("heartbeat");
+
+    if (!reasons.length) return;
+
+    this.snapshotLogLastTs.set(poolId, now);
+
+    const payload: Record<string, unknown> = {
+      pool: poolId,
+      venue: snap.venue,
+      pool_kind: snap.poolKind,
+      slot: snap.slot ?? null,
+      reasons,
+    };
+
+    if (snap.feeBps != null && Number.isFinite(snap.feeBps)) payload.fee_bps = snap.feeBps;
+    if (snap.price != null && Number.isFinite(snap.price)) payload.price = snap.price;
+    if (priceDeltaBps != null && Number.isFinite(priceDeltaBps)) {
+      payload.price_delta_bps = Number(priceDeltaBps.toFixed(4));
+    }
+
+    const slotLag = this.lastSlotSeen != null && snap.slot != null
+      ? this.lastSlotSeen - snap.slot
+      : null;
+    if (slotLag != null && Number.isFinite(slotLag)) payload.slot_lag = slotLag;
+
+    const baseReserve = typeof snap.baseReserve === "number" && Number.isFinite(snap.baseReserve)
+      ? snap.baseReserve
+      : typeof snap.baseReserveUi === "number" && Number.isFinite(snap.baseReserveUi)
+        ? snap.baseReserveUi
+        : undefined;
+    if (baseReserve !== undefined) payload.base_reserve = baseReserve;
+
+    const quoteReserve = typeof snap.quoteReserve === "number" && Number.isFinite(snap.quoteReserve)
+      ? snap.quoteReserve
+      : typeof snap.quoteReserveUi === "number" && Number.isFinite(snap.quoteReserveUi)
+        ? snap.quoteReserveUi
+        : undefined;
+    if (quoteReserve !== undefined) payload.quote_reserve = quoteReserve;
+
+    logger.log("market_provider_snapshot", payload);
+  }
+
+  private logPhoenixSnapshotChange(prev: PhoenixSnapshot | null, snap: PhoenixSnapshot): void {
+    const market = snap.market;
+    const now = Date.now();
+    const lastLogged = this.phoenixLogLastTs.get(market) ?? 0;
+    const heartbeatDue = this.snapshotLogHeartbeatMs > 0 && now - lastLogged >= this.snapshotLogHeartbeatMs;
+
+    const reasons: string[] = [];
+    if (!prev) reasons.push("initial");
+
+    const deltas: Record<string, number> = {};
+
+    if (
+      prev?.bestBid != null && prev.bestBid > 0 &&
+      snap.bestBid != null && snap.bestBid > 0
+    ) {
+      const delta = Math.abs((snap.bestBid / prev.bestBid) - 1) * 10_000;
+      if (delta >= this.snapshotLogBps) {
+        reasons.push(`bid_${delta.toFixed(3)}bps`);
+        deltas.bid_delta_bps = Number(delta.toFixed(4));
+      }
+    } else if (prev && prev?.bestBid !== snap.bestBid) {
+      reasons.push("bid_change");
+    }
+
+    if (
+      prev?.bestAsk != null && prev.bestAsk > 0 &&
+      snap.bestAsk != null && snap.bestAsk > 0
+    ) {
+      const delta = Math.abs((snap.bestAsk / prev.bestAsk) - 1) * 10_000;
+      if (delta >= this.snapshotLogBps) {
+        reasons.push(`ask_${delta.toFixed(3)}bps`);
+        deltas.ask_delta_bps = Number(delta.toFixed(4));
+      }
+    } else if (prev && prev?.bestAsk !== snap.bestAsk) {
+      reasons.push("ask_change");
+    }
+
+    if (
+      prev?.mid != null && prev.mid > 0 &&
+      snap.mid != null && snap.mid > 0
+    ) {
+      const delta = Math.abs((snap.mid / prev.mid) - 1) * 10_000;
+      if (delta >= this.snapshotLogBps) {
+        reasons.push(`mid_${delta.toFixed(3)}bps`);
+        deltas.mid_delta_bps = Number(delta.toFixed(4));
+      }
+    } else if (prev && prev?.mid !== snap.mid) {
+      reasons.push("mid_change");
+    }
+
+    if (heartbeatDue && !reasons.length) reasons.push("heartbeat");
+    if (!reasons.length) return;
+
+    this.phoenixLogLastTs.set(market, now);
+
+    const payload: Record<string, unknown> = {
+      market,
+      symbol: snap.symbol,
+      slot: snap.slot ?? null,
+      reasons,
+    };
+
+    if (snap.bestBid != null && Number.isFinite(snap.bestBid)) payload.best_bid = snap.bestBid;
+    if (snap.bestAsk != null && Number.isFinite(snap.bestAsk)) payload.best_ask = snap.bestAsk;
+    if (snap.mid != null && Number.isFinite(snap.mid)) payload.mid = snap.mid;
+
+    if (snap.levelsBids?.[0]?.qty != null && Number.isFinite(snap.levelsBids[0].qty)) {
+      payload.best_bid_qty = snap.levelsBids[0].qty;
+    }
+    if (snap.levelsAsks?.[0]?.qty != null && Number.isFinite(snap.levelsAsks[0].qty)) {
+      payload.best_ask_qty = snap.levelsAsks[0].qty;
+    }
+
+    Object.assign(payload, deltas);
+
+    logger.log("market_provider_phoenix_snapshot", payload);
   }
 
   private setAmmDegraded(poolId: string, reason: string): void {
@@ -822,6 +1057,7 @@ export class MarketStateProvider {
         this.phoenixSnapshots.set(market, snap);
         this.phoenixWriter?.write("phoenix_mid", serializePhoenixMid(snap));
         this.phoenixWriter?.write("phoenix_l2", serializePhoenixL2(snap));
+        this.logPhoenixSnapshotChange(prev ?? null, snap);
         this.requestEmit();
       } catch (err) {
         const isRateLimit = this.isRateLimitError(err);
@@ -874,6 +1110,7 @@ export class MarketStateProvider {
       if (allFresh) {
         this.updateSnapshotHealth();
         this.emitState();
+        this.maybeLogRefreshSummary(reason, slot ?? null, { skipped: true });
         return;
       }
     }
@@ -892,6 +1129,7 @@ export class MarketStateProvider {
 
       if (!this.trackedPools.length) {
         this.updateSnapshotHealth();
+        this.refreshStats.lastDurationMs = Date.now() - start;
         return;
       }
 
@@ -915,6 +1153,7 @@ export class MarketStateProvider {
         });
         if (isRateLimit) this.scheduleBackoff("amm", this.config.refreshMs * 2);
         this.updateSnapshotHealth();
+        this.refreshStats.lastDurationMs = Date.now() - start;
         return;
       }
 
@@ -1025,31 +1264,43 @@ export class MarketStateProvider {
         this.pendingSlot = null;
         if (stillDegraded) this.scheduleAmmRefresh(pending, "pending");
       }
+      this.maybeLogRefreshSummary(reason, slot ?? null);
     }
 
     for (const pool of this.trackedPools) this.ensurePoolSubscriptions(pool);
   }
 
   private async refreshPhoenix(force = false): Promise<void> {
-    if (!this.trackedMarkets.length) return;
-    if (!force && Date.now() < this.phoenixBackoffUntil) return;
+    if (!this.trackedMarkets.length) {
+      this.maybeLogPhoenixSummary("no_markets", { skipped: true, force: true });
+      return;
+    }
+    if (!force && Date.now() < this.phoenixBackoffUntil) {
+      this.maybeLogPhoenixSummary("backoff", { skipped: true });
+      return;
+    }
     if (!this.phoenixClient || force) {
       try {
         const seeds = this.trackedMarkets.map(({ market }) => market);
         this.phoenixClient = await getPhoenixClient(this.conn, seeds);
       } catch (err) {
-        logger.log("market_provider_phoenix_connect_error", { err: String((err as any)?.message ?? err) });
+        const msg = String((err as any)?.message ?? err);
+        logger.log("market_provider_phoenix_connect_error", { err: msg });
         this.phoenixClient = null;
         this.scheduleBackoff("phoenix", this.config.phoenixRefreshMs * 2);
+        this.maybeLogPhoenixSummary("connect_error", { error: msg, force: true });
         return;
       }
     }
+
+    const start = Date.now();
 
     await Promise.all(
       this.trackedMarkets.map(({ market, symbol }) =>
         this.refreshPhoenixMarket(market, symbol, null, force)
       )
     );
+    this.maybeLogPhoenixSummary(force ? "forced" : "scheduled", { duration_ms: Date.now() - start });
     for (const { market, symbol } of this.trackedMarkets) this.ensurePhoenixSubscription(market, symbol);
     this.updateSnapshotHealth();
     this.emitState();
@@ -1339,15 +1590,125 @@ export class MarketStateProvider {
     }
   }
 
+  private summarizeAmmHealth(): { total: number; stale: number; degraded: number; healthy: number; missing: number } {
+    const now = Date.now();
+    const ttl = this.config.snapshotTtlMs;
+    const tracked = this.trackedPools;
+    const trackedSet = new Set(tracked.map((pool) => pool.poolId));
+
+    let stale = 0;
+    let missing = 0;
+    for (const pool of tracked) {
+      const snap = this.amms.get(pool.poolId);
+      if (!snap) {
+        missing += 1;
+        stale += 1;
+        continue;
+      }
+      const age = now - (snap.lastUpdateTs ?? 0);
+      const isStale = snap.stale || (ttl > 0 && age > ttl);
+      if (isStale) stale += 1;
+    }
+
+    let degraded = 0;
+    for (const poolId of this.ammDegradedReasons.keys()) {
+      if (trackedSet.has(poolId)) degraded += 1;
+    }
+
+    const total = tracked.length;
+    const healthy = Math.max(total - stale - degraded, 0);
+    return { total, stale, degraded, healthy, missing };
+  }
+
+  private summarizePhoenixHealth(): { total: number; stale: number; healthy: number; missing: number } {
+    const now = Date.now();
+    const ttl = this.config.staleMs;
+    const tracked = this.trackedMarkets;
+
+    let stale = 0;
+    let missing = 0;
+    for (const { market } of tracked) {
+      const snap = this.phoenixSnapshots.get(market);
+      if (!snap) {
+        missing += 1;
+        stale += 1;
+        continue;
+      }
+      const age = now - (snap.lastUpdateTs ?? 0);
+      const isStale = snap.stale || (ttl > 0 && age > ttl);
+      if (isStale) stale += 1;
+    }
+
+    const total = tracked.length;
+    const healthy = Math.max(total - stale, 0);
+    return { total, stale, healthy, missing };
+  }
+
+  private maybeLogRefreshSummary(reason: string, slot: number | null, extra: Record<string, unknown> = {}): void {
+    const now = Date.now();
+    const forceLog = ((extra as any)?.force === true);
+    if (!forceLog && this.refreshLogCooldownMs > 0 && now - this.lastRefreshLogTs < this.refreshLogCooldownMs) {
+      return;
+    }
+    this.lastRefreshLogTs = now;
+
+    const ammHealth = this.summarizeAmmHealth();
+    const payload: Record<string, unknown> = {
+      reason,
+      slot: slot ?? null,
+      batches: this.refreshStats.batches,
+    };
+
+    if (this.refreshStats.lastDurationMs) payload.duration_ms = this.refreshStats.lastDurationMs;
+    if (this.refreshStats.errors) payload.errors = this.refreshStats.errors;
+    if (this.refreshStats.rateLimited) payload.rate_limited = this.refreshStats.rateLimited;
+
+    payload.pools_tracked = ammHealth.total;
+    payload.pools_healthy = Math.max(ammHealth.total - ammHealth.stale - ammHealth.degraded, 0);
+    if (ammHealth.stale) payload.pools_stale = ammHealth.stale;
+    if (ammHealth.degraded) payload.pools_degraded = ammHealth.degraded;
+    if (ammHealth.missing) payload.pools_missing = ammHealth.missing;
+
+    const extras = { ...extra };
+    delete (extras as any).force;
+    if (Object.keys(extras).length) Object.assign(payload, extras);
+
+    logger.log("market_provider_refresh", payload);
+  }
+
+  private maybeLogPhoenixSummary(reason: string, extra: Record<string, unknown> = {}): void {
+    const now = Date.now();
+    const forceLog = ((extra as any)?.force === true);
+    if (!forceLog && this.phoenixLogCooldownMs > 0 && now - this.lastPhoenixLogTs < this.phoenixLogCooldownMs) {
+      return;
+    }
+    this.lastPhoenixLogTs = now;
+
+    const health = this.summarizePhoenixHealth();
+    const payload: Record<string, unknown> = {
+      reason,
+      markets_tracked: health.total,
+      markets_healthy: health.healthy,
+    };
+    if (health.stale) payload.markets_stale = health.stale;
+    if (health.missing) payload.markets_missing = health.missing;
+
+    const extras = { ...extra };
+    delete (extras as any).force;
+    if (Object.keys(extras).length) Object.assign(payload, extras);
+
+    logger.log("market_provider_phoenix_refresh", payload);
+  }
+
   private emitTelemetry(): void {
     const now = Date.now();
     const totalAmms = this.amms.size;
     const totalPhoenix = this.phoenixSnapshots.size;
-
-    // Count health status
-    const staleAmms = Array.from(this.amms.values()).filter(snap => snap.stale).length;
-    const degradedAmms = Array.from(this.amms.values()).filter(snap => snap.degraded).length;
-    const stalePhoenix = Array.from(this.phoenixSnapshots.values()).filter(snap => snap.stale).length;
+    const ammHealth = this.summarizeAmmHealth();
+    const phoenixHealth = this.summarizePhoenixHealth();
+    const staleAmms = ammHealth.stale;
+    const degradedAmms = ammHealth.degraded;
+    const stalePhoenix = phoenixHealth.stale;
 
     // Subscription counts
     const activeSubs = this.accountSubs.size;
@@ -1355,10 +1716,10 @@ export class MarketStateProvider {
     const activePhoenixSubs = this.phoenixSubs.size;
 
     // Degraded pool details
-    const degradedPools = Array.from(this.ammDegradedReasons.entries()).map(([poolId, reason]) => ({
-      poolId,
-      reason
-    }));
+    const trackedPoolSet = new Set(this.trackedPools.map((p) => p.poolId));
+    const degradedPools = Array.from(this.ammDegradedReasons.entries())
+      .filter(([poolId]) => trackedPoolSet.has(poolId))
+      .map(([poolId, reason]) => ({ poolId, reason }));
 
     // Calculate backoff times remaining
     const ammBackoffMs = this.ammBackoffUntil > now ? this.ammBackoffUntil - now : 0;
@@ -1369,14 +1730,18 @@ export class MarketStateProvider {
       slot: this.lastSlotSeen,
       amms: {
         total: totalAmms,
+        tracked: ammHealth.total,
         stale: staleAmms,
         degraded: degradedAmms,
-        healthy: totalAmms - staleAmms - degradedAmms
+        healthy: Math.max(ammHealth.total - staleAmms - degradedAmms, 0),
+        missing: ammHealth.missing,
       },
       phoenix: {
         total: totalPhoenix,
+        tracked: phoenixHealth.total,
         stale: stalePhoenix,
-        healthy: totalPhoenix - stalePhoenix
+        healthy: Math.max(phoenixHealth.total - stalePhoenix, 0),
+        missing: phoenixHealth.missing,
       },
       subscriptions: {
         accounts: activeSubs,
@@ -1444,11 +1809,28 @@ function resolveAmmsPath(): string {
   }
   const runRoot = (process.env.RUN_ROOT ?? "").trim();
   if (runRoot) {
-    const resolved = path.resolve(process.cwd(), runRoot, "amms-runtime.jsonl");
+    const resolved = path.resolve(process.cwd(), runRoot, "amms-feed.jsonl");
     fs.mkdirSync(path.dirname(resolved), { recursive: true });
     return resolved;
   }
-  const fallback = path.resolve(process.cwd(), "data", "logs", "amms", "runtime.jsonl");
+  const fallback = path.resolve(process.cwd(), "data", "logs", "amms", "feed.jsonl");
+  fs.mkdirSync(path.dirname(fallback), { recursive: true });
+  return fallback;
+}
+
+function resolveAmmsTextPath(): string {
+  const env = (process.env.EDGE_AMMS_TEXT ?? "").trim();
+  if (env) {
+    fs.mkdirSync(path.dirname(env), { recursive: true });
+    return env;
+  }
+  const runRoot = (process.env.RUN_ROOT ?? "").trim();
+  if (runRoot) {
+    const resolved = path.resolve(process.cwd(), runRoot, "amms-prices.log");
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    return resolved;
+  }
+  const fallback = path.resolve(process.cwd(), "data", "logs", "amms", "prices.log");
   fs.mkdirSync(path.dirname(fallback), { recursive: true });
   return fallback;
 }
@@ -1461,11 +1843,11 @@ function resolvePhoenixPath(): string {
   }
   const runRoot = (process.env.RUN_ROOT ?? "").trim();
   if (runRoot) {
-    const resolved = path.resolve(process.cwd(), runRoot, "phoenix-runtime.jsonl");
+    const resolved = path.resolve(process.cwd(), runRoot, "phoenix-feed.jsonl");
     fs.mkdirSync(path.dirname(resolved), { recursive: true });
     return resolved;
   }
-  const fallback = path.resolve(process.cwd(), "data", "logs", "phoenix", "runtime.jsonl");
+  const fallback = path.resolve(process.cwd(), "data", "logs", "phoenix", "feed.jsonl");
   fs.mkdirSync(path.dirname(fallback), { recursive: true });
   return fallback;
 }

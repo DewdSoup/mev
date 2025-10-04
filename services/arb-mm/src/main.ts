@@ -61,6 +61,44 @@ import { asPublicKey } from "./util/pubkey.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+class TextWriter {
+  private stream: fs.WriteStream | null = null;
+  constructor(private readonly filePath: string) {
+    const dir = path.dirname(filePath);
+    fs.mkdirSync(dir, { recursive: true });
+    this.stream = fs.createWriteStream(filePath, {
+      flags: "a",
+      encoding: "utf8",
+      mode: 0o644,
+    });
+  }
+  write(line: string) {
+    if (!this.stream) return;
+    try {
+      this.stream.write(line + "\n");
+    } catch (err) {
+      logger.log("decision_log_write_error", { err: String((err as any)?.message ?? err) });
+    }
+  }
+  close() {
+    try { this.stream?.end(); } catch { /* noop */ }
+    this.stream = null;
+  }
+}
+
+function resolveDecisionLogPath(): string {
+  const env = (process.env.EDGE_DECISIONS_TEXT ?? "").trim();
+  if (env) return path.isAbsolute(env) ? env : path.resolve(env);
+  const runRoot = (process.env.RUN_ROOT ?? "").trim();
+  if (runRoot) return path.resolve(runRoot, "decisions.log");
+  return path.resolve(process.cwd(), "data", "logs", "decisions.log");
+}
+
+const decisionsWriter = new TextWriter(resolveDecisionLogPath());
+process.once("beforeExit", () => decisionsWriter.close());
+process.once("SIGINT", () => decisionsWriter.close());
+process.once("SIGTERM", () => decisionsWriter.close());
+
 // ────────────────────────────────────────────────────────────────────────────
 /** helpers / constants */
 // ────────────────────────────────────────────────────────────────────────────
@@ -429,12 +467,24 @@ async function main() {
     backoff_max_concurrency: Number(process.env.RPC_BACKOFF_MAX_CONCURRENCY ?? "NaN"),
   });
 
+  const boolFromEnv = (value: string | undefined, defaultVal: boolean): boolean => {
+    if (value == null) return defaultVal;
+    const s = value.trim().toLowerCase();
+    if (!s) return defaultVal;
+    if (["1", "true", "yes", "on"].includes(s)) return true;
+    if (["0", "false", "no", "off"].includes(s)) return false;
+    return defaultVal;
+  };
+
+  const LIVE = boolFromEnv(process.env.LIVE_TRADING, true);
+  const SHADOW = !LIVE && boolFromEnv(process.env.SHADOW_TRADING, true);
+
   // Explicit boot banner (live-only)
   console.log(
     [
       `BOOT rpc=${maskUrl(RPC)}`,
-      `LIVE_TRADING=1`,
-      `SHADOW_TRADING=0`,
+      `LIVE_TRADING=${LIVE ? 1 : 0}`,
+      `SHADOW_TRADING=${SHADOW ? 1 : 0}`,
       `EXEC_ALLOWED_PATH=${process.env.EXEC_ALLOWED_PATH ?? "both"}`,
       `USE_RPC_SIM=${process.env.USE_RPC_SIM ?? "(unset)"}`,
       `USE_RAYDIUM_SWAP_SIM=${process.env.USE_RAYDIUM_SWAP_SIM ?? "(unset)"}`,
@@ -445,7 +495,7 @@ async function main() {
   logger.log("arb boot", {
     rpc: maskUrl(RPC),
     atomic_mode: process.env.ATOMIC_MODE ?? "none",
-    live_forced: true,
+    live_forced: LIVE,
     env_live_locked: true,
   });
 
@@ -520,9 +570,7 @@ async function main() {
   const stopHealth = startHealth(conn);
   initRisk();
 
-  // Live-only (forced above)
-  const LIVE = true;
-  const SHADOW = false;
+  // Live-only (forced via env flags above)
   const LIVE_SIZE_BASE = Number(process.env.LIVE_SIZE_BASE ?? 0) || CFG.TRADE_SIZE_BASE;
   const LOG_ML = Boolean(CFG.LOG_SIM_FIELDS);
 
@@ -676,6 +724,14 @@ async function main() {
   const onDecision: DecisionHook = (_wouldTrade, _edgeNetBps, _expectedPnl, d) => {
     const edgeNetBps = Number(_edgeNetBps ?? 0);
     const expPnl = Number(_expectedPnl ?? 0);
+    try {
+      const line = `${new Date().toISOString()} would_trade=${Boolean(_wouldTrade)} edge_bps=${edgeNetBps.toFixed(4)} pnl=${expPnl.toFixed(6)} ` +
+        (d ? `path=${d.path} amm=${d.amm_venue ?? "?"} buy_px=${Number(d.buy_px ?? NaN).toFixed(6)} sell_px=${Number(d.sell_px ?? NaN).toFixed(6)} size=${Number(d.recommended_size_base ?? NaN).toFixed(6)}`
+          : "decision=idle");
+      decisionsWriter.write(line);
+    } catch {
+      /* best-effort logging */
+    }
     if (!d) { recordDecision(false, edgeNetBps, expPnl); return; }
 
     if (ALLOWED !== "both" && d.path && d.path !== ALLOWED) {
@@ -763,6 +819,19 @@ async function main() {
       amm_meta: (d as any).amm_meta,     // 👈 pass-through meta if joiner provided it
       atomic: true,
     };
+
+    if (d.path === "AMM->AMM") {
+      const joinerDstVenue = String(d.amm_dst_venue ?? "").toLowerCase();
+      const dstVenue = joinerDstVenue === "raydium" || joinerDstVenue === "orca"
+        ? joinerDstVenue
+        : (joinerDstVenue ? joinerDstVenue : (ammVenue === "raydium" ? "orca" : "raydium"));
+      const dstPoolEnv = dstVenue === "raydium" ? rayPoolEnv : orcaPoolEnv;
+      const dstPoolId = String(d.amm_dst_pool_id ?? "").trim() || dstPoolEnv;
+      payload.amm_dst_venue = dstVenue;
+      payload.amm_dst_pool_id = dstPoolId;
+      payload.amm_dst = { pool: dstPoolId };
+      if ((d as any)?.amm_dst_meta) payload.amm_dst_meta = (d as any).amm_dst_meta;
+    }
 
     console.log(
       `EXEC (EV>0) ${payload.path} base=${roundN(payload.size_base, 6)} ` +

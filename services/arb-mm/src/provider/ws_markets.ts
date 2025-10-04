@@ -47,12 +47,21 @@ const KEEPALIVE_MS = Math.max(60_000, Number(process.env.WS_KEEPALIVE_HEALTH_MS 
 // Freshness / TTLs
 const AMM_TTL_MS = Number(process.env.BOOK_TTL_MS ?? 6000);              // joiner TTL (keep > decision TTL)
 const ORCA_FORCE_POLL_MS = Math.max(900, Number(process.env.ORCA_FORCE_POLL_MS ?? 1200)); // force a refresh if no WS within this window
+const ORCA_TICKARRAY_HORIZON = Math.max(1, Math.min(6, Number(process.env.ORCA_TICKARRAY_HORIZON ?? 2)));
 
 function getenv(k: string) { const v = process.env[k]; return typeof v === "string" && v.trim() ? v.trim() : undefined; }
 function envTrue(k: string, d = false) {
     const v = String(process.env[k] ?? "").trim().toLowerCase();
     if (!v) return d;
     return v === "1" || v === "true" || v === "yes";
+}
+
+function slotFromContext(context: { slot?: number } | null | undefined, account?: { slot?: number } | null): number | undefined {
+    const viaCtx = context?.slot;
+    if (typeof viaCtx === "number" && Number.isFinite(viaCtx)) return Number(viaCtx);
+    const viaAcc = account && typeof (account as any)?.slot === "number" ? (account as any).slot : undefined;
+    if (typeof viaAcc === "number" && Number.isFinite(viaAcc)) return Number(viaAcc);
+    return undefined;
 }
 
 // Cache: mint decimals
@@ -295,9 +304,10 @@ export async function startWsMarkets(args: {
                         err: String((e as any)?.message ?? e),
                     });
                 }
-                if (context?.slot != null) {
-                    entry.lastSlot = Number(context.slot);
-                    lastObservedSlot = Math.max(lastObservedSlot, Number(context.slot));
+                const slot = slotFromContext(context, acc as any);
+                if (slot != null) {
+                    entry.lastSlot = slot;
+                    lastObservedSlot = Math.max(lastObservedSlot, slot);
                 }
             });
             const entry = state.tickArrays.get(startTick);
@@ -340,13 +350,14 @@ export async function startWsMarkets(args: {
         if (!Number.isFinite(tickIndex)) return;
         const spacing = state.ctx.tickSpacing;
         const desired = new Set<number>();
-        for (const offset of [0, -1, 1]) {
+        for (let offset = -ORCA_TICKARRAY_HORIZON; offset <= ORCA_TICKARRAY_HORIZON; offset += 1) {
             let startTick: number;
             try {
                 startTick = TickUtil.getStartTickIndex(tickIndex, spacing, offset);
             } catch {
                 continue;
             }
+            if (desired.has(startTick)) continue;
             desired.add(startTick);
             if (!state.tickArrays.has(startTick)) {
                 await subscribeTickArray(poolIdStr, poolKey, state, startTick);
@@ -385,13 +396,13 @@ export async function startWsMarkets(args: {
                 const px = computeOrcaQuotePerBaseFromSqrt(sqrtBN, ctx.decA, ctx.decB, ctx.baseIsA);
                 if (!Number.isFinite(px) || px <= 0) continue;
 
-                const slotHint = latestTickArraySlot(state) ?? (lastObservedSlot || undefined);
+                const slotHintNum = Math.max(latestTickArraySlot(state) ?? 0, lastObservedSlot || 0);
                 args.joiner.upsertAmms({
                     venue: "orca",
                     ammId: ctx.whirlpool.toBase58(),
                     px,
                     ts: now,
-                    slot: slotHint,
+                    slot: slotHintNum > 0 ? slotHintNum : undefined,
                     feeBps: ctx.feeBps,
                     poolKind: "clmm",
                     baseDecimals: ctx.baseIsA ? ctx.decA : ctx.decB,
@@ -445,12 +456,13 @@ export async function startWsMarkets(args: {
                     const quoteUi = atomsToUi(state.quote, meta.quoteDecimals);
                     const px = quoteUi > 0 && baseUi > 0 ? (quoteUi / baseUi) : NaN;
                     if (!Number.isFinite(px) || !(px > 0)) return;
+                    const slotResolved = Math.max(slotOverride ?? 0, lastObservedSlot || 0);
                     args.joiner.upsertAmms({
                         venue: "raydium",
                         ammId: poolId.toBase58(),
                         px,
                         ts: now,
-                        slot: slotOverride ?? (lastObservedSlot || undefined),
+                        slot: slotResolved > 0 ? slotResolved : undefined,
                         feeBps: meta.feeBps,
                         poolKind: "cpmm",
                         baseDecimals: meta.baseDecimals,
@@ -463,19 +475,21 @@ export async function startWsMarkets(args: {
 
                 // WS: vault balances (2-arg signature)
                 const subBase = await ws.onAccountChange(meta.baseVault, (acc, context) => {
-                    if (context?.slot != null) lastObservedSlot = Math.max(lastObservedSlot, Number(context.slot));
+                    const slot = slotFromContext(context, acc as any);
+                    if (slot != null) lastObservedSlot = Math.max(lastObservedSlot, slot);
                     try {
                         state.base = decodeSplAmount(acc.data);
-                        push(Date.now(), context?.slot != null ? Number(context.slot) : undefined);
+                        push(Date.now(), slot);
                     } catch { }
                 });
                 addSub(subBase, "ray_base_vault", meta.baseVault);
 
                 const subQuote = await ws.onAccountChange(meta.quoteVault, (acc, context) => {
-                    if (context?.slot != null) lastObservedSlot = Math.max(lastObservedSlot, Number(context.slot));
+                    const slot = slotFromContext(context, acc as any);
+                    if (slot != null) lastObservedSlot = Math.max(lastObservedSlot, slot);
                     try {
                         state.quote = decodeSplAmount(acc.data);
-                        push(Date.now(), context?.slot != null ? Number(context.slot) : undefined);
+                        push(Date.now(), slot);
                     } catch { }
                 });
                 addSub(subQuote, "ray_quote_vault", meta.quoteVault);
@@ -534,13 +548,13 @@ export async function startWsMarkets(args: {
                             const px = computeOrcaQuotePerBaseFromSqrt(sqrtBN, ctx.decA, ctx.decB, ctx.baseIsA);
                             if (Number.isFinite(px) && px > 0) {
                                 const now = Date.now();
-                                const slotHint = latestTickArraySlot(poolState) ?? (lastObservedSlot || undefined);
+                                const slotHintNum = Math.max(latestTickArraySlot(poolState) ?? 0, lastObservedSlot || 0);
                                 args.joiner.upsertAmms({
                                     venue: "orca",
                                     ammId: poolId.toBase58(),
                                     px,
                                     ts: now,
-                                    slot: slotHint,
+                                    slot: slotHintNum > 0 ? slotHintNum : undefined,
                                     feeBps: ctx.feeBps,
                                     poolKind: "clmm",
                                     baseDecimals: ctx.baseIsA ? ctx.decA : ctx.decB,
@@ -562,7 +576,8 @@ export async function startWsMarkets(args: {
 
                 // WS: whirlpool account (2-arg signature)
                 const subId = await ws.onAccountChange(poolId, (acc, context) => {
-                    if (context?.slot != null) lastObservedSlot = Math.max(lastObservedSlot, Number(context.slot));
+                    const slot = slotFromContext(context, acc as any);
+                    if (slot != null) lastObservedSlot = Math.max(lastObservedSlot, slot);
                     try {
                         const parsed: any = ParsableWhirlpool.parse(poolId, { ...acc, owner: acc.owner, data: acc.data });
                         const sqrtRaw = parsed?.sqrtPrice ?? 0;
@@ -574,14 +589,13 @@ export async function startWsMarkets(args: {
 
                         const now = Date.now();
                         const state = orcaState.get(poolKeyStr);
-                        const slotFromCtx = context?.slot != null ? Number(context.slot) : undefined;
-                        const slotHint = slotFromCtx ?? latestTickArraySlot(state) ?? (lastObservedSlot || undefined);
+                        const slotHintNum = Math.max(slot ?? 0, latestTickArraySlot(state) ?? 0, lastObservedSlot || 0);
                         args.joiner.upsertAmms({
                             venue: "orca",
                             ammId: poolId.toBase58(),
                             px,
                             ts: now,
-                            slot: slotHint,
+                            slot: slotHintNum > 0 ? slotHintNum : undefined,
                             feeBps: ctx.feeBps,   // exact per-pool fee (feeRate/100)
                             poolKind: "clmm",
                             baseDecimals: ctx.baseIsA ? ctx.decA : ctx.decB,

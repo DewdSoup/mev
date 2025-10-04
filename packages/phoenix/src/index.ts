@@ -12,7 +12,7 @@ import { fileURLToPath } from "url";
 import { Connection, PublicKey } from "@solana/web3.js";
 import type { Commitment } from "@solana/web3.js";
 import * as PhoenixSDK from "@ellipsis-labs/phoenix-sdk";
-import { logger } from "@mev/storage";
+import { logger, getRunRoot } from "@mev/storage";
 import { makePhoenixConnection } from "./rpc";
 
 type MarketState = any;
@@ -107,7 +107,17 @@ function resolveOutPath(): string {
     fs.mkdirSync(path.dirname(edgePath), { recursive: true });
     return edgePath;
   }
-  const fallback = path.resolve(__dirname, "..", "logs", "runtime.jsonl");
+  let runRoot = (process.env.RUN_ROOT ?? "").trim();
+  if (!runRoot) {
+    runRoot = getRunRoot();
+  }
+  if (runRoot) {
+    const resolved = path.join(runRoot, "phoenix-feed.jsonl");
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    process.env.EDGE_PHOENIX_JSONL = resolved;
+    return resolved;
+  }
+  const fallback = path.resolve(__dirname, "..", "logs", "feed.jsonl");
   fs.mkdirSync(path.dirname(fallback), { recursive: true });
   return fallback;
 }

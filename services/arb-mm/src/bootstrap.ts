@@ -28,8 +28,12 @@ function loadExactEnvLive() {
     console.error("[env] .env.live not found; expected at", repoEnvLive, "or", svcEnvLive);
   }
 
-  process.env.LIVE_TRADING = "1";
-  process.env.SHADOW_TRADING = "0";
+  if (process.env.LIVE_TRADING == null || process.env.LIVE_TRADING.trim() === "") {
+    process.env.LIVE_TRADING = "1";
+  }
+  if (process.env.SHADOW_TRADING == null || process.env.SHADOW_TRADING.trim() === "") {
+    process.env.SHADOW_TRADING = "0";
+  }
   process.env.__ENV_LIVE_LOCKED = "1";
   if (process.env.SKIP_BALANCE_READS == null) {
     process.env.SKIP_BALANCE_READS = "1";

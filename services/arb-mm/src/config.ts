@@ -262,8 +262,8 @@ export function loadConfig(): AppConfig {
     ? (path.isAbsolute(runRootRaw) ? runRootRaw : path.resolve(REPO_ROOT, runRootRaw))
     : null;
 
-  const defaultAmmsLog = runRoot ? path.join(runRoot, "amms-runtime.jsonl") : "data/amms/runtime.jsonl";
-  const defaultPhxLog = runRoot ? path.join(runRoot, "phoenix-runtime.jsonl") : "data/phoenix/runtime.jsonl";
+  const defaultAmmsLog = runRoot ? path.join(runRoot, "amms-feed.jsonl") : "data/amms/feed.jsonl";
+  const defaultPhxLog = runRoot ? path.join(runRoot, "phoenix-feed.jsonl") : "data/phoenix/feed.jsonl";
 
   const AMMS_JSONL: string = firstExistingPathOrDefault(
     process.env.EDGE_AMMS_JSONL ?? defaultAmmsLog
