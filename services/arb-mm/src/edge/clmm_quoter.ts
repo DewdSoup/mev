@@ -24,6 +24,7 @@ import { TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 
 import { logger } from "../ml_logger.js";
 import { rpcClient } from "@mev/rpc-facade";
+import { cpmmBuyQuotePerBase, cpmmSellQuotePerBase } from "../util/cpmm.js";
 
 const ENABLE_RAYDIUM_CLMM = String(process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0";
 
@@ -149,28 +150,10 @@ function calcFeeBps(feeAtoms: BN | undefined, baseAtoms: BN | undefined): number
   return fee.mul(10_000).div(amt).toNumber();
 }
 
-function cpmmBuyQuotePerBase(base: number, quote: number, wantBase: number, feeBps: number): number | undefined {
-  if (!(base > 0 && quote > 0 && wantBase > 0)) return undefined;
-  if (wantBase >= base * 0.999999) return undefined;
-  const fee = Math.max(0, feeBps) / 10_000;
-  const dqPrime = (wantBase * quote) / (base - wantBase);
-  const dq = dqPrime / (1 - fee);
-  if (!Number.isFinite(dq) || dq <= 0) return undefined;
-  return dq / wantBase;
-}
-
-function cpmmSellQuotePerBase(base: number, quote: number, sellBase: number, feeBps: number): number | undefined {
-  if (!(base > 0 && quote > 0 && sellBase > 0)) return undefined;
-  const fee = Math.max(0, feeBps) / 10_000;
-  const dbPrime = sellBase * (1 - fee);
-  const dy = (quote * dbPrime) / (base + dbPrime);
-  if (!Number.isFinite(dy) || dy <= 0) return undefined;
-  return dy / sellBase;
-}
-
 function quoteFromReserves(args: QuoteArgs): QuoteResult | null {
   // CLMM pools do not follow CPMM math, so reserve-based quoting is unsafe.
-  if (String(args.poolKind ?? "").toLowerCase() === "clmm") return null;
+  const kind = String(args.poolKind ?? "").toLowerCase();
+  if (kind === "clmm" || kind === "dlmm") return null;
   const reserves = args.reserves;
   if (!reserves) return null;
   const { base, quote } = reserves;
@@ -245,6 +228,12 @@ function isRateLimitError(err: any): boolean {
 function strEq(a?: string, b?: string): boolean {
   if (!a || !b) return false;
   return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+function fallbackFeeBpsFromTradeRate(rate: unknown): number {
+  const raw = Number(rate ?? 0);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return raw <= 1 ? Math.round(raw * 10_000) : Math.round(raw);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -499,10 +488,11 @@ export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
       const price = outUi.div(inUi).toNumber();
       if (!Number.isFinite(price) || price <= 0) return { ok: false, err: "raydium_clmm_price_nan" };
 
+      const feeFallbackBps = fallbackFeeBpsFromTradeRate(poolInfo.ammConfig?.tradeFeeRate);
       const feeBps =
         calcFeeBps(computeOut.fee, realInAtoms) ||
         args.feeBpsHint ||
-        Math.round((poolInfo.ammConfig?.tradeFeeRate ?? 0) * 10_000);
+        feeFallbackBps;
 
       const meta = {
         mode: "computeAmountOut",
@@ -549,10 +539,11 @@ export async function quoteRaydiumClmm(args: QuoteArgs): Promise<QuoteResult> {
     const price = inUi.div(outUi).toNumber();
     if (!Number.isFinite(price) || price <= 0) return { ok: false, err: "raydium_clmm_price_nan" };
 
+    const feeFallbackBps = fallbackFeeBpsFromTradeRate(poolInfo.ammConfig?.tradeFeeRate);
     const feeBps =
       calcFeeBps(computeIn.fee, inAtoms) ||
       args.feeBpsHint ||
-      Math.round((poolInfo.ammConfig?.tradeFeeRate ?? 0) * 10_000);
+      feeFallbackBps;
 
     const meta = {
       mode: "computeAmountIn",

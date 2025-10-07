@@ -1,41 +1,107 @@
 {
-    "pairs": [
+  "pairs": [
+    {
+      "symbol": "SOL/USDC",
+      "baseMint": "So11111111111111111111111111111111111111112",
+      "quoteMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "phoenixMarket": "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg",
+      "venues": [
         {
-            "symbol": "SOL/USDC",
-            "baseMint": "So11111111111111111111111111111111111111112",
-            "quoteMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-            "phoenixMarket": "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg",
-            "venues": [
-                {
-                    "kind": "phoenix",
-                    "id": "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg"
-                },
-                {
-                    "kind": "raydium",
-                    "id": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
-                    "poolKind": "cpmm",
-                    "feeBps": 25
-                },
-                {
-                    "kind": "orca",
-                    "id": "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ",
-                    "poolKind": "clmm",
-                    "feeBps": 30
-                },
-                {
-                    "kind": "orca",
-                    "id": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
-                    "poolKind": "clmm",
-                    "feeBps": 4
-                },
-                {
-                    "kind": "raydium",
-                    "id": "2QdhepnKRTLjjSqPL1PtKNwqrUkoLee5Gqs8bvZhRdMv",
-                    "poolKind": "clmm",
-                    "feeBps": 5,
-                    "enabled": false
-                }
-            ]
+          "kind": "phoenix",
+          "id": "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg"
+        },
+        {
+          "kind": "raydium",
+          "id": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
+          "poolKind": "cpmm",
+          "feeBps": 25
+        },
+        {
+          "kind": "raydium",
+          "id": "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv",
+          "poolKind": "clmm",
+          "feeBps": 400
+        },
+        {
+          "kind": "raydium",
+          "id": "CYbD9RaToYMtWKA7QZyoLahnHdWq553Vm62Lh6qWtuxq",
+          "poolKind": "clmm",
+          "feeBps": 200
+        },
+        {
+          "kind": "raydium",
+          "id": "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj",
+          "poolKind": "clmm",
+          "feeBps": 100
+        },
+        {
+          "kind": "raydium",
+          "id": "EXHyQxMSttcvLPwjENnXCPZ8GmLjJYHtNBnAkcFeFKMn",
+          "poolKind": "clmm",
+          "feeBps": 100
+        },
+        {
+          "kind": "raydium",
+          "id": "2QdhepnKRTLjjSqPL1PtKNwqrUkoLee5Gqs8bvZhRdMv",
+          "poolKind": "clmm",
+          "feeBps": 500,
+          "enabled": false
+        },
+        {
+          "kind": "orca",
+          "id": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
+          "poolKind": "clmm",
+          "feeBps": 4
+        },
+        {
+          "kind": "orca",
+          "id": "FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q",
+          "poolKind": "clmm",
+          "feeBps": 2
+        },
+        {
+          "kind": "orca",
+          "id": "7qbRF6YsyGuLUVs6Y1q64bdVrfe4ZcUUz1JRdoVNUJnm",
+          "poolKind": "clmm",
+          "feeBps": 5
+        },
+        {
+          "kind": "orca",
+          "id": "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ",
+          "poolKind": "clmm",
+          "feeBps": 30
+        },
+        {
+          "kind": "meteora",
+          "id": "BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y",
+          "poolKind": "dlmm",
+          "feeBps": 10
+        },
+        {
+          "kind": "meteora",
+          "id": "BVRbyLjjfSBcoyiYFuxbgKYnWuiFaF9CSXEa5vdSZ9Hh",
+          "poolKind": "dlmm",
+          "feeBps": 20
+        },
+        {
+          "kind": "meteora",
+          "id": "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6",
+          "poolKind": "dlmm",
+          "feeBps": 4
+        },
+        {
+          "kind": "meteora",
+          "id": "HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR",
+          "poolKind": "dlmm",
+          "feeBps": 1
+        },
+        {
+          "kind": "meteora",
+          "id": "CgqwPLSFfht89pF5RSKGUUMFj5zRxoUt4861w2SkXaqY",
+          "poolKind": "dlmm",
+          "feeBps": 5
         }
-    ]
+      ]
+    }
+  ]
 }

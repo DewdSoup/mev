@@ -125,7 +125,7 @@ class PairPipeline {
     private rpcMsP95 = 0;
     private rpcBlocked = 0;
 
-    private ammVenueByPool = new Map<string, { venue: string; poolKind?: string; feeBps?: number }>();
+    private ammVenueByPool = new Map<string, { venue: string; poolKind?: string; feeBps?: number; baseMint: string; quoteMint: string }>();
     private _ammFeeBps: number;
     private _phxFeeBps: number;
 
@@ -163,12 +163,16 @@ class PairPipeline {
                     venue: String(venue.venue ?? pair.adapters?.amm ?? "raydium").toLowerCase(),
                     poolKind: venue.poolKind,
                     feeBps: venue.feeBps,
+                    baseMint: pair.baseMint,
+                    quoteMint: pair.quoteMint,
                 });
             }
         }
         if (!this.ammVenueByPool.has(pair.ammPool)) {
             this.ammVenueByPool.set(pair.ammPool, {
                 venue: String(pair.adapters?.amm ?? "raydium").toLowerCase(),
+                baseMint: pair.baseMint,
+                quoteMint: pair.quoteMint,
             });
         }
 
@@ -268,6 +272,8 @@ class PairPipeline {
             amm_pool_id: srcPoolId,
             amm: { pool: srcPoolId, venue: srcVenue, meta: srcMeta },
             amm_meta: srcMeta,
+            base_mint: this.pair.baseMint,
+            quote_mint: this.pair.quoteMint,
         };
 
         if (d.path === "AMM->AMM") {

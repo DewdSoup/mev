@@ -92,6 +92,7 @@
   },
   "dependencies": {
     "@ellipsis-labs/phoenix-sdk": "^2.0.3",
+    "@meteora-ag/dlmm": "^1.7.5",
     "@mev/storage": "workspace:*",
     "@orca-so/common-sdk": "^0.6.11",
     "@orca-so/whirlpools-client": "^4.0.0",

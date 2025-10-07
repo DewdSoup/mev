@@ -1,5 +1,5 @@
-export type AmmVenue = "raydium" | "orca";
-export type PoolKind = "cpmm" | "clmm";
+export type AmmVenue = "raydium" | "orca" | "meteora";
+export type PoolKind = "cpmm" | "clmm" | "dlmm";
 
 export interface AmmSnapshot {
   poolId: string;
@@ -20,12 +20,14 @@ export interface AmmSnapshot {
   /** raw atom balances as strings to avoid precision loss */
   baseReserveAtoms?: string | null;
   quoteReserveAtoms?: string | null;
+  reserves?: { base: number; quote: number; baseDecimals: number; quoteDecimals: number } | null;
   lastUpdateTs: number;
   ageMs?: number;
   slot?: number | null;
   stale?: boolean;
   degraded?: boolean;
   degradedReason?: string | null;
+  meta?: Record<string, unknown> | null;
 }
 
 export interface PhoenixLevel {

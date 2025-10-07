@@ -18,6 +18,7 @@ import { logger } from "../ml_logger.js";
 import { buildRaydiumCpmmSwapIx } from "./buildRaydiumCpmmIx.js";
 import { buildRaydiumClmmSwapIx } from "./buildRaydiumClmmIx.js";
 import { buildOrcaWhirlpoolSwapIx } from "./buildOrcaWhirlpoolIx.js";
+import { buildMeteoraDlmmSwapIx } from "./buildMeteoraDlmmIx.js";
 import { buildPhoenixSwapIxs } from "../util/phoenix.js";
 import { toIxArray, assertIxArray } from "../util/ix.js";
 import { submitAtomic, buildPreIxs } from "../tx/submit.js";
@@ -343,7 +344,7 @@ export class LiveExecutor {
         payload?.amm?.venue ??
         payload?.ammVenue ??
         "raydium"
-      ).toLowerCase() as "raydium" | "orca";
+      ).toLowerCase() as "raydium" | "orca" | "meteora";
       const poolFromPayload = String(
         payload?.amm_pool_id ??
         payload?.amm?.pool ??
@@ -361,7 +362,7 @@ export class LiveExecutor {
         payload?.amm_dst_venue ??
         payload?.amm_dst?.venue ??
         ""
-      ).toLowerCase() as "raydium" | "orca" | "";
+      ).toLowerCase() as "raydium" | "orca" | "meteora" | "";
       const ammDstPoolId = String(
         payload?.amm_dst_pool_id ??
         payload?.amm_dst?.pool ??
@@ -374,6 +375,11 @@ export class LiveExecutor {
       )
         .trim()
         .toLowerCase();
+
+      const baseMintStr = (String(payload?.base_mint ?? payload?.amm_meta?.baseMint ?? "").trim()) || DEFAULT_BASE_MINT.toBase58();
+      const quoteMintStr = (String(payload?.quote_mint ?? payload?.amm_meta?.quoteMint ?? "").trim()) || DEFAULT_QUOTE_MINT.toBase58();
+      const dstBaseMintStr = (String(payload?.amm_dst_meta?.baseMint ?? baseMintStr).trim()) || baseMintStr;
+      const dstQuoteMintStr = (String(payload?.amm_dst_meta?.quoteMint ?? quoteMintStr).trim()) || quoteMintStr;
 
       let sizeBase = Number(payload?.size_base ?? payload?.trade_size_base ?? 0);
       const phoenix = payload?.phoenix || {};
@@ -449,6 +455,7 @@ export class LiveExecutor {
         if (poolId) return poolId;
         if (venue === "raydium") return (process.env.RAYDIUM_POOL_ID ?? process.env.RAYDIUM_POOL_ID_SOL_USDC ?? DEFAULT_RAYDIUM_POOL_ID).trim();
         if (venue === "orca") return (process.env.ORCA_POOL_ID ?? DEFAULT_ORCA_POOL_ID).trim();
+        if (venue === "meteora") return poolId;
         return poolId;
       };
 
@@ -461,6 +468,8 @@ export class LiveExecutor {
         baseIn: boolean;
         sizeBase: number;
         refPx: number;
+        baseMint?: string;
+        quoteMint?: string;
         label: string;
       }): Promise<BuiltLeg> => {
         const venue = leg.venue.toLowerCase();
@@ -471,6 +480,27 @@ export class LiveExecutor {
         }
         if (!(leg.refPx > 0)) {
           throw new Error(`${venue}_no_ref_px`);
+        }
+
+        if (venue === "meteora") {
+          const baseMintStr = (leg.baseMint ?? DEFAULT_BASE_MINT.toBase58()).trim() || DEFAULT_BASE_MINT.toBase58();
+          const quoteMintStr = (leg.quoteMint ?? DEFAULT_QUOTE_MINT.toBase58()).trim() || DEFAULT_QUOTE_MINT.toBase58();
+          const built = await buildMeteoraDlmmSwapIx({
+            connection: this.conn,
+            user: this.payer.publicKey,
+            poolId,
+            baseIn: leg.baseIn,
+            sizeBase: leg.sizeBase,
+            refPx: leg.refPx,
+            slippageBps: SLIPPAGE_BPS,
+            baseMint: baseMintStr,
+            quoteMint: quoteMintStr,
+          });
+          if (!built.ok) throw new Error(built.reason);
+          const ixs = built.ixs;
+          assertIxArray(ixs, "meteora");
+          logger.log("meteora_build_ok", { ixs: ixs.length, pool: poolId, leg: leg.label });
+          return { ixs, lookupTables: [] };
         }
 
         if (venue === "raydium" && poolKind === "clmm") {
@@ -587,6 +617,8 @@ export class LiveExecutor {
           baseIn: false, // quote -> base
           sizeBase,
           refPx: buy_px,
+          baseMint: baseMintStr,
+          quoteMint: quoteMintStr,
           label: "src",
         });
         const dstLeg = await buildAmmLeg({
@@ -596,6 +628,8 @@ export class LiveExecutor {
           baseIn: true, // base -> quote
           sizeBase,
           refPx: sell_px,
+          baseMint: dstBaseMintStr,
+          quoteMint: dstQuoteMintStr,
           label: "dst",
         });
         ammSrcIxs = srcLeg.ixs;
@@ -634,6 +668,8 @@ export class LiveExecutor {
           baseIn: atomicPath === "PHX->AMM",
           sizeBase,
           refPx: atomicPath === "PHX->AMM" ? sell_px : buy_px,
+          baseMint: baseMintStr,
+          quoteMint: quoteMintStr,
           label: "amm",
         });
         ammSrcIxs = leg.ixs;

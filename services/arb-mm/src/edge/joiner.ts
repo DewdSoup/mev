@@ -24,8 +24,11 @@ import {
   orcaAvgSellQuotePerBase,
 } from "../executor/orca_quoter.js";
 import { quoteClmm } from "./clmm_quoter.js";
+import { quoteDlmm } from "./dlmm_quoter.js";
 import Decimal from "decimal.js";
 import { getCachedOrcaFee, getCachedRaydiumFee } from "../util/fee_cache.js";
+import { cpmmBuyQuotePerBase, cpmmSellQuotePerBase } from "../util/cpmm.js";
+import type { PairSpec } from "../registry/pairs.js";
 
 Decimal.set({ precision: 40, rounding: Decimal.ROUND_HALF_EVEN });
 
@@ -63,6 +66,7 @@ const CLMM_PREFER_ADAPTER = envTrue("CLMM_PREFER_ADAPTER", false);
 const RATE_LIMIT_BACKOFF_MS = Math.max(250, Number(process.env.RATE_LIMIT_BACKOFF_MS ?? 1500));
 const MIN_PRICE_DELTA_BPS = Math.max(0, Number(process.env.MIN_PRICE_DELTA_BPS ?? 1));
 const ALLOW_STALE_DECISIONS = envTrue("ALLOW_STALE_DECISIONS", true);
+const AMM_DEGRADE_LOG_WINDOW_MS = Math.max(500, Number(process.env.AMM_DEGRADE_LOG_WINDOW_MS ?? 2000));
 
 // ────────────────────────────────────────────────────────────────────────────
 // Staleness guard (inline helper)
@@ -318,6 +322,7 @@ export class EdgeJoiner {
 
   // config gating
   private allowedPools = new Set<string>(); // `${venue}:${id}`
+  private warnedPools = new Set<string>();
   private symbol = "SOL/USDC";
   private baseMint?: string;
   private quoteMint?: string;
@@ -326,6 +331,9 @@ export class EdgeJoiner {
   private phxSnapshotLastMtime = 0;
   private phxSnapshotPersistMs = 0;
   private phoenixSnapshotTimer: NodeJS.Timeout | null = null;
+  private dlmmQuoteMemo = new Map<string, QuoteRes>();
+  private degradedLogMemo = new Map<string, { reason: string; atMs: number }>();
+  private ignoredLogMemo = new Map<string, { reason: string; atMs: number }>();
 
   constructor(
     private P: JoinerParams,
@@ -405,9 +413,31 @@ export class EdgeJoiner {
     const ammId = String(obj?.ammId ?? obj?.id ?? "");
     if (!ammId || !(px && px > 0)) return;
 
+    const poolKindRaw = String(obj?.poolKind ?? obj?.pool_kind ?? obj?.poolType ?? obj?.pool_type ?? "")
+      .trim()
+      .toLowerCase();
+
     // Gate by AMMS_ENABLE (optional)
-    const enableList = String(process.env.AMMS_ENABLE ?? "").toLowerCase().split(",").map(s => s.trim()).filter(Boolean);
-    if (enableList.length && !enableList.includes(venue)) return;
+    const enableList = String(process.env.AMMS_ENABLE ?? "")
+      .toLowerCase()
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (enableList.length) {
+      const enableSet = new Set(enableList);
+      let allowed = enableSet.has(venue);
+      if (!allowed && poolKindRaw) {
+        allowed = enableSet.has(`${venue}_${poolKindRaw}`) || enableSet.has(poolKindRaw);
+      }
+      if (!allowed && poolKindRaw === "dlmm" && !enableList.some((entry) => entry.startsWith("meteora"))) {
+        allowed = true;
+        if (!this.warnedPools.has("meteora_auto")) {
+          this.warnedPools.add("meteora_auto");
+          logger.log("amm_enable_auto", { venue: "meteora", pool_kind: "dlmm" });
+        }
+      }
+      if (!allowed) return;
+    }
 
     // Gate to configured pools (if any listed in pairs.json)
     if (this.allowedPools.size && !this.allowedPools.has(`${venue}:${ammId}`)) return;
@@ -486,8 +516,8 @@ export class EdgeJoiner {
       reserves,
       feeBps,
     };
-    const poolKindRaw = String(obj?.poolKind ?? obj?.pool_kind ?? obj?.poolType ?? obj?.pool_type ?? "").trim();
-    if (poolKindRaw) snap.poolKind = poolKindRaw;
+    const poolKindRawUpper = String(obj?.poolKind ?? obj?.pool_kind ?? obj?.poolType ?? obj?.pool_type ?? "").trim();
+    if (poolKindRawUpper) snap.poolKind = poolKindRawUpper.toLowerCase();
 
     this.amms.set(`${venue}:${ammId}`, snap);
     void this.maybeReport();
@@ -623,47 +653,6 @@ export class EdgeJoiner {
   }
 
   // CPMM effective price (QUOTE per BASE)
-  private cpmmBuyQuotePerBase(xBase: number, yQuote: number, wantBase: number, feeBps: number): number | undefined {
-    if (!(xBase > 0 && yQuote > 0) || !(wantBase > 0)) return undefined;
-    const fee = new Decimal(Math.max(0, feeBps)).div(10_000);
-    const x = new Decimal(xBase);
-    const y = new Decimal(yQuote);
-    const dx = new Decimal(wantBase);
-    const maxFraction = 0.999999999;
-    if (dx.greaterThanOrEqualTo(x.mul(maxFraction))) return undefined;
-
-    const one = new Decimal(1);
-    const dxAfterFee = dx.mul(one.minus(fee));
-    if (dxAfterFee.lte(0)) return undefined;
-
-    const k = x.mul(y);
-    const x1 = x.plus(dxAfterFee);
-    if (x1.lte(0)) return undefined;
-
-    const y1 = k.div(x1);
-    const dy = y.minus(y1);
-    if (dy.lte(0)) return undefined;
-
-    return dy.div(dxAfterFee).toNumber();
-  }
-  private cpmmSellQuotePerBase(xBase: number, yQuote: number, sellBase: number, feeBps: number): number | undefined {
-    if (!(xBase > 0 && yQuote > 0) || !(sellBase > 0)) return undefined;
-    const fee = new Decimal(Math.max(0, feeBps)).div(10_000);
-    const x = new Decimal(xBase);
-    const y = new Decimal(yQuote);
-    const dx = new Decimal(sellBase);
-    if (dx.lte(0)) return undefined;
-
-    const one = new Decimal(1);
-    const dbPrime = dx.mul(one.minus(fee));
-    if (dbPrime.lte(0)) return undefined;
-
-    const dy = y.mul(dbPrime).div(x.plus(dbPrime));
-    if (dy.lte(0)) return undefined;
-
-    return dy.div(dx).toNumber();
-  }
-
   // CLMM / mid-only fallback (used only if quoter errs)
   private midBuyQuotePerBase(mid: number, feeBps: number, slipBps: number): number {
     const fee = Math.max(0, feeBps) / 10_000;
@@ -1041,6 +1030,9 @@ export class EdgeJoiner {
 
     const poolKind = String(amm.poolKind ?? "").toLowerCase();
     const isClmm = poolKind === "clmm";
+    const isDlmm = poolKind === "dlmm";
+    const sizeBucket = Number.isFinite(sizeBase) ? Number(sizeBase.toFixed(6)) : sizeBase;
+    const dlmmMemoKey = isDlmm ? `${amm.ammId}:${side}:${sizeBucket}:${slip}` : null;
 
     let adapterQuoteCached: QuoteRes | undefined;
     const hasAdapter = typeof adapter?.quote === "function";
@@ -1068,6 +1060,47 @@ export class EdgeJoiner {
 
     if (this.isRateLimited()) {
       return { px: undefined, feeBps: amm.feeBps, used: "fallback", meta: { rate_limited: true, wait_ms: this.rateLimitedUntil - Date.now() } };
+    }
+
+    if (isDlmm) {
+      const cached = dlmmMemoKey ? this.dlmmQuoteMemo.get(dlmmMemoKey) : undefined;
+      const fromCache = cached != null;
+      const dlmmQuote = fromCache ? cached : await quoteDlmm({
+        poolId: amm.ammId,
+        side,
+        sizeBase,
+        slippageBps: slip,
+        baseMint: this.baseMint,
+        quoteMint: this.quoteMint,
+      });
+      if (!fromCache && dlmmMemoKey) {
+        this.dlmmQuoteMemo.set(dlmmMemoKey, dlmmQuote);
+      }
+      if (dlmmQuote.ok && Number.isFinite(dlmmQuote.price) && (dlmmQuote.price ?? 0) > 0) {
+        const price = dlmmQuote.price ?? 0;
+        const effectiveFeeBps = Number.isFinite(dlmmQuote.feeBps)
+          ? (dlmmQuote.feeBps as number)
+          : (amm.feeBps ?? this.P.ammFeeBps);
+        logQuote("dlmm_quoter", price, {
+          fee_bps: effectiveFeeBps,
+          meta: dlmmQuote.meta ?? null,
+          cache_hit: fromCache,
+          degraded: Boolean((dlmmQuote.meta as any)?.degraded),
+          degraded_reason: (dlmmQuote.meta as any)?.degraded_reason ?? null,
+        });
+        return {
+          px: price,
+          feeBps: effectiveFeeBps,
+          used: "local",
+          meta: { source: "dlmm_quoter", cache_hit: fromCache, ...(dlmmQuote.meta ?? {}) },
+        };
+      }
+      logQuote("dlmm_quoter_err", undefined, {
+        err: dlmmQuote.ok ? undefined : dlmmQuote.err,
+        cache_hit: fromCache,
+        degraded: Boolean((dlmmQuote as any)?.meta?.degraded),
+        degraded_reason: (dlmmQuote as any)?.meta?.degraded_reason ?? null,
+      });
     }
 
     if (hasAdapter && (!isClmm || CLMM_PREFER_ADAPTER)) {
@@ -1187,12 +1220,12 @@ export class EdgeJoiner {
             return { px: q.price, feeBps: amm.feeBps, used: "local" };
           }
         }
-      } else if (!isClmm) {
+      } else if (!isClmm && !isDlmm) {
         // Raydium CPMM: closed-form reserves math
         const hasRes = !!amm.reserves && amm.reserves.base > 0 && amm.reserves.quote > 0;
         if (hasRes) {
           if (side === "buy") {
-            const px = this.cpmmBuyQuotePerBase(amm.reserves!.base, amm.reserves!.quote, sizeBase, amm.feeBps);
+            const px = cpmmBuyQuotePerBase(amm.reserves!.base, amm.reserves!.quote, sizeBase, amm.feeBps);
             if (px != null) {
               logQuote("cpmm_buy", px, {
                 fee_bps: amm.feeBps,
@@ -1202,7 +1235,7 @@ export class EdgeJoiner {
               return { px, feeBps: amm.feeBps, used: "local" };
             }
           } else {
-            const px = this.cpmmSellQuotePerBase(amm.reserves!.base, amm.reserves!.quote, sizeBase, amm.feeBps);
+            const px = cpmmSellQuotePerBase(amm.reserves!.base, amm.reserves!.quote, sizeBase, amm.feeBps);
             if (px != null) {
               logQuote("cpmm_sell", px, {
                 fee_bps: amm.feeBps,
@@ -1215,6 +1248,11 @@ export class EdgeJoiner {
         }
       }
     } catch { /* fall through */ }
+
+    if (isDlmm) {
+      logQuote("dlmm_quoter_no_fallback", undefined, { reason: "dlmm_disabled" });
+      return { px: undefined, feeBps: amm.feeBps, used: "fallback", meta: { source: "dlmm_disabled_fallback" } };
+    }
 
     // Final fallback: mid + slippage + fee (conservative)
     const px = side === "buy"
@@ -1310,28 +1348,38 @@ export class EdgeJoiner {
         if (canUseStale) {
           const degraded: AmmSnap = { ...a, degraded: true, degradedReason: reason };
           degraded.stale = true;
-          logger.log("amm_snapshot_degraded", {
-            venue: degraded.venue,
-            ammId: degraded.ammId,
-            reason,
-            ts: degraded.ts,
-            slot: degraded.slot ?? null,
-            phoenix_slot: this.phxSlot ?? null,
-            slot_skew: freshness.skew,
-            age_ms: freshness.ageMs,
-          });
+          const key = `${degraded.venue}:${degraded.ammId}`;
+          const last = this.degradedLogMemo.get(key);
+          if (!last || last.reason !== reason || now - last.atMs >= AMM_DEGRADE_LOG_WINDOW_MS) {
+            logger.log("amm_snapshot_degraded", {
+              venue: degraded.venue,
+              ammId: degraded.ammId,
+              reason,
+              ts: degraded.ts,
+              slot: degraded.slot ?? null,
+              phoenix_slot: this.phxSlot ?? null,
+              slot_skew: freshness.skew,
+              age_ms: freshness.ageMs,
+            });
+            this.degradedLogMemo.set(key, { reason, atMs: now });
+          }
           snapshot = degraded;
         } else {
-          logger.log("amm_snapshot_ignored", {
-            venue: a.venue,
-            ammId: a.ammId,
-            reason,
-            ts: a.ts,
-            slot: a.slot ?? null,
-            phoenix_slot: this.phxSlot ?? null,
-            slot_skew: freshness.skew,
-            age_ms: freshness.ageMs,
-          });
+          const key = `${a.venue}:${a.ammId}`;
+          const last = this.ignoredLogMemo.get(key);
+          if (!last || last.reason !== reason || now - last.atMs >= AMM_DEGRADE_LOG_WINDOW_MS) {
+            logger.log("amm_snapshot_ignored", {
+              venue: a.venue,
+              ammId: a.ammId,
+              reason,
+              ts: a.ts,
+              slot: a.slot ?? null,
+              phoenix_slot: this.phxSlot ?? null,
+              slot_skew: freshness.skew,
+              age_ms: freshness.ageMs,
+            });
+            this.ignoredLogMemo.set(key, { reason, atMs: now });
+          }
           staleAmms.push({ snap: a, reason, skew: freshness.skew, ageMs: freshness.ageMs });
           continue;
         }
@@ -1339,6 +1387,11 @@ export class EdgeJoiner {
         snapshot = a;
       }
       if (!snapshot) continue;
+      const memoKey = `${snapshot.venue}:${snapshot.ammId}`;
+      if (!snapshot.degraded) {
+        this.degradedLogMemo.delete(memoKey);
+        this.ignoredLogMemo.delete(memoKey);
+      }
       if (this.allowedPools.size && !this.allowedPools.has(`${snapshot.venue}:${snapshot.ammId}`)) continue;
       freshAmms.push(snapshot);
     }
@@ -1401,6 +1454,8 @@ export class EdgeJoiner {
       ask,
       amms: Object.fromEntries(validAmms.map((a) => [`${a.venue}:${a.ammId}`, Number(a.px ?? 0)])),
     };
+
+    this.dlmmQuoteMemo.clear();
 
     // Emit a single edge_report snapshot (Phoenix vs latest valid AMM mid)
     const latestAmm = validAmms.slice().sort((a, b) => b.ts - a.ts)[0];
@@ -1620,11 +1675,11 @@ export class EdgeJoiner {
       }
       if (best.path === "AMM->PHX") {
         return hasRes
-          ? this.cpmmBuyQuotePerBase(best.amm.reserves!.base, best.amm.reserves!.quote, best.size, best.amm.feeBps)
+          ? cpmmBuyQuotePerBase(best.amm.reserves!.base, best.amm.reserves!.quote, best.size, best.amm.feeBps)
           : this.midBuyQuotePerBase(best.amm.px, best.amm.feeBps, this.P.flatSlippageBps);
       } else if (best.path === "PHX->AMM") {
         return hasRes
-          ? this.cpmmSellQuotePerBase(best.amm.reserves!.base, best.amm.reserves!.quote, best.size, best.amm.feeBps)
+          ? cpmmSellQuotePerBase(best.amm.reserves!.base, best.amm.reserves!.quote, best.size, best.amm.feeBps)
           : this.midSellQuotePerBase(best.amm.px, best.amm.feeBps, this.P.flatSlippageBps);
       } else {
         return undefined;

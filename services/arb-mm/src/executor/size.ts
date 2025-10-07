@@ -2,6 +2,7 @@
 // Size optimizer + EV helpers used by the joiner and debug paths.
 // All exports have explicit types for --isolatedDeclarations compatibility.
 
+import { cpmmBuyQuotePerBase, cpmmSellQuotePerBase } from "../util/cpmm.js";
 export type DepthLevel = { px: number; qtyBase: number };
 
 export type PhoenixBook = {
@@ -63,25 +64,6 @@ function phoenixBuyAvgPx(book: PhoenixBook, sizeBase: number): number | undefine
   if (rem > 1e-12) return undefined;      // not enough depth
   const paidQuote = notional * (1 + fee);
   return paidQuote / sizeBase;             // QUOTE per BASE paid
-}
-
-function cpmmBuyQuotePerBase(xBase: number, yQuote: number, wantBase: number, feeBps: number): number | undefined {
-  if (!(xBase > 0 && yQuote > 0 && wantBase > 0)) return undefined;
-  const fee = Math.max(0, feeBps) / 10_000;
-  if (wantBase >= xBase * (1 - 1e-9)) return undefined;
-  const dqPrime = (wantBase * yQuote) / (xBase - wantBase);
-  const dq = dqPrime / (1 - fee);
-  if (!Number.isFinite(dq)) return undefined;
-  return dq / wantBase; // avg QUOTE per BASE paid
-}
-
-function cpmmSellQuotePerBase(xBase: number, yQuote: number, sellBase: number, feeBps: number): number | undefined {
-  if (!(xBase > 0 && yQuote > 0 && sellBase > 0)) return undefined;
-  const fee = Math.max(0, feeBps) / 10_000;
-  const dbPrime = sellBase * (1 - fee);
-  const dy = (yQuote * dbPrime) / (xBase + dbPrime);
-  if (!Number.isFinite(dy)) return undefined;
-  return dy / sellBase; // avg QUOTE per BASE received
 }
 
 function calcAtSize(

@@ -18,7 +18,7 @@ function envInt(k: string, d: number) {
 }
 
 // How many slots the AMM feed is allowed to lag behind Phoenix before we ignore it.
-const MAX_LAG_SLOTS = envInt("AMM_SLOT_MAX_LAG", 8);
+const MAX_LAG_SLOTS = envInt("AMM_SLOT_MAX_LAG", 12);
 // Hard wall-clock staleness (ms). Falls back to PRICE_STALENESS_MS if set.
 const MAX_AGE_MS = envInt("AMM_SNAPSHOT_MAX_AGE_MS", envInt("PRICE_STALENESS_MS", 5000));
 

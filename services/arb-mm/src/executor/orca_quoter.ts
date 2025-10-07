@@ -15,6 +15,7 @@
 import fs from "fs";
 import path from "path";
 import { logger } from "../ml_logger.js";
+import { cpmmBuyQuotePerBase, cpmmSellQuotePerBase } from "../util/cpmm.js";
 
 export type OrcaQuoteResult =
     | { ok: true; price: number }
@@ -34,35 +35,6 @@ function safeParseJson<T = any>(p: string): T | undefined {
         logger.log("orca_quoter_cache_error", { path: p, err: String(e?.message ?? e) });
         return undefined;
     }
-}
-
-/** Basic CPMM approx for a CLMM snapshot — conservative fallback */
-function cpmmBuyQuotePerBase(
-    base: number,
-    quote: number,
-    wantBase: number,
-    feeBps: number
-): number | undefined {
-    if (!(base > 0 && quote > 0 && wantBase > 0)) return undefined;
-    const fee = Math.max(0, feeBps) / 10_000;
-    if (wantBase >= base * (1 - 1e-9)) return undefined;
-    const dqPrime = (wantBase * quote) / (base - wantBase);
-    const dq = dqPrime / (1 - fee);
-    if (!Number.isFinite(dq)) return undefined;
-    return dq / wantBase;
-}
-function cpmmSellQuotePerBase(
-    base: number,
-    quote: number,
-    sellBase: number,
-    feeBps: number
-): number | undefined {
-    if (!(base > 0 && quote > 0 && sellBase > 0)) return undefined;
-    const fee = Math.max(0, feeBps) / 10_000;
-    const dbPrime = sellBase * (1 - fee);
-    const dy = (quote * dbPrime) / (base + dbPrime);
-    if (!Number.isFinite(dy)) return undefined;
-    return dy / sellBase;
 }
 
 /**

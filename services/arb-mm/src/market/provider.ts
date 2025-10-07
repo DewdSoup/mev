@@ -22,8 +22,15 @@ import type {
   TrackedPoolMeta,
   MarketProviderConfig,
   PoolKind,
+  AmmVenue,
 } from "./types.js";
 import { getPhoenixClient, ensurePhoenixMarketState } from "../util/phoenix.js";
+import {
+  createProgram as createMeteoraProgram,
+  decodeAccount as decodeMeteoraAccount,
+  getPriceOfBinByBinId,
+} from "@meteora-ag/dlmm";
+import { getDlmmBinArrays, getDlmmInstance } from "../util/meteora_dlmm.js";
 
 const DEFAULT_REFRESH_MS = Number(process.env.MARKET_PROVIDER_REFRESH_MS ?? 600);
 const DEFAULT_REFRESH_DEBOUNCE_MS = Number(
@@ -37,11 +44,15 @@ const DEFAULT_STALE_MS = Number(process.env.MARKET_PROVIDER_STALE_MS ?? 6_000);
 const DEFAULT_SNAPSHOT_TTL_MS = Number(process.env.AMM_SNAPSHOT_TTL_MS ?? DEFAULT_STALE_MS ?? 6_000);
 const DEFAULT_PHOENIX_DEPTH = Number(process.env.MARKET_PROVIDER_PHOENIX_DEPTH ?? 3);
 const DEFAULT_TELEMETRY_MS = Number(process.env.MARKET_PROVIDER_TELEMETRY_MS ?? 15_000);
+const DEFAULT_SLOT_LAG = Number(process.env.AMM_SLOT_MAX_LAG ?? 12);
+const DEFAULT_SLOT_GAP_STRIKES = Math.max(1, Number(process.env.AMM_SLOT_GAP_STRIKES ?? 3));
 
 const SOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 
 type AccountChangeHandler = (info: AccountInfo<Buffer>, slot: number | null) => void;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 
 type PoolWatcherState = {
   meta: TrackedPoolMeta;
@@ -131,6 +142,7 @@ export class MarketStateProvider {
   private lastRefreshLogTs = 0;
   private readonly phoenixLogCooldownMs: number;
   private lastPhoenixLogTs = 0;
+  private readonly mintDecimals = new Map<string, number>();
 
   private emitScheduled = false;
 
@@ -149,6 +161,7 @@ export class MarketStateProvider {
     batches: 0,
   };
   private readonly ammDegradedReasons = new Map<string, string>();
+  private readonly slotGapStrikes = new Map<string, number>();
   private telemetryTimer: NodeJS.Timeout | null = null;
   private refreshTimer: NodeJS.Timeout | null = null; // retained for backwards compat (legacy callers)
   private phoenixTimer: NodeJS.Timeout | null = null;
@@ -159,6 +172,8 @@ export class MarketStateProvider {
 
   private started = false;
   private stopping = false;
+
+  private meteoraProgram: any | null = null;
 
   constructor(conn: Connection, pairs?: PairSpec[], cfg?: MarketProviderConfig) {
     this.conn = conn;
@@ -313,6 +328,7 @@ export class MarketStateProvider {
   private collectPools(): TrackedPoolMeta[] {
     const enableRaydiumClmm = String(process.env.ENABLE_AMM_RAYDIUM_CLMM ?? process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0";
     const enableOrcaClmm = String(process.env.ENABLE_AMM_ORCA ?? "0").trim() === "1";
+    const enableMeteoraDlmm = String(process.env.ENABLE_AMM_METEORA ?? "1").trim() !== "0";
     const seen = new Set<string>();
     const out: TrackedPoolMeta[] = [];
 
@@ -322,21 +338,23 @@ export class MarketStateProvider {
       if ((venue as any).enabled === false) return;
 
       const venueName = String(((venue as any).kind ?? venue.venue ?? "")).toLowerCase();
-      if (venueName !== "raydium" && venueName !== "orca") return;
+      if (venueName !== "raydium" && venueName !== "orca" && venueName !== "meteora") return;
 
       const poolKind = String((venue.poolKind ?? "")).toLowerCase();
       if (poolKind === "clmm") {
         if (venueName === "raydium" && !enableRaydiumClmm) return;
         if (venueName === "orca" && !enableOrcaClmm) return;
+      } else if (poolKind === "dlmm") {
+        if (venueName === "meteora" && !enableMeteoraDlmm) return;
       }
-      if (poolKind !== "cpmm" && poolKind !== "clmm") return;
+      if (poolKind !== "cpmm" && poolKind !== "clmm" && poolKind !== "dlmm") return;
 
       const key = `${venueName}:${rawPool}`;
       if (seen.has(key)) return;
       seen.add(key);
       out.push({
         poolId: rawPool,
-        venue: venueName as "raydium" | "orca",
+        venue: venueName as AmmVenue,
         poolKind: poolKind as PoolKind,
         feeHint: typeof venue.feeBps === "number" ? venue.feeBps : undefined,
       });
@@ -361,6 +379,23 @@ export class MarketStateProvider {
       out.push({ market, symbol });
     }
     return out;
+  }
+
+  private getMeteoraProgram() {
+    if (!this.meteoraProgram) {
+      this.meteoraProgram = createMeteoraProgram(this.conn);
+    }
+    return this.meteoraProgram;
+  }
+
+  private async loadMintDecimalsCached(mint: PublicKey): Promise<number> {
+    const key = mint.toBase58();
+    const cached = this.mintDecimals.get(key);
+    if (cached != null) return cached;
+    const info = await this.conn.getParsedAccountInfo(mint, "processed");
+    const decimals = Number((info.value as any)?.data?.parsed?.info?.decimals ?? 9);
+    this.mintDecimals.set(key, decimals);
+    return decimals;
   }
 
   private setupSubscriptions(): void {
@@ -427,6 +462,10 @@ export class MarketStateProvider {
       return;
     }
     if (pool.poolKind === "clmm") {
+      this.handleClmmVault(pool, which, info, slot);
+      return;
+    }
+    if (pool.poolKind === "dlmm") {
       this.handleClmmVault(pool, which, info, slot);
     }
   }
@@ -662,6 +701,7 @@ export class MarketStateProvider {
   }
 
   private clearAmmDegraded(poolId: string): void {
+    this.slotGapStrikes.delete(poolId);
     if (this.ammDegradedReasons.has(poolId)) {
       this.ammDegradedReasons.delete(poolId);
     }
@@ -679,9 +719,19 @@ export class MarketStateProvider {
         // If the last applied slot is far behind, flag degraded to allow a single HTTP backfill
         if (slot != null) {
           for (const [poolId, snap] of this.amms) {
-            const lagOk = Number(process.env.AMM_SLOT_MAX_LAG ?? 8);
-            if (snap.slot != null && slot - snap.slot > lagOk) {
-              this.setAmmDegraded(poolId, "slot_gap");
+            if (snap.slot == null) continue;
+            const lag = slot - snap.slot;
+            if (lag > DEFAULT_SLOT_LAG) {
+              const strikes = (this.slotGapStrikes.get(poolId) ?? 0) + 1;
+              this.slotGapStrikes.set(poolId, strikes);
+              if (strikes >= DEFAULT_SLOT_GAP_STRIKES) {
+                this.setAmmDegraded(poolId, "slot_gap");
+              }
+            } else {
+              if (this.slotGapStrikes.has(poolId)) this.slotGapStrikes.delete(poolId);
+              if (this.ammDegradedReasons.get(poolId) === "slot_gap") {
+                this.clearAmmDegraded(poolId);
+              }
             }
           }
         }
@@ -745,6 +795,11 @@ export class MarketStateProvider {
       }
       if (pool.venue === "orca" && pool.poolKind === "clmm") {
         this.handleOrcaClmmState(pool, info, slot);
+        return;
+      }
+      if (pool.venue === "meteora" && pool.poolKind === "dlmm") {
+        void this.handleMeteoraDlmmState(pool, info, slot);
+        return;
       }
     } catch (err) {
       logger.log("market_provider_pool_ws_error", {
@@ -814,10 +869,12 @@ export class MarketStateProvider {
     const reserve = amount.toNumber() / 10 ** decimals;
     const atomsStr = amount.toString();
 
+    const effectiveSlot = pool.poolKind === "dlmm" ? null : slot;
+
     const next: AmmSnapshot = {
       ...snap,
       lastUpdateTs: Date.now(),
-      slot: slot ?? snap.slot ?? null,
+      slot: effectiveSlot ?? snap.slot ?? null,
       stale: false,
     };
     if (which === "base") {
@@ -869,10 +926,11 @@ export class MarketStateProvider {
 
   private handleRaydiumClmmState(pool: TrackedPoolMeta, info: AccountInfo<Buffer>, slot: number | null): void {
     const state: any = PoolInfoLayout.decode(info.data);
-    const mintA = new PublicKey(state.mintA.mint);
-    const mintB = new PublicKey(state.mintB.mint);
-    const decimalsA = Number(state.mintA.decimals ?? 0);
-    const decimalsB = Number(state.mintB.decimals ?? 0);
+    const parsed = this.parseRaydiumClmmState(state);
+    const mintA = parsed.mintA;
+    const mintB = parsed.mintB;
+    const decimalsA = parsed.decimalsA;
+    const decimalsB = parsed.decimalsB;
 
     const prev = this.amms.get(pool.poolId);
 
@@ -881,12 +939,12 @@ export class MarketStateProvider {
     const baseDecimals = baseIsA ? decimalsA : decimalsB;
     const quoteDecimals = baseIsA ? decimalsB : decimalsA;
 
-    const vaultA = new PublicKey(state.vaultA).toBase58();
-    const vaultB = new PublicKey(state.vaultB).toBase58();
+    const vaultA = parsed.vaultA.toBase58();
+    const vaultB = parsed.vaultB.toBase58();
     const baseVault = baseIsA ? vaultA : vaultB;
     const quoteVault = baseIsA ? vaultB : vaultA;
 
-    const sqrtPrice = new BN(state.sqrtPriceX64.toString());
+    const sqrtPrice = parsed.sqrtPriceX64;
     const priceAB = SqrtPriceMath.sqrtPriceX64ToPrice(sqrtPrice, decimalsA, decimalsB).toNumber();
     const priceBA = priceAB > 0 ? 1 / priceAB : null;
     let price = baseIsA ? priceBA ?? priceAB : priceAB;
@@ -894,7 +952,8 @@ export class MarketStateProvider {
       price = Math.max(priceAB, priceBA);
     }
 
-    const feeBps = pool.feeHint ?? prev?.feeBps ?? (Number.isFinite(state.tradeFeeRate) ? Number(state.tradeFeeRate) * 10_000 : null);
+    const feeFromState = this.toFeeBps(parsed.tradeFeeRate);
+    const feeBps = pool.feeHint ?? prev?.feeBps ?? feeFromState;
     const snap: AmmSnapshot = {
       poolId: pool.poolId,
       venue: pool.venue,
@@ -967,6 +1026,131 @@ export class MarketStateProvider {
     };
 
     this.commitAmmSnapshot(pool, snap, slot ?? prev?.slot ?? null);
+    const watcher = this.poolWatchers.get(pool.poolId);
+    if (watcher) this.ensurePoolVaultSubscriptions(watcher, snap);
+  }
+
+  private async handleMeteoraDlmmState(pool: TrackedPoolMeta, info: AccountInfo<Buffer>, slot: number | null): Promise<void> {
+    const program = this.getMeteoraProgram();
+    const pair = decodeMeteoraAccount(program, "lbPair", info.data) as any;
+    if (!pair) return;
+
+    try {
+      await getDlmmInstance(pool.poolId, this.conn);
+    } catch (err) {
+      logger.log("meteora_dlmm_instance_refresh_error", { pool: pool.poolId, err: String((err as any)?.message ?? err) });
+    }
+
+    try {
+      await getDlmmBinArrays({
+        poolId: pool.poolId,
+        swapForY: true,
+        connection: this.conn,
+        allowStale: true,
+        allowRefresh: true,
+      });
+      await getDlmmBinArrays({
+        poolId: pool.poolId,
+        swapForY: false,
+        connection: this.conn,
+        allowStale: true,
+        allowRefresh: true,
+      });
+    } catch (err) {
+      logger.log("meteora_dlmm_binarray_refresh_error", { pool: pool.poolId, err: String((err as any)?.message ?? err) });
+    }
+
+    const mintX = new PublicKey(pair.tokenXMint);
+    const mintY = new PublicKey(pair.tokenYMint);
+
+    const configuredBase = this.findBaseMint(pool.poolId);
+    const baseIsX = configuredBase ? configuredBase.equals(mintX) : true;
+
+    const baseMint = baseIsX ? mintX : mintY;
+    const quoteMint = baseIsX ? mintY : mintX;
+
+    const [baseDecimals, quoteDecimals] = await Promise.all([
+      this.loadMintDecimalsCached(baseMint),
+      this.loadMintDecimalsCached(quoteMint),
+    ]);
+
+    const activeId = typeof pair.activeId?.toString === "function" ? Number(pair.activeId.toString()) : Number(pair.activeId ?? 0);
+    const binStep = Number(pair.binStep ?? 0);
+    let price: number | null = null;
+    if (Number.isFinite(activeId) && Number.isFinite(binStep)) {
+      const ratio = Number(getPriceOfBinByBinId(activeId, binStep));
+      if (Number.isFinite(ratio) && ratio > 0) {
+        if (baseIsX) {
+          price = ratio * Math.pow(10, baseDecimals - quoteDecimals);
+        } else {
+          const inv = ratio > 0 ? 1 / ratio : null;
+          if (inv != null) {
+            price = inv * Math.pow(10, quoteDecimals - baseDecimals);
+          }
+        }
+      }
+    }
+
+    const reserveX = new PublicKey(pair.reserveX);
+    const reserveY = new PublicKey(pair.reserveY);
+    let reserveInfoX: any = null;
+    let reserveInfoY: any = null;
+    try {
+      const vaultInfos = await this.conn.getMultipleAccountsInfo([reserveX, reserveY], { commitment: "confirmed" });
+      reserveInfoX = vaultInfos[0]?.data ? SPL_ACCOUNT_LAYOUT.decode(vaultInfos[0].data) : null;
+      reserveInfoY = vaultInfos[1]?.data ? SPL_ACCOUNT_LAYOUT.decode(vaultInfos[1].data) : null;
+    } catch (err) {
+      logger.log("meteora_dlmm_reserve_error", { pool: pool.poolId, err: String((err as any)?.message ?? err) });
+    }
+
+    const amountX = reserveInfoX ? new BN(reserveInfoX.amount.toString()) : null;
+    const amountY = reserveInfoY ? new BN(reserveInfoY.amount.toString()) : null;
+
+    const baseAtoms = baseIsX ? amountX : amountY;
+    const quoteAtoms = baseIsX ? amountY : amountX;
+
+    const prevSnap = this.amms.get(pool.poolId);
+
+    const baseReserve = baseAtoms
+      ? Number(baseAtoms.toString()) / Math.pow(10, baseDecimals)
+      : (typeof prevSnap?.baseReserve === "number" ? prevSnap.baseReserve : null);
+    const quoteReserve = quoteAtoms
+      ? Number(quoteAtoms.toString()) / Math.pow(10, quoteDecimals)
+      : (typeof prevSnap?.quoteReserve === "number" ? prevSnap.quoteReserve : null);
+
+    const feeBps = typeof pool.feeHint === "number" ? pool.feeHint : null;
+
+    const snap: AmmSnapshot = {
+      poolId: pool.poolId,
+      venue: "meteora",
+      poolKind: "dlmm",
+      price,
+      feeBps,
+      baseDecimals,
+      quoteDecimals,
+      baseVault: (baseIsX ? reserveX : reserveY).toBase58(),
+      quoteVault: (baseIsX ? reserveY : reserveX).toBase58(),
+      baseReserve,
+      quoteReserve,
+      baseReserveUi: baseReserve,
+      quoteReserveUi: quoteReserve,
+      baseReserveAtoms: baseAtoms?.toString() ?? prevSnap?.baseReserveAtoms ?? null,
+      quoteReserveAtoms: quoteAtoms?.toString() ?? prevSnap?.quoteReserveAtoms ?? null,
+      lastUpdateTs: Date.now(),
+      slot: slot ?? null,
+      stale: false,
+      meta: {
+        activeId,
+        binStep,
+        tokenXMint: mintX.toBase58(),
+        tokenYMint: mintY.toBase58(),
+      },
+      reserves: baseReserve != null && quoteReserve != null
+        ? { base: baseReserve, quote: quoteReserve, baseDecimals, quoteDecimals }
+        : prevSnap?.reserves,
+    };
+
+    this.commitAmmSnapshot(pool, snap, slot ?? null);
     const watcher = this.poolWatchers.get(pool.poolId);
     if (watcher) this.ensurePoolVaultSubscriptions(watcher, snap);
   }
@@ -1175,6 +1359,8 @@ export class MarketStateProvider {
             this.handleRaydiumClmmState(pool, info, slot);
           } else if (pool.venue === "orca" && pool.poolKind === "clmm") {
             this.handleOrcaClmmState(pool, info, slot);
+          } else if (pool.venue === "meteora" && pool.poolKind === "dlmm") {
+            await this.handleMeteoraDlmmState(pool, info, slot);
           }
         } catch (err) {
           const isRateLimit = this.isRateLimitError(err);
@@ -1310,6 +1496,7 @@ export class MarketStateProvider {
     if (pool.venue === "raydium" && pool.poolKind === "cpmm") return this.refreshRaydiumCpmm(pool, force);
     if (pool.venue === "raydium" && pool.poolKind === "clmm") return this.refreshRaydiumClmm(pool, force);
     if (pool.venue === "orca" && pool.poolKind === "clmm") return this.refreshOrcaClmm(pool, force);
+    if (pool.venue === "meteora" && pool.poolKind === "dlmm") return this.refreshMeteoraDlmm(pool, force);
     return null;
   }
 
@@ -1398,32 +1585,35 @@ export class MarketStateProvider {
   private async refreshRaydiumClmm(pool: TrackedPoolMeta, force: boolean): Promise<AmmSnapshot | null> {
     const prev = this.amms.get(pool.poolId);
     const now = Date.now();
-    if (!force && prev && now - prev.lastUpdateTs < this.config.refreshMs * 3) {
+    const minInterval = Math.max(250, this.config.refreshMs ?? 1000);
+    if (!force && prev && now - prev.lastUpdateTs < minInterval) {
       return null;
     }
 
     const info = await this.conn.getAccountInfo(new PublicKey(pool.poolId), "confirmed");
     if (!info?.data) throw new Error("raydium_clmm_account_missing");
     const state: any = PoolInfoLayout.decode(info.data);
+    const parsed = this.parseRaydiumClmmState(state);
 
-    const mintA = new PublicKey(state.mintA.mint);
-    const mintB = new PublicKey(state.mintB.mint);
-    const decimalsA = Number(state.mintA.decimals ?? 0);
-    const decimalsB = Number(state.mintB.decimals ?? 0);
+    const mintA = parsed.mintA;
+    const mintB = parsed.mintB;
+    const decimalsA = parsed.decimalsA;
+    const decimalsB = parsed.decimalsB;
 
     const baseMint = this.findBaseMint(pool.poolId) ?? mintA;
     const baseIsA = baseMint.equals(mintA);
     const baseDecimals = baseIsA ? decimalsA : decimalsB;
     const quoteDecimals = baseIsA ? decimalsB : decimalsA;
 
-    const sqrtPrice = new BN(state.sqrtPriceX64.toString());
+    const sqrtPrice = parsed.sqrtPriceX64;
     const rawPrice = SqrtPriceMath.sqrtPriceX64ToPrice(sqrtPrice, decimalsA, decimalsB).toNumber();
     const price = baseIsA ? rawPrice : rawPrice > 0 ? 1 / rawPrice : null;
 
-    const feeBps = pool.feeHint ?? (Number.isFinite(state.tradeFeeRate) ? Number(state.tradeFeeRate) * 10_000 : null);
+    const feeFromState = this.toFeeBps(parsed.tradeFeeRate);
+    const feeBps = pool.feeHint ?? prev?.feeBps ?? feeFromState;
 
-    const vaultAPk = new PublicKey(state.vaultA);
-    const vaultBPk = new PublicKey(state.vaultB);
+    const vaultAPk = parsed.vaultA;
+    const vaultBPk = parsed.vaultB;
     const vaultInfos = await this.conn.getMultipleAccountsInfo([vaultAPk, vaultBPk], { commitment: "confirmed" });
     if (!vaultInfos[0]?.data || !vaultInfos[1]?.data) throw new Error("raydium_clmm_vault_missing");
     const vaultAInfo: any = SPL_ACCOUNT_LAYOUT.decode(vaultInfos[0].data);
@@ -1459,6 +1649,90 @@ export class MarketStateProvider {
     };
   }
 
+  private parseRaydiumClmmState(state: any): {
+    mintA: PublicKey;
+    mintB: PublicKey;
+    vaultA: PublicKey;
+    vaultB: PublicKey;
+    decimalsA: number;
+    decimalsB: number;
+    sqrtPriceX64: BN;
+    tradeFeeRate: number | null;
+  } {
+    const mintA = this.coercePublicKey(state?.mintA, "mintA");
+    const mintB = this.coercePublicKey(state?.mintB, "mintB");
+    const vaultA = this.coercePublicKey(state?.vaultA, "vaultA");
+    const vaultB = this.coercePublicKey(state?.vaultB, "vaultB");
+    const decimalsA = this.readRaydiumMintDecimals(state, "A");
+    const decimalsB = this.readRaydiumMintDecimals(state, "B");
+    const sqrtPriceRaw = state?.sqrtPriceX64 ?? state?.sqrtPrice ?? state?.currentSqrtPriceX64;
+    if (!sqrtPriceRaw) throw new Error("raydium_clmm_missing_sqrt_price");
+    const sqrtPriceX64 = new BN(sqrtPriceRaw.toString());
+    const tradeFeeRate = Number.isFinite(Number(state?.tradeFeeRate))
+      ? Number(state.tradeFeeRate)
+      : Number.isFinite(Number(state?.feeRate))
+        ? Number(state.feeRate)
+        : null;
+    return {
+      mintA,
+      mintB,
+      vaultA,
+      vaultB,
+      decimalsA,
+      decimalsB,
+      sqrtPriceX64,
+      tradeFeeRate,
+    };
+  }
+
+  private coercePublicKey(value: unknown, label: string): PublicKey {
+    const attempt = (input: unknown): PublicKey | null => {
+      if (input == null) return null;
+      try {
+        if (input instanceof PublicKey) return input;
+        if (typeof input === "string" && input.trim()) return new PublicKey(input.trim());
+        if (input instanceof Uint8Array) return new PublicKey(input);
+        if (typeof (input as any)?.toBase58 === "function") return new PublicKey((input as any).toBase58());
+        if (typeof (input as any)?.toBytes === "function") return new PublicKey((input as any).toBytes());
+        return new PublicKey(input as any);
+      } catch {
+        return null;
+      }
+    };
+
+    let pk = attempt(value);
+    if (!pk && value && typeof value === "object") {
+      const nested =
+        (value as any).mint ??
+        (value as any).vault ??
+        (value as any).pubkey ??
+        (value as any).publicKey ??
+        (value as any).address;
+      pk = attempt(nested);
+    }
+    if (!pk) throw new Error(`raydium_clmm_invalid_pubkey_${label}`);
+    return pk;
+  }
+
+  private readRaydiumMintDecimals(state: any, which: "A" | "B"): number {
+    const directKey = which === "A" ? "mintDecimalsA" : "mintDecimalsB";
+    const direct = state?.[directKey];
+    const directNum = Number(direct);
+    if (Number.isFinite(directNum) && directNum >= 0) return directNum;
+    const nested = which === "A" ? state?.mintA?.decimals : state?.mintB?.decimals;
+    const nestedNum = Number(nested);
+    if (Number.isFinite(nestedNum) && nestedNum >= 0) return nestedNum;
+    return 0;
+  }
+
+  private toFeeBps(raw: unknown): number | null {
+    if (raw == null) return null;
+    const num = Number(raw);
+    if (!Number.isFinite(num) || num <= 0) return null;
+    if (num <= 1) return Math.round(num * 10_000);
+    return Math.round(num);
+  }
+
   private findBaseMint(_pool: string): PublicKey | null {
     for (const pair of this.pairs) {
       for (const venue of pair.ammVenues ?? []) {
@@ -1473,7 +1747,8 @@ export class MarketStateProvider {
   private async refreshOrcaClmm(pool: TrackedPoolMeta, force: boolean): Promise<AmmSnapshot | null> {
     const prev = this.amms.get(pool.poolId);
     const now = Date.now();
-    if (!force && prev && now - prev.lastUpdateTs < this.config.refreshMs * 3) {
+    const minimalRefresh = Math.max(250, this.config.refreshMs ?? DEFAULT_REFRESH_MS);
+    if (!force && prev && now - prev.lastUpdateTs < minimalRefresh) {
       return null;
     }
 
@@ -1532,6 +1807,43 @@ export class MarketStateProvider {
       lastUpdateTs: Date.now(),
       slot: null,
     };
+  }
+
+  private async refreshMeteoraDlmm(pool: TrackedPoolMeta, force: boolean): Promise<AmmSnapshot | null> {
+    const prev = this.amms.get(pool.poolId);
+    const now = Date.now();
+    const minimalRefresh = Math.max(250, this.config.refreshMs ?? DEFAULT_REFRESH_MS);
+    if (!force && prev && now - prev.lastUpdateTs < minimalRefresh) {
+      return null;
+    }
+    const maxAttempts = Math.max(1, Number(process.env.METEORA_REFRESH_ATTEMPTS ?? 3));
+    const baseDelay = Math.max(150, Number(process.env.METEORA_REFRESH_BACKOFF_MS ?? 200));
+    let lastErr: unknown = null;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        const info = await this.conn.getAccountInfo(new PublicKey(pool.poolId), "confirmed");
+        if (!info?.data) throw new Error("meteora_lbpair_missing");
+        await this.handleMeteoraDlmmState(pool, info, null);
+        const snap = this.amms.get(pool.poolId) ?? null;
+        if (snap) this.clearAmmDegraded(pool.poolId);
+        return snap;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < maxAttempts - 1) {
+          await sleep(baseDelay * Math.pow(2, attempt));
+          continue;
+        }
+      }
+    }
+
+    const errMsg = String((lastErr as any)?.message ?? lastErr ?? "unknown_error");
+    logger.log("meteora_dlmm_refresh_error", { pool: pool.poolId, err: errMsg, attempts: maxAttempts });
+    this.setAmmDegraded(pool.poolId, `refresh_failed:${errMsg}`.slice(0, 64));
+    if (prev) {
+      this.amms.set(pool.poolId, { ...prev, lastUpdateTs: Date.now(), stale: false });
+    }
+    return prev ?? null;
   }
 
   private async resolveMintDecimals(mint: PublicKey): Promise<number> {
@@ -1853,6 +2165,8 @@ function resolvePhoenixPath(): string {
 }
 
 function serializeAmmSnapshot(snap: AmmSnapshot) {
+  const rawPrice = typeof snap.price === "number" ? snap.price : undefined;
+  const finitePrice = rawPrice != null && Number.isFinite(rawPrice) && rawPrice > 0 ? rawPrice : undefined;
   return {
     symbol: "SOL/USDC",
     venue: snap.venue,
@@ -1861,8 +2175,8 @@ function serializeAmmSnapshot(snap: AmmSnapshot) {
     ts: snap.lastUpdateTs,
     baseDecimals: snap.baseDecimals,
     quoteDecimals: snap.quoteDecimals,
-    px: snap.price ?? undefined,
-    px_str: snap.price != null ? String(snap.price) : undefined,
+    px: finitePrice,
+    px_str: finitePrice != null ? String(finitePrice) : undefined,
     feeBps: snap.feeBps ?? undefined,
     fee_source: snap.feeBps != null ? "provider" : undefined,
     tick_ms: DEFAULT_REFRESH_MS,
@@ -1870,7 +2184,7 @@ function serializeAmmSnapshot(snap: AmmSnapshot) {
     base_vault: snap.baseVault ?? undefined,
     quote_vault: snap.quoteVault ?? undefined,
     source: "provider",
-    validation_passed: snap.price != null,
+    validation_passed: finitePrice != null,
     base_ui: snap.baseReserveUi ?? snap.baseReserve ?? undefined,
     quote_ui: snap.quoteReserveUi ?? snap.quoteReserve ?? undefined,
     base_int: snap.baseReserveAtoms ?? (snap.baseReserve != null
