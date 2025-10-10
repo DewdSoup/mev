@@ -86,8 +86,19 @@ function classifyError(e: any): { retry: boolean; rateLimited: boolean } {
   if (!e) return { retry: false, rateLimited: false };
   const msg = String((e as any)?.message ?? e).toLowerCase();
   const rateLimited = msg.includes("429") || msg.includes("rate limit") || msg.includes("too many requests");
+  const networkFlaky =
+    msg.includes("fetch failed") ||
+    msg.includes("failed to fetch") ||
+    msg.includes("socket hang up") ||
+    msg.includes("econnreset") ||
+    msg.includes("connection reset") ||
+    msg.includes("etimedout") ||
+    msg.includes("timed out") ||
+    msg.includes("tls handshake timeout") ||
+    msg.includes("temporarily unavailable");
   const transient =
     rateLimited ||
+    networkFlaky ||
     msg.includes("timeout") ||
     msg.includes("internal server error") ||
     msg.includes("502") ||

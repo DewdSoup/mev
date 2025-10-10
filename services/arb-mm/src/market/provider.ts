@@ -31,6 +31,7 @@ import {
   getPriceOfBinByBinId,
 } from "@meteora-ag/dlmm";
 import { getDlmmBinArrays, getDlmmInstance } from "../util/meteora_dlmm.js";
+import { summarizeHeartbeatByVenue } from "../runtime/metrics.js";
 
 const DEFAULT_REFRESH_MS = Number(process.env.MARKET_PROVIDER_REFRESH_MS ?? 600);
 const DEFAULT_REFRESH_DEBOUNCE_MS = Number(
@@ -46,6 +47,29 @@ const DEFAULT_PHOENIX_DEPTH = Number(process.env.MARKET_PROVIDER_PHOENIX_DEPTH ?
 const DEFAULT_TELEMETRY_MS = Number(process.env.MARKET_PROVIDER_TELEMETRY_MS ?? 15_000);
 const DEFAULT_SLOT_LAG = Number(process.env.AMM_SLOT_MAX_LAG ?? 12);
 const DEFAULT_SLOT_GAP_STRIKES = Math.max(1, Number(process.env.AMM_SLOT_GAP_STRIKES ?? 3));
+
+function loadVenueOverrides(prefix: string): Record<string, number> {
+  const out: Record<string, number> = {};
+  const needle = `${prefix}__`;
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.startsWith(needle)) continue;
+    const venue = key.slice(needle.length).toLowerCase();
+    const num = Number(value);
+    if (Number.isFinite(num)) out[venue] = Number(num);
+  }
+  return out;
+}
+
+function resolveVenueNumber(venue: string | undefined, overrides: Record<string, number>, fallback: number): number {
+  if (!venue) return fallback;
+  return overrides[venue.toLowerCase()] ?? fallback;
+}
+
+const SLOT_LAG_OVERRIDES = loadVenueOverrides("AMM_SLOT_MAX_LAG");
+
+function slotLagLimitFor(venue: string | undefined): number {
+  return resolveVenueNumber(venue, SLOT_LAG_OVERRIDES, DEFAULT_SLOT_LAG);
+}
 
 const SOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
@@ -357,6 +381,7 @@ export class MarketStateProvider {
         venue: venueName as AmmVenue,
         poolKind: poolKind as PoolKind,
         feeHint: typeof venue.feeBps === "number" ? venue.feeBps : undefined,
+        freshness: venue.freshness,
       });
     };
 
@@ -519,8 +544,29 @@ export class MarketStateProvider {
   private commitAmmSnapshot(pool: TrackedPoolMeta, snap: AmmSnapshot, slot: number | null): void {
     const prev = this.amms.get(pool.poolId);
     const now = Date.now();
+    const slotValue = slot ?? snap.slot ?? null;
     snap.lastUpdateTs = now;
-    snap.slot = slot ?? snap.slot ?? null;
+    snap.slot = slotValue;
+
+    if (typeof snap.tradeableWhenDegraded !== "boolean") {
+      snap.tradeableWhenDegraded =
+        typeof prev?.tradeableWhenDegraded === "boolean"
+          ? prev.tradeableWhenDegraded
+          : Boolean(pool.freshness?.tradeableWhenDegraded);
+    }
+
+    snap.wsAt = snap.wsAt ?? prev?.wsAt ?? now;
+    snap.heartbeatAt = snap.heartbeatAt ?? prev?.heartbeatAt ?? now;
+    if (slotValue != null) {
+      snap.heartbeatSlot = slotValue;
+      snap.syntheticSlot = false;
+    } else {
+      if (snap.heartbeatSlot == null) snap.heartbeatSlot = prev?.heartbeatSlot ?? null;
+      if (snap.syntheticSlot === undefined) snap.syntheticSlot = prev?.syntheticSlot;
+    }
+
+    snap.source = snap.source ?? prev?.source ?? "provider";
+
     snap.degraded = false;
     snap.degradedReason = null;
     snap.ageMs = 0;
@@ -720,8 +766,10 @@ export class MarketStateProvider {
         if (slot != null) {
           for (const [poolId, snap] of this.amms) {
             if (snap.slot == null) continue;
+            const venue = snap.venue ?? this.trackedPools.find((p) => p.poolId === poolId)?.venue;
+            const lagLimit = slotLagLimitFor(venue);
             const lag = slot - snap.slot;
-            if (lag > DEFAULT_SLOT_LAG) {
+            if (lag > lagLimit) {
               const strikes = (this.slotGapStrikes.get(poolId) ?? 0) + 1;
               this.slotGapStrikes.set(poolId, strikes);
               if (strikes >= DEFAULT_SLOT_GAP_STRIKES) {
@@ -834,6 +882,11 @@ export class MarketStateProvider {
       ? quoteReserve / baseReserve
       : prev?.price ?? null;
 
+    const now = Date.now();
+    const slotHint = slot ?? prev?.slot ?? null;
+    const tradeablePreferred = Boolean(pool.freshness?.tradeableWhenDegraded);
+    const heartbeatSlot = slot ?? prev?.heartbeatSlot ?? slotHint ?? null;
+
     const snap: AmmSnapshot = {
       poolId: pool.poolId,
       venue: pool.venue,
@@ -846,11 +899,17 @@ export class MarketStateProvider {
       quoteVault,
       baseReserve,
       quoteReserve,
-      lastUpdateTs: Date.now(),
-      slot: slot ?? prev?.slot ?? null,
+      lastUpdateTs: now,
+      slot: slotHint,
+      wsAt: now,
+      heartbeatAt: now,
+      heartbeatSlot,
+      syntheticSlot: slotHint == null ? prev?.syntheticSlot : false,
+      tradeableWhenDegraded: tradeablePreferred,
+      source: "provider",
       stale: false,
     };
-    this.commitAmmSnapshot(pool, snap, slot ?? prev?.slot ?? null);
+    this.commitAmmSnapshot(pool, snap, slotHint);
     const watcher = this.poolWatchers.get(pool.poolId);
     if (watcher) this.ensurePoolVaultSubscriptions(watcher, snap);
   }
@@ -871,11 +930,20 @@ export class MarketStateProvider {
 
     const effectiveSlot = pool.poolKind === "dlmm" ? null : slot;
 
+    const now = Date.now();
+    const slotHint = effectiveSlot ?? snap.slot ?? null;
+    const heartbeatSlot = effectiveSlot ?? snap.heartbeatSlot ?? slotHint ?? null;
+
     const next: AmmSnapshot = {
       ...snap,
-      lastUpdateTs: Date.now(),
-      slot: effectiveSlot ?? snap.slot ?? null,
+      lastUpdateTs: now,
+      slot: slotHint,
+      wsAt: now,
+      heartbeatAt: now,
+      heartbeatSlot,
+      syntheticSlot: effectiveSlot != null ? false : snap.syntheticSlot,
       stale: false,
+      source: snap.source ?? "provider",
     };
     if (which === "base") {
       next.baseReserve = reserve;
@@ -887,7 +955,7 @@ export class MarketStateProvider {
       next.quoteReserveAtoms = atomsStr;
     }
 
-    this.commitAmmSnapshot(pool, next, slot ?? snap.slot ?? null);
+    this.commitAmmSnapshot(pool, next, slotHint);
   }
 
   private handleClmmVault(
@@ -904,11 +972,20 @@ export class MarketStateProvider {
     const decimals = which === "base" ? snap.baseDecimals : snap.quoteDecimals;
     const reserve = amount.toNumber() / 10 ** decimals;
 
+    const now = Date.now();
+    const slotHint = slot ?? snap.slot ?? null;
+    const heartbeatSlot = slot ?? snap.heartbeatSlot ?? slotHint ?? null;
+
     const next: AmmSnapshot = {
       ...snap,
-      lastUpdateTs: Date.now(),
-      slot: slot ?? snap.slot ?? null,
+      lastUpdateTs: now,
+      slot: slotHint,
+      wsAt: now,
+      heartbeatAt: now,
+      heartbeatSlot,
+      syntheticSlot: slot != null ? false : snap.syntheticSlot,
       stale: false,
+      source: snap.source ?? "provider",
     };
 
     if (which === "base") {
@@ -921,7 +998,7 @@ export class MarketStateProvider {
       next.quoteReserveAtoms = atomsStr;
     }
 
-    this.commitAmmSnapshot(pool, next, slot ?? snap.slot ?? null);
+    this.commitAmmSnapshot(pool, next, slotHint);
   }
 
   private handleRaydiumClmmState(pool: TrackedPoolMeta, info: AccountInfo<Buffer>, slot: number | null): void {
@@ -954,6 +1031,10 @@ export class MarketStateProvider {
 
     const feeFromState = this.toFeeBps(parsed.tradeFeeRate);
     const feeBps = pool.feeHint ?? prev?.feeBps ?? feeFromState;
+    const now = Date.now();
+    const slotHint = slot ?? prev?.slot ?? null;
+    const tradeablePreferred = Boolean(pool.freshness?.tradeableWhenDegraded);
+    const heartbeatSlot = slot ?? prev?.heartbeatSlot ?? slotHint ?? null;
     const snap: AmmSnapshot = {
       poolId: pool.poolId,
       venue: pool.venue,
@@ -966,12 +1047,18 @@ export class MarketStateProvider {
       quoteVault,
       baseReserve: prev?.baseReserve ?? null,
       quoteReserve: prev?.quoteReserve ?? null,
-      lastUpdateTs: Date.now(),
-      slot: slot ?? prev?.slot ?? null,
+      lastUpdateTs: now,
+      slot: slotHint,
+      wsAt: now,
+      heartbeatAt: now,
+      heartbeatSlot,
+      syntheticSlot: slotHint == null ? prev?.syntheticSlot : false,
+      tradeableWhenDegraded: tradeablePreferred,
+      source: "provider",
       stale: false,
     };
 
-    this.commitAmmSnapshot(pool, snap, slot ?? prev?.slot ?? null);
+    this.commitAmmSnapshot(pool, snap, slotHint);
     const watcher = this.poolWatchers.get(pool.poolId);
     if (watcher) this.ensurePoolVaultSubscriptions(watcher, snap);
   }
@@ -1008,6 +1095,10 @@ export class MarketStateProvider {
     }
 
     const feeBps = pool.feeHint ?? prev?.feeBps ?? (Number.isFinite(whirlpool.feeRate) ? Number(whirlpool.feeRate) / 100 : null);
+    const now = Date.now();
+    const slotHint = slot ?? prev?.slot ?? null;
+    const tradeablePreferred = Boolean(pool.freshness?.tradeableWhenDegraded);
+    const heartbeatSlot = slot ?? prev?.heartbeatSlot ?? slotHint ?? null;
     const snap: AmmSnapshot = {
       poolId: pool.poolId,
       venue: pool.venue,
@@ -1020,12 +1111,18 @@ export class MarketStateProvider {
       quoteVault,
       baseReserve: prev?.baseReserve ?? null,
       quoteReserve: prev?.quoteReserve ?? null,
-      lastUpdateTs: Date.now(),
-      slot: slot ?? prev?.slot ?? null,
+      lastUpdateTs: now,
+      slot: slotHint,
+      wsAt: now,
+      heartbeatAt: now,
+      heartbeatSlot,
+      syntheticSlot: slotHint == null ? prev?.syntheticSlot : false,
+      tradeableWhenDegraded: tradeablePreferred,
+      source: "provider",
       stale: false,
     };
 
-    this.commitAmmSnapshot(pool, snap, slot ?? prev?.slot ?? null);
+    this.commitAmmSnapshot(pool, snap, slotHint);
     const watcher = this.poolWatchers.get(pool.poolId);
     if (watcher) this.ensurePoolVaultSubscriptions(watcher, snap);
   }
@@ -1120,6 +1217,11 @@ export class MarketStateProvider {
 
     const feeBps = typeof pool.feeHint === "number" ? pool.feeHint : null;
 
+    const now = Date.now();
+    const slotHint = slot ?? prevSnap?.slot ?? null;
+    const tradeablePreferred = Boolean(pool.freshness?.tradeableWhenDegraded);
+    const heartbeatSlot = slot ?? prevSnap?.heartbeatSlot ?? slotHint ?? null;
+
     const snap: AmmSnapshot = {
       poolId: pool.poolId,
       venue: "meteora",
@@ -1136,8 +1238,14 @@ export class MarketStateProvider {
       quoteReserveUi: quoteReserve,
       baseReserveAtoms: baseAtoms?.toString() ?? prevSnap?.baseReserveAtoms ?? null,
       quoteReserveAtoms: quoteAtoms?.toString() ?? prevSnap?.quoteReserveAtoms ?? null,
-      lastUpdateTs: Date.now(),
-      slot: slot ?? null,
+      lastUpdateTs: now,
+      slot: slotHint,
+      wsAt: now,
+      heartbeatAt: now,
+      heartbeatSlot,
+      syntheticSlot: slotHint == null ? prevSnap?.syntheticSlot : false,
+      tradeableWhenDegraded: tradeablePreferred,
+      source: "provider",
       stale: false,
       meta: {
         activeId,
@@ -1150,7 +1258,7 @@ export class MarketStateProvider {
         : prevSnap?.reserves,
     };
 
-    this.commitAmmSnapshot(pool, snap, slot ?? null);
+    this.commitAmmSnapshot(pool, snap, slotHint);
     const watcher = this.poolWatchers.get(pool.poolId);
     if (watcher) this.ensurePoolVaultSubscriptions(watcher, snap);
   }
@@ -2021,6 +2129,7 @@ export class MarketStateProvider {
     const staleAmms = ammHealth.stale;
     const degradedAmms = ammHealth.degraded;
     const stalePhoenix = phoenixHealth.stale;
+    const heartbeatSummary = summarizeHeartbeatByVenue(now);
 
     // Subscription counts
     const activeSubs = this.accountSubs.size;
@@ -2069,6 +2178,11 @@ export class MarketStateProvider {
       inflightOperations: {
         refreshInFlight: !!this.refreshInFlight,
         phoenixInflight: this.phoenixInflight.size
+      },
+      heartbeat: {
+        updated_at: now,
+        venues: heartbeatSummary.byVenue,
+        pools_tracked: heartbeatSummary.pools.length,
       }
     };
 
@@ -2181,9 +2295,14 @@ function serializeAmmSnapshot(snap: AmmSnapshot) {
     fee_source: snap.feeBps != null ? "provider" : undefined,
     tick_ms: DEFAULT_REFRESH_MS,
     slot: snap.slot ?? undefined,
+    heartbeat_at: snap.heartbeatAt ?? undefined,
+    heartbeat_slot: snap.heartbeatSlot ?? undefined,
+    ws_at: snap.wsAt ?? undefined,
+    synthetic_slot: typeof snap.syntheticSlot === "boolean" ? snap.syntheticSlot : undefined,
+    tradeable_when_degraded: typeof snap.tradeableWhenDegraded === "boolean" ? snap.tradeableWhenDegraded : undefined,
     base_vault: snap.baseVault ?? undefined,
     quote_vault: snap.quoteVault ?? undefined,
-    source: "provider",
+    source: snap.source ?? "provider",
     validation_passed: finitePrice != null,
     base_ui: snap.baseReserveUi ?? snap.baseReserve ?? undefined,
     quote_ui: snap.quoteReserveUi ?? snap.quoteReserve ?? undefined,

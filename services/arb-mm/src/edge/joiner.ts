@@ -68,17 +68,115 @@ const MIN_PRICE_DELTA_BPS = Math.max(0, Number(process.env.MIN_PRICE_DELTA_BPS ?
 const ALLOW_STALE_DECISIONS = envTrue("ALLOW_STALE_DECISIONS", true);
 const AMM_DEGRADE_LOG_WINDOW_MS = Math.max(500, Number(process.env.AMM_DEGRADE_LOG_WINDOW_MS ?? 2000));
 
+const PATH_PAIR_LOG_ENABLED = envTrue("LOG_PATH_PAIRS", true);
+const PATH_PAIR_LOG_PATH = (() => {
+  const explicit = String(process.env.PATH_PAIRS_LOG ?? "").trim();
+  if (explicit) return path.isAbsolute(explicit) ? explicit : path.resolve(explicit);
+  const runRoot = String(process.env.RUN_ROOT ?? "").trim();
+  if (runRoot) return path.resolve(runRoot, "path-pairs.log");
+  return path.resolve(process.cwd(), "data", "logs", "path-pairs.log");
+})();
+
+let pathPairWriter: fs.WriteStream | null = null;
+if (PATH_PAIR_LOG_ENABLED && PATH_PAIR_LOG_PATH) {
+  try { fs.mkdirSync(path.dirname(PATH_PAIR_LOG_PATH), { recursive: true }); } catch { /* ignore */ }
+  try {
+    pathPairWriter = fs.createWriteStream(PATH_PAIR_LOG_PATH, {
+      flags: "a",
+      encoding: "utf8",
+      mode: 0o644,
+    });
+  } catch (err) {
+    pathPairWriter = null;
+    logger.log("path_pair_log_open_error", { file: PATH_PAIR_LOG_PATH, err: String((err as any)?.message ?? err) });
+  }
+  const close = () => {
+    try { pathPairWriter?.end(); } catch { /* noop */ }
+    pathPairWriter = null;
+  };
+  process.once("beforeExit", close);
+  process.once("SIGINT", close);
+  process.once("SIGTERM", close);
+}
+
+function appendPathPairLog(payload: Record<string, unknown>): void {
+  if (!pathPairWriter) return;
+  try {
+    pathPairWriter.write(`${JSON.stringify(payload)}\n`);
+  } catch (err) {
+    logger.log("path_pair_log_write_error", { err: String((err as any)?.message ?? err) });
+    try { pathPairWriter.end(); } catch { /* noop */ }
+    pathPairWriter = null;
+  }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
-// Staleness guard (inline helper)
+// Staleness guard helpers
 function envInt(name: string, def: number) {
   const n = Number(process.env[name]);
   return Number.isFinite(n) ? n : def;
 }
-const AMM_SLOT_MAX_LAG = envInt("AMM_SLOT_MAX_LAG", 2);
-const AMM_SNAPSHOT_FALLBACK_AGE_MS = envInt(
+
+function loadVenueOverrides(prefix: string): Record<string, number> {
+  const out: Record<string, number> = {};
+  const needle = `${prefix}__`;
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.startsWith(needle)) continue;
+    const venue = key.slice(needle.length).toLowerCase();
+    const num = Number(value);
+    if (Number.isFinite(num)) out[venue] = Number(num);
+  }
+  return out;
+}
+
+const AMM_SLOT_MAX_LAG_DEFAULT = envInt("AMM_SLOT_MAX_LAG", 2);
+const AMM_SLOT_MAX_LAG_BY_VENUE = loadVenueOverrides("AMM_SLOT_MAX_LAG");
+
+const AMM_SNAPSHOT_FALLBACK_AGE_MS_DEFAULT = envInt(
   "AMM_SNAPSHOT_FALLBACK_AGE_MS",
   envInt("PRICE_STALENESS_MS", 4000)
 );
+const AMM_SNAPSHOT_FALLBACK_AGE_MS_BY_VENUE = loadVenueOverrides("AMM_SNAPSHOT_FALLBACK_AGE_MS");
+
+const AMM_HEARTBEAT_SOFT_MS_DEFAULT = envInt("AMM_HEARTBEAT_SOFT_MS", 20_000);
+const AMM_HEARTBEAT_SOFT_MS_BY_VENUE = loadVenueOverrides("AMM_HEARTBEAT_SOFT_MS");
+
+const CONFIG_SLOT_LAG_BY_VENUE = new Map<string, number>();
+const CONFIG_AGE_BY_VENUE = new Map<string, number>();
+const CONFIG_HEARTBEAT_GRACE_MS_BY_VENUE = new Map<string, number>();
+const CONFIG_TRADEABLE_BY_VENUE = new Map<string, boolean>();
+
+function resolveVenueNumber(
+  venue: string,
+  overrides: Record<string, number>,
+  fallback: number,
+): number {
+  return overrides[venue.toLowerCase()] ?? fallback;
+}
+
+export function resolveSlotLagLimit(venue: string): number {
+  const envOverride = AMM_SLOT_MAX_LAG_BY_VENUE[venue.toLowerCase()];
+  if (envOverride != null) return envOverride;
+  const cfg = CONFIG_SLOT_LAG_BY_VENUE.get(venue.toLowerCase());
+  if (cfg != null) return cfg;
+  return resolveVenueNumber(venue, AMM_SLOT_MAX_LAG_BY_VENUE, AMM_SLOT_MAX_LAG_DEFAULT);
+}
+
+export function resolveSnapshotAgeLimit(venue: string): number {
+  const envOverride = AMM_SNAPSHOT_FALLBACK_AGE_MS_BY_VENUE[venue.toLowerCase()];
+  if (envOverride != null) return envOverride;
+  const cfg = CONFIG_AGE_BY_VENUE.get(venue.toLowerCase());
+  if (cfg != null) return cfg;
+  return resolveVenueNumber(venue, AMM_SNAPSHOT_FALLBACK_AGE_MS_BY_VENUE, AMM_SNAPSHOT_FALLBACK_AGE_MS_DEFAULT);
+}
+
+export function resolveHeartbeatGraceMs(venue: string): number {
+  const envOverride = AMM_HEARTBEAT_SOFT_MS_BY_VENUE[venue.toLowerCase()];
+  if (envOverride != null) return envOverride;
+  const cfg = CONFIG_HEARTBEAT_GRACE_MS_BY_VENUE.get(venue.toLowerCase());
+  if (cfg != null) return cfg;
+  return resolveVenueNumber(venue, AMM_HEARTBEAT_SOFT_MS_BY_VENUE, AMM_HEARTBEAT_SOFT_MS_DEFAULT);
+}
 
 type FreshnessCheck = {
   ok: boolean;
@@ -87,7 +185,7 @@ type FreshnessCheck = {
   ageMs?: number;
 };
 
-function checkAmmFreshness(
+export function checkAmmFreshness(
   snap: { ts: number; slot?: number | null; venue: string; ammId: string },
   phoenixSlot: number | null | undefined,
   now: number,
@@ -100,8 +198,9 @@ function checkAmmFreshness(
   const phxSlot = phoenixSlot != null && Number.isFinite(phoenixSlot) ? Number(phoenixSlot) : null;
 
   if (hasSlot && phxSlot != null) {
-    const skew = Math.abs(slot! - phxSlot);
-    if (skew > slotSkewMax) {
+    const diff = phxSlot - slot!; // positive => AMM lagging behind Phoenix
+    const skew = Math.abs(diff);
+    if (diff > slotSkewMax) {
       return { ok: false, reason: `slot_skew>${slotSkewMax}`, skew };
     }
     return { ok: true, skew };
@@ -111,11 +210,31 @@ function checkAmmFreshness(
   const ttl = typeof bookTtlMs === "number" && Number.isFinite(bookTtlMs)
     ? Math.max(100, bookTtlMs)
     : null;
-  const limit = Math.max(100, ttl != null ? Math.min(fallbackAgeMs, ttl) : fallbackAgeMs);
+  const limit = Math.max(100, ttl != null ? Math.max(fallbackAgeMs, ttl) : fallbackAgeMs);
   if (ageMs > limit) {
     return { ok: false, reason: `age_ms>${limit}`, ageMs };
   }
   return { ok: true, ageMs };
+}
+
+export function isSoftStaleEligible(
+  snapshot: AmmSnap,
+  reason: string,
+  now: number,
+  graceMs: number,
+  tradeablePreferred?: boolean,
+): boolean {
+  if (!ALLOW_STALE_DECISIONS) return false;
+  const wantSoft = Boolean(snapshot.tradeableWhenDegraded || tradeablePreferred);
+  if (!wantSoft) return false;
+  if (!(reason.startsWith("slot_skew") || reason.startsWith("age_ms"))) return false;
+  const heartbeatAt = nnum(snapshot.heartbeatAt);
+  const wsAt = nnum(snapshot.wsAt);
+  const signalAt = heartbeatAt ?? wsAt;
+  if (signalAt == null) return false;
+  if (now - signalAt > graceMs) return false;
+  if (heartbeatAt != null && now - heartbeatAt > graceMs) return false;
+  return true;
 }
 
 function envTrue(name: string, def?: boolean): boolean {
@@ -175,11 +294,19 @@ type AmmSnap = {
   degraded?: boolean;
   degradedReason?: string | null;
   stale?: boolean;
+  staleReason?: string | null;
+  tradeableWhenDegraded?: boolean;
+  softStale?: boolean;
+  heartbeatAt?: number | null;
+  heartbeatSlot?: number | null;
+  wsAt?: number | null;
+  syntheticSlot?: boolean;
+  freshnessSource?: string | null;
 };
 
 // Unified node abstraction for 2-leg paths
 type VenueNode =
-  | { kind: "phx"; id: "phoenix"; feeBps: number }
+  | { kind: "phx"; id: "phoenix" | "phoenix_buy" | "phoenix_sell"; feeBps: number }
   | { kind: "amm"; id: string; feeBps: number; amm: AmmSnap };
 
 export interface JoinerParams {
@@ -269,7 +396,19 @@ type PathCandidate = {
 // Pairs config (broaden venues by config, not code)
 
 // ── types used by readPairsConfig() ─────────────────────────────────────────
-type VenueCfg = { kind: string; id: string; poolKind?: string; enabled?: boolean };
+type VenueCfg = {
+  kind: string;
+  id: string;
+  venue?: string;
+  poolKind?: string;
+  enabled?: boolean;
+  freshness?: {
+    slotLagSlots?: number;
+    maxAgeMs?: number;
+    heartbeatGraceMs?: number;
+    tradeableWhenDegraded?: boolean;
+  };
+};
 type PairCfg = {
   symbol: string;
   baseMint: string;
@@ -334,6 +473,7 @@ export class EdgeJoiner {
   private dlmmQuoteMemo = new Map<string, QuoteRes>();
   private degradedLogMemo = new Map<string, { reason: string; atMs: number }>();
   private ignoredLogMemo = new Map<string, { reason: string; atMs: number }>();
+  private softStaleLogMemo = new Map<string, { reason: string; atMs: number }>();
 
   constructor(
     private P: JoinerParams,
@@ -356,6 +496,23 @@ export class EdgeJoiner {
             if (v && v.enabled === false) continue;  // ← respect disabled pools
             const key = `${String(v.kind).toLowerCase()}:${v.id}`;
             this.allowedPools.add(key);
+
+            const venueName = String(v?.kind ?? v?.venue ?? "").toLowerCase();
+            const freshness = v?.freshness;
+            if (freshness) {
+              if (Number.isFinite(freshness.slotLagSlots)) {
+                CONFIG_SLOT_LAG_BY_VENUE.set(venueName, Number(freshness.slotLagSlots));
+              }
+              if (Number.isFinite(freshness.maxAgeMs)) {
+                CONFIG_AGE_BY_VENUE.set(venueName, Number(freshness.maxAgeMs));
+              }
+              if (Number.isFinite(freshness.heartbeatGraceMs)) {
+                CONFIG_HEARTBEAT_GRACE_MS_BY_VENUE.set(venueName, Number(freshness.heartbeatGraceMs));
+              }
+              if (typeof freshness.tradeableWhenDegraded === "boolean") {
+                CONFIG_TRADEABLE_BY_VENUE.set(venueName, freshness.tradeableWhenDegraded);
+              }
+            }
           }
         }
 
@@ -375,16 +532,24 @@ export class EdgeJoiner {
     this.loadPhoenixSnapshot(true);
 
     try {
+      const fallbackDefault = AMM_SNAPSHOT_FALLBACK_AGE_MS_DEFAULT;
       const effectiveAgeMs = Math.max(
         100,
         this.C.bookTtlMs != null && Number.isFinite(this.C.bookTtlMs)
-          ? Math.min(AMM_SNAPSHOT_FALLBACK_AGE_MS, this.C.bookTtlMs)
-          : AMM_SNAPSHOT_FALLBACK_AGE_MS
+          ? Math.min(fallbackDefault, this.C.bookTtlMs)
+          : fallbackDefault
       );
       logger.log("joiner_freshness_config", {
         book_ttl_ms: this.C.bookTtlMs,
-        slot_skew_max: AMM_SLOT_MAX_LAG,
-        fallback_age_ms: AMM_SNAPSHOT_FALLBACK_AGE_MS,
+        slot_skew_default: AMM_SLOT_MAX_LAG_DEFAULT,
+        slot_skew_env_overrides: AMM_SLOT_MAX_LAG_BY_VENUE,
+        slot_skew_config_overrides: Object.fromEntries(CONFIG_SLOT_LAG_BY_VENUE),
+        fallback_age_ms_default: AMM_SNAPSHOT_FALLBACK_AGE_MS_DEFAULT,
+        fallback_age_env_overrides: AMM_SNAPSHOT_FALLBACK_AGE_MS_BY_VENUE,
+        fallback_age_config_overrides: Object.fromEntries(CONFIG_AGE_BY_VENUE),
+        heartbeat_soft_ms_default: AMM_HEARTBEAT_SOFT_MS_DEFAULT,
+        heartbeat_soft_env_overrides: AMM_HEARTBEAT_SOFT_MS_BY_VENUE,
+        heartbeat_soft_config_overrides: Object.fromEntries(CONFIG_HEARTBEAT_GRACE_MS_BY_VENUE),
         effective_age_ms: effectiveAgeMs,
       });
     } catch {
@@ -502,24 +667,92 @@ export class EdgeJoiner {
             ? Number(process.env.ORCA_TRADE_FEE_BPS ?? this.P.ammFeeBps ?? 30)
             : Number(this.P.ammFeeBps ?? 25)
       );
-    const feeBps = feeFromPayload ?? feeFallback;
+
+    const key = `${venue}:${ammId}`;
+    const prev = this.amms.get(key);
 
     const tsFromPayload = nnum(obj?.ts);
     const slotFromPayload = nnum(obj?.slot);
+    const heartbeatAtRaw = nnum(obj?.heartbeat_at ?? obj?.heartbeatAt);
+    const heartbeatSlotRaw = nnum(obj?.heartbeat_slot ?? obj?.heartbeatSlot);
+    const wsAtRaw = nnum(obj?.ws_at ?? obj?.wsAt);
+    const syntheticSlotRaw = obj?.syntheticSlot ?? obj?.synthetic_slot;
+    const tradeableRaw = obj?.tradeableWhenDegraded ?? obj?.tradeable_when_degraded;
+    const freshnessSourceRaw = typeof obj?.source === "string" ? obj.source : typeof obj?.origin === "string" ? obj.origin : undefined;
+
+    const hasField = (field: string): boolean =>
+      !!obj && typeof obj === "object" && Object.prototype.hasOwnProperty.call(obj, field);
+    const hasAnyField = (...fields: string[]): boolean => fields.some((f) => hasField(f));
+
+    const ts = tsFromPayload && tsFromPayload > 0 ? tsFromPayload : prev?.ts ?? Date.now();
+
+    const slot =
+      hasField("slot")
+        ? (slotFromPayload ?? null)
+        : prev?.slot ?? null;
+
+    const heartbeatAt =
+      hasAnyField("heartbeat_at", "heartbeatAt")
+        ? (heartbeatAtRaw ?? null)
+        : prev?.heartbeatAt ?? null;
+
+    const heartbeatSlot =
+      hasAnyField("heartbeat_slot", "heartbeatSlot")
+        ? (heartbeatSlotRaw ?? null)
+        : prev?.heartbeatSlot ?? null;
+
+    const wsAt =
+      hasAnyField("ws_at", "wsAt")
+        ? (wsAtRaw ?? null)
+        : prev?.wsAt ?? null;
+
+    const syntheticSlot =
+      hasAnyField("synthetic_slot", "syntheticSlot")
+        ? (typeof syntheticSlotRaw === "boolean" ? syntheticSlotRaw : undefined)
+        : prev?.syntheticSlot;
+
+    const tradeableWhenDegraded =
+      hasAnyField("tradeable_when_degraded", "tradeableWhenDegraded")
+        ? (typeof tradeableRaw === "boolean" ? tradeableRaw : Boolean(tradeableRaw))
+        : Boolean(prev?.tradeableWhenDegraded);
+
+    const freshnessSource =
+      freshnessSourceRaw !== undefined
+        ? freshnessSourceRaw
+        : (prev?.freshnessSource ?? null);
+
+    const staleReason =
+      hasAnyField("stale_reason", "staleReason")
+        ? (typeof obj?.stale_reason === "string"
+          ? obj.stale_reason
+          : typeof obj?.staleReason === "string"
+            ? obj.staleReason
+            : null)
+        : (prev?.staleReason ?? null);
+
+    const feeBps = feeFromPayload ?? prev?.feeBps ?? feeFallback;
+    const finalReserves = reserves ?? prev?.reserves;
 
     const snap: AmmSnap = {
       venue: venue as any,
       ammId,
       px,
-      ts: tsFromPayload && tsFromPayload > 0 ? tsFromPayload : Date.now(),
-      slot: slotFromPayload ?? null,
-      reserves,
+      ts,
+      slot,
+      reserves: finalReserves,
       feeBps,
+      tradeableWhenDegraded,
+      heartbeatAt: heartbeatAt ?? null,
+      heartbeatSlot: heartbeatSlot ?? null,
+      wsAt: wsAt ?? null,
+      syntheticSlot: syntheticSlot ?? undefined,
+      freshnessSource: freshnessSource ?? null,
+      staleReason: staleReason ?? null,
     };
     const poolKindRawUpper = String(obj?.poolKind ?? obj?.pool_kind ?? obj?.poolType ?? obj?.pool_type ?? "").trim();
     if (poolKindRawUpper) snap.poolKind = poolKindRawUpper.toLowerCase();
 
-    this.amms.set(`${venue}:${ammId}`, snap);
+    this.amms.set(key, snap);
     void this.maybeReport();
   }
 
@@ -1295,6 +1528,29 @@ export class EdgeJoiner {
     return this.quoteAmmAvgPerBase(node.amm, side, sizeBase, fallbackMid);
   }
 
+  private logSoftStale(snapshot: AmmSnap, reason: string, freshness: FreshnessCheck, now: number): void {
+    const memoKey = `${snapshot.venue}:${snapshot.ammId}`;
+    const last = this.softStaleLogMemo.get(memoKey);
+    if (!last || last.reason !== reason || now - last.atMs >= AMM_DEGRADE_LOG_WINDOW_MS) {
+      logger.log("amm_snapshot_soft_stale", {
+        venue: snapshot.venue,
+        ammId: snapshot.ammId,
+        reason,
+        ts: snapshot.ts,
+        slot: snapshot.slot ?? null,
+        phoenix_slot: this.phxSlot ?? null,
+        slot_skew: freshness.skew,
+        slot_skew_max: resolveSlotLagLimit(snapshot.venue),
+        age_ms: freshness.ageMs,
+        age_limit_ms: resolveSnapshotAgeLimit(snapshot.venue),
+        heartbeat_ms: snapshot.heartbeatAt != null ? Math.max(0, now - (snapshot.heartbeatAt as number)) : null,
+        ws_age_ms: snapshot.wsAt != null ? Math.max(0, now - (snapshot.wsAt as number)) : null,
+        synthetic_slot: snapshot.syntheticSlot ?? false,
+      });
+      this.softStaleLogMemo.set(memoKey, { reason, atMs: now });
+    }
+  }
+
   // ──────────────────────────────────────────────────────────────────────────
   private async maybeReport(): Promise<void> {
     // Reset circuit breakers daily
@@ -1328,69 +1584,119 @@ export class EdgeJoiner {
     const freshAmms: AmmSnap[] = [];
     const staleAmms: { snap: AmmSnap; reason: string; skew?: number; ageMs?: number }[] = [];
     for (const a of this.amms.values()) {
+      const tradeablePreferred = CONFIG_TRADEABLE_BY_VENUE.get(a.venue.toLowerCase());
+      if (tradeablePreferred) {
+        a.tradeableWhenDegraded = true;
+      }
+      const slotLagLimit = resolveSlotLagLimit(a.venue);
+      const fallbackAgeMs = resolveSnapshotAgeLimit(a.venue);
+      const heartbeatGraceMs = resolveHeartbeatGraceMs(a.venue);
+      const bookTtl = this.C.bookTtlMs != null ? Math.max(this.C.bookTtlMs, fallbackAgeMs) : undefined;
+
       const freshness = checkAmmFreshness(
         { ts: a.ts, slot: a.slot ?? null, venue: a.venue, ammId: a.ammId },
         this.phxSlot ?? null,
         now,
-        AMM_SLOT_MAX_LAG,
-        AMM_SNAPSHOT_FALLBACK_AGE_MS,
-        this.C.bookTtlMs
+        slotLagLimit,
+        fallbackAgeMs,
+        bookTtl
       );
+
       let snapshot: AmmSnap | null = null;
+      const memoKey = `${a.venue}:${a.ammId}`;
+
       if (!freshness.ok) {
         const reason = freshness.reason ?? "stale";
-        const canUseStale = ALLOW_STALE_DECISIONS && (
-          reason.startsWith("slot_skew") ||
-          reason.startsWith("age_ms") ||
-          reason.includes("slot") ||
-          reason.includes("age")
-        );
-        if (canUseStale) {
-          const degraded: AmmSnap = { ...a, degraded: true, degradedReason: reason };
-          degraded.stale = true;
-          const key = `${degraded.venue}:${degraded.ammId}`;
-          const last = this.degradedLogMemo.get(key);
-          if (!last || last.reason !== reason || now - last.atMs >= AMM_DEGRADE_LOG_WINDOW_MS) {
-            logger.log("amm_snapshot_degraded", {
-              venue: degraded.venue,
-              ammId: degraded.ammId,
-              reason,
-              ts: degraded.ts,
-              slot: degraded.slot ?? null,
-              phoenix_slot: this.phxSlot ?? null,
-              slot_skew: freshness.skew,
-              age_ms: freshness.ageMs,
-            });
-            this.degradedLogMemo.set(key, { reason, atMs: now });
-          }
-          snapshot = degraded;
+
+        if (isSoftStaleEligible(a, reason, now, heartbeatGraceMs, Boolean(tradeablePreferred))) {
+          const soft: AmmSnap = { ...a, softStale: true, stale: true, staleReason: reason };
+          snapshot = soft;
+          this.logSoftStale(soft, reason, freshness, now);
+          this.degradedLogMemo.delete(memoKey);
+          this.ignoredLogMemo.delete(memoKey);
         } else {
-          const key = `${a.venue}:${a.ammId}`;
-          const last = this.ignoredLogMemo.get(key);
-          if (!last || last.reason !== reason || now - last.atMs >= AMM_DEGRADE_LOG_WINDOW_MS) {
-            logger.log("amm_snapshot_ignored", {
-              venue: a.venue,
-              ammId: a.ammId,
-              reason,
-              ts: a.ts,
-              slot: a.slot ?? null,
-              phoenix_slot: this.phxSlot ?? null,
-              slot_skew: freshness.skew,
-              age_ms: freshness.ageMs,
-            });
-            this.ignoredLogMemo.set(key, { reason, atMs: now });
+          const canUseStale = ALLOW_STALE_DECISIONS && (
+            reason.startsWith("slot_skew") ||
+            reason.startsWith("age_ms") ||
+            reason.includes("slot") ||
+            reason.includes("age")
+          );
+
+          if (canUseStale) {
+            const degraded: AmmSnap = {
+              ...a,
+              degraded: true,
+              degradedReason: reason,
+              stale: true,
+              staleReason: reason,
+              softStale: false,
+            };
+            const last = this.degradedLogMemo.get(memoKey);
+            if (!last || last.reason !== reason || now - last.atMs >= AMM_DEGRADE_LOG_WINDOW_MS) {
+              logger.log("amm_snapshot_degraded", {
+                venue: degraded.venue,
+                ammId: degraded.ammId,
+                reason,
+                ts: degraded.ts,
+                slot: degraded.slot ?? null,
+                phoenix_slot: this.phxSlot ?? null,
+                slot_skew: freshness.skew,
+                slot_skew_max: slotLagLimit,
+                age_ms: freshness.ageMs,
+                age_limit_ms: fallbackAgeMs,
+                heartbeat_ms: a.heartbeatAt != null ? Math.max(0, now - (a.heartbeatAt as number)) : null,
+                ws_age_ms: a.wsAt != null ? Math.max(0, now - (a.wsAt as number)) : null,
+                synthetic_slot: a.syntheticSlot ?? false,
+              });
+              this.degradedLogMemo.set(memoKey, { reason, atMs: now });
+            }
+            this.softStaleLogMemo.delete(memoKey);
+            snapshot = degraded;
+          } else {
+            const last = this.ignoredLogMemo.get(memoKey);
+            if (!last || last.reason !== reason || now - last.atMs >= AMM_DEGRADE_LOG_WINDOW_MS) {
+              logger.log("amm_snapshot_ignored", {
+                venue: a.venue,
+                ammId: a.ammId,
+                reason,
+                ts: a.ts,
+                slot: a.slot ?? null,
+                phoenix_slot: this.phxSlot ?? null,
+                slot_skew: freshness.skew,
+                slot_skew_max: slotLagLimit,
+                age_ms: freshness.ageMs,
+                age_limit_ms: fallbackAgeMs,
+              });
+              this.ignoredLogMemo.set(memoKey, { reason, atMs: now });
+            }
+            this.degradedLogMemo.delete(memoKey);
+            this.softStaleLogMemo.delete(memoKey);
+            staleAmms.push({ snap: a, reason, skew: freshness.skew, ageMs: freshness.ageMs });
+            continue;
           }
-          staleAmms.push({ snap: a, reason, skew: freshness.skew, ageMs: freshness.ageMs });
-          continue;
         }
       } else {
-        snapshot = a;
+        const fresh = {
+          ...a,
+          softStale: false,
+          staleReason: null,
+          degraded: false,
+          degradedReason: null,
+          stale: false,
+        } as AmmSnap;
+        snapshot = fresh;
+        this.degradedLogMemo.delete(memoKey);
+        this.ignoredLogMemo.delete(memoKey);
+        this.softStaleLogMemo.delete(memoKey);
       }
+
       if (!snapshot) continue;
-      const memoKey = `${snapshot.venue}:${snapshot.ammId}`;
       if (!snapshot.degraded) {
         this.degradedLogMemo.delete(memoKey);
         this.ignoredLogMemo.delete(memoKey);
+      }
+      if (!snapshot.softStale) {
+        this.softStaleLogMemo.delete(memoKey);
       }
       if (this.allowedPools.size && !this.allowedPools.has(`${snapshot.venue}:${snapshot.ammId}`)) continue;
       freshAmms.push(snapshot);
@@ -1494,15 +1800,22 @@ export class EdgeJoiner {
     }
 
     // ── Unified 2-leg path enumerator (PHX<->AMM and AMM<->AMM) ─────────────
-    const nodes: VenueNode[] = [
-      { kind: "phx" as const, id: "phoenix" as const, feeBps: this.P.phoenixFeeBps },
-      ...validAmms.map((a) => ({
-        kind: "amm" as const,
-        id: `${a.venue}:${a.ammId}`,
-        feeBps: a.feeBps,
-        amm: a,
-      })),
-    ];
+    const includeDualPhoenix = envTrue("ENABLE_AMM_PHX", true);
+    const phoenixNodes: VenueNode[] = includeDualPhoenix
+      ? [
+        { kind: "phx", id: "phoenix_buy", feeBps: this.P.phoenixFeeBps },
+        { kind: "phx", id: "phoenix_sell", feeBps: this.P.phoenixFeeBps },
+      ]
+      : [{ kind: "phx", id: "phoenix", feeBps: this.P.phoenixFeeBps }];
+
+    const ammNodes: VenueNode[] = validAmms.map((a) => ({
+      kind: "amm" as const,
+      id: `${a.venue}:${a.ammId}`,
+      feeBps: a.feeBps,
+      amm: a,
+    }));
+
+    const nodes: VenueNode[] = [...phoenixNodes, ...ammNodes];
 
     const candidates: PathCandidate[] = [];
     const trackAmmAmm = envTrue("TRACK_AMM_AMM", true);
@@ -1514,6 +1827,8 @@ export class EdgeJoiner {
       "AMM->AMM": 0,
     };
     const bestPerPath = new Map<PathCandidate["path"], PathCandidate>();
+
+    const logPathPairs = PATH_PAIR_LOG_ENABLED;
 
     for (const nodeSrc of nodes) {
       for (const nodeDst of nodes) {
@@ -1528,6 +1843,18 @@ export class EdgeJoiner {
               "AMM->AMM";
 
         if (path === "AMM->AMM" && !trackAmmAmm && !execAmmAmm) continue;
+
+        if (logPathPairs) {
+          const payload = {
+            t: new Date().toISOString(),
+            symbol: this.symbol,
+            path,
+            src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
+            dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
+          } as const;
+          try { logger.log("path_pair_considered", payload); } catch { /* ignore */ }
+          appendPathPairLog(payload as unknown as Record<string, unknown>);
+        }
 
         const candidate = await this.evaluatePathCandidate({
           nodeSrc,

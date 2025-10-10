@@ -950,7 +950,12 @@ async function main() {
               base_ui: s.baseReserve ?? undefined,
               quote_ui: s.quoteReserve ?? undefined,
               slot: s.slot ?? undefined,
-              source: "provider",
+              heartbeat_at: s.heartbeatAt ?? undefined,
+              heartbeat_slot: s.heartbeatSlot ?? undefined,
+              ws_at: s.wsAt ?? undefined,
+              synthetic_slot: typeof s.syntheticSlot === "boolean" ? s.syntheticSlot : undefined,
+              tradeable_when_degraded: typeof s.tradeableWhenDegraded === "boolean" ? s.tradeableWhenDegraded : undefined,
+              source: s.source ?? "provider",
               validation_passed: s.price != null,
             };
             joiner.upsertAmms(obj);

@@ -31,8 +31,22 @@ import Decimal from "decimal.js";
 import { logger } from "../ml_logger.js";
 import type { EdgeJoiner } from "../edge/joiner.js";
 import { cacheRaydiumFee, cacheOrcaFee } from "../util/fee_cache.js";
+import { recordHeartbeatMetric } from "../runtime/metrics.js";
 
-type VenueCfg = { kind: string; id: string; poolKind?: string; enabled?: boolean; feeBps?: number };
+type VenueCfg = {
+    kind: string;
+    id: string;
+    venue?: string;
+    poolKind?: string;
+    enabled?: boolean;
+    feeBps?: number;
+    freshness?: {
+        slotLagSlots?: number;
+        maxAgeMs?: number;
+        heartbeatGraceMs?: number;
+        tradeableWhenDegraded?: boolean;
+    };
+};
 type PairCfg = {
     symbol: string;
     baseMint: string;
@@ -52,6 +66,10 @@ const KEEPALIVE_MS = Math.max(60_000, Number(process.env.WS_KEEPALIVE_HEALTH_MS 
 // Freshness / TTLs
 const AMM_TTL_MS = Number(process.env.BOOK_TTL_MS ?? 6000);              // joiner TTL (keep > decision TTL)
 const ORCA_FORCE_POLL_MS = Math.max(1_500, Number(process.env.ORCA_FORCE_POLL_MS ?? 4_500)); // force a refresh if no WS within this window, keep < snapshot TTL
+const METEORA_HEARTBEAT_MS = Math.max(1_000, Number(process.env.METEORA_HEARTBEAT_MS ?? 4_000)); // refresh quiescent pools before joiner TTL
+const METEORA_HEARTBEAT_LOG_MS = Math.max(5_000, Number(process.env.METEORA_HEARTBEAT_LOG_MS ?? 30_000));
+const RAYDIUM_HEARTBEAT_MS = Math.max(1_000, Number(process.env.RAYDIUM_HEARTBEAT_MS ?? 2_000));
+const RAYDIUM_HEARTBEAT_LOG_MS = Math.max(5_000, Number(process.env.RAYDIUM_HEARTBEAT_LOG_MS ?? 30_000));
 const ORCA_TICKARRAY_HORIZON = Math.max(1, Math.min(6, Number(process.env.ORCA_TICKARRAY_HORIZON ?? 2)));
 
 function getenv(k: string) { const v = process.env[k]; return typeof v === "string" && v.trim() ? v.trim() : undefined; }
@@ -89,10 +107,36 @@ function atomsToUi(atoms: bigint, decimals: number): number {
 }
 function decodeSplAmount(data: Buffer): bigint {
     const acc = AccountLayout.decode(data);
-    const arr = Uint8Array.from(acc.amount as unknown as Buffer);
-    let x = 0n;
-    for (let i = 0; i < 8; i++) x |= BigInt(arr[i]) << (8n * BigInt(i));
-    return x;
+    const raw = acc.amount as unknown;
+
+    if (typeof raw === "bigint") {
+        return raw;
+    }
+
+    if (BN.isBN(raw)) {
+        return BigInt((raw as BN).toString(10));
+    }
+
+    if (typeof raw === "number") {
+        return BigInt(raw);
+    }
+
+    if (typeof raw === "string") {
+        return BigInt(raw);
+    }
+
+    if (raw && typeof raw === "object" && typeof (raw as { length?: number }).length === "number") {
+        const view = Uint8Array.from(raw as any);
+        if (view.length === 0) return 0n;
+        let x = 0n;
+        for (let i = 0; i < view.length; i++) {
+            const value = view[i] ?? 0;
+            x |= BigInt(value) << (8n * BigInt(i));
+        }
+        return x;
+    }
+
+    throw new Error("spl_amount_decode_unsupported");
 }
 
 type NormalizedPoolSpec = {
@@ -104,6 +148,7 @@ type NormalizedPoolSpec = {
     baseMint: PublicKey;
     quoteMint: PublicKey;
     symbol: string;
+    freshness?: VenueCfg["freshness"];
 };
 
 type MeteoraPoolState = {
@@ -127,6 +172,38 @@ type MeteoraPoolState = {
     reserveYAtoms?: bigint;
     binStep: number;
     activeId: number;
+    lastPushMs: number;
+    lastSlotHint?: number;
+    lastHeartbeatLogMs?: number;
+    lastHeartbeatMs?: number;
+    lastHeartbeatSlot?: number;
+    lastHeartbeatSynthetic?: boolean;
+    heartbeatConsecutiveMisses?: number;
+    lastWsSlot?: number;
+    lastWsMs?: number;
+    lastPushSlot?: number;
+    lastPushSynthetic?: boolean;
+    tradeableWhenDegradedPreferred?: boolean;
+    heartbeatGraceMs?: number;
+};
+
+type RaydiumPoolState = {
+    poolId: PublicKey;
+    poolIdStr: string;
+    baseVault: PublicKey;
+    quoteVault: PublicKey;
+    baseDecimals: number;
+    quoteDecimals: number;
+    feeBps: number;
+    base: bigint;
+    quote: bigint;
+    lastPushMs: number;
+    lastSlotHint?: number;
+    lastWsSlot?: number;
+    lastWsMs?: number;
+    lastHeartbeatMs?: number;
+    tradeableWhenDegradedPreferred?: boolean;
+    heartbeatGraceMs?: number;
 };
 
 function collectPoolSpecs(conf: PairsFile): NormalizedPoolSpec[] {
@@ -183,6 +260,7 @@ function collectPoolSpecs(conf: PairsFile): NormalizedPoolSpec[] {
                 baseMint: baseMintPk,
                 quoteMint: quoteMintPk,
                 symbol: pair.symbol ?? `${baseMintStr}/${quoteMintStr}`,
+                freshness: venue.freshness,
             });
             seen.add(key);
         }
@@ -251,6 +329,10 @@ type OrcaPoolState = {
     lastPushMs: number;
     activeTickIndex: number;
     tickArrays: Map<number, OrcaTickArrayState>;
+    lastSlotHint?: number;
+    lastWsSlot?: number;
+    lastWsMs?: number;
+    lastHeartbeatMs?: number;
 };
 
 async function loadOrcaContext(
@@ -342,6 +424,7 @@ export async function startWsMarkets(args: {
             close: async () => {
                 keepaliveTimer && clearInterval(keepaliveTimer);
                 orcaTimer && clearInterval(orcaTimer);
+                meteoraTimer && clearInterval(meteoraTimer);
             },
         };
     }
@@ -371,9 +454,14 @@ export async function startWsMarkets(args: {
     const keepaliveTimer = setInterval(() => { http.getSlot(COMMITMENT).catch(() => undefined); }, KEEPALIVE_MS);
     keepaliveTimer.unref?.();
 
+    let orcaTimer: NodeJS.Timeout | null = null;
+    let meteoraTimer: NodeJS.Timeout | null = null;
+    let raydiumTimer: NodeJS.Timeout | null = null;
+
     // ── Per-pool freshness state (for Orca forced refreshes)
     const orcaState = new Map<string, OrcaPoolState>();
     const meteoraState = new Map<string, MeteoraPoolState>();
+    const raydiumState = new Map<string, RaydiumPoolState>();
     let meteoraProgram: any | null = null;
 
     const ensureTickArrayLock = new Set<string>();
@@ -489,7 +577,7 @@ export async function startWsMarkets(args: {
     }
 
     // Force-poll any Orca pool that hasn't had a WS tick within ORCA_FORCE_POLL_MS
-    const orcaTimer = setInterval(async () => {
+    orcaTimer = setInterval(async () => {
         const now = Date.now();
         for (const [poolKeyStr, state] of orcaState.entries()) {
             const { ctx, lastPushMs } = state;
@@ -508,19 +596,38 @@ export async function startWsMarkets(args: {
 
                 const pollSlot = typeof resp?.context?.slot === "number" ? resp.context.slot : undefined;
                 const slotHintNum = Math.max(pollSlot ?? 0, latestTickArraySlot(state) ?? 0, lastObservedSlot || 0);
+                const slotUsed = slotHintNum > 0 ? slotHintNum : undefined;
+                const syntheticSlot = slotUsed != null && !(typeof pollSlot === "number" && pollSlot > 0);
+                const wsAtValue = now;
                 args.joiner.upsertAmms({
                     venue: "orca",
                     ammId: ctx.whirlpool.toBase58(),
                     px,
                     ts: now,
-                    slot: slotHintNum > 0 ? slotHintNum : undefined,
+                    slot: slotUsed,
                     feeBps: ctx.feeBps,
                     poolKind: "clmm",
                     baseDecimals: ctx.baseIsA ? ctx.decA : ctx.decB,
                     quoteDecimals: ctx.baseIsA ? ctx.decB : ctx.decA,
                     source: "ws+poll",
+                    ws_at: wsAtValue,
+                    heartbeat_at: wsAtValue,
+                    synthetic_slot: syntheticSlot || undefined,
+                });
+                recordHeartbeatMetric({
+                    venue: "orca",
+                    poolId: ctx.whirlpool.toBase58(),
+                    wsAt: wsAtValue,
+                    heartbeatAt: wsAtValue,
+                    source: "ws+poll",
+                    synthetic: syntheticSlot,
                 });
                 state.lastPushMs = now;
+                if (slotUsed != null) {
+                    state.lastSlotHint = slotUsed;
+                    state.lastWsSlot = slotUsed;
+                }
+                state.lastWsMs = wsAtValue;
                 const tickIdx = Number(parsed?.tickCurrentIndex);
                 if (Number.isFinite(tickIdx)) {
                     state.activeTickIndex = tickIdx;
@@ -536,7 +643,7 @@ export async function startWsMarkets(args: {
             }
         }
     }, Math.min(ORCA_FORCE_POLL_MS, 2000));
-    orcaTimer.unref?.();
+    orcaTimer?.unref?.();
 
     const getMeteoraProgram = () => {
         if (!meteoraProgram) {
@@ -544,6 +651,68 @@ export async function startWsMarkets(args: {
         }
         return meteoraProgram;
     };
+
+    const meteoraHeartbeatInterval = Math.max(1_000, Math.min(METEORA_HEARTBEAT_MS, 2_000));
+    meteoraTimer = setInterval(() => {
+        const now = Date.now();
+        for (const [poolKeyStr, state] of meteoraState.entries()) {
+            const waitedMs = now - state.lastPushMs;
+            if (waitedMs < METEORA_HEARTBEAT_MS) continue;
+            try {
+                const heartbeat = pushMeteoraSnapshot(state, "heartbeat", state.lastSlotHint ?? null);
+                if (!heartbeat.ok) {
+                    state.heartbeatConsecutiveMisses = (state.heartbeatConsecutiveMisses ?? 0) + 1;
+                    continue;
+                }
+                const missCount = state.heartbeatConsecutiveMisses ?? 0;
+                state.heartbeatConsecutiveMisses = 0;
+
+                const shouldLog = now - (state.lastHeartbeatLogMs ?? 0) >= METEORA_HEARTBEAT_LOG_MS;
+                if (shouldLog || heartbeat.syntheticSlot) {
+                    state.lastHeartbeatLogMs = now;
+                    logger.log("meteora_heartbeat_refresh", {
+                        pool: poolKeyStr,
+                        waited_ms: waitedMs,
+                        slot: heartbeat.slotUsed ?? null,
+                        synthetic: heartbeat.syntheticSlot || false,
+                        ws_age_ms: state.lastWsMs != null ? Math.max(0, now - state.lastWsMs) : null,
+                        misses: missCount,
+                    });
+                }
+            } catch (e) {
+                state.heartbeatConsecutiveMisses = (state.heartbeatConsecutiveMisses ?? 0) + 1;
+                logger.log("meteora_heartbeat_error", {
+                    pool: poolKeyStr,
+                    err: String((e as any)?.message ?? e),
+                });
+            }
+        }
+    }, meteoraHeartbeatInterval);
+    meteoraTimer?.unref?.();
+
+    const raydiumHeartbeatInterval = Math.max(1_000, Math.min(RAYDIUM_HEARTBEAT_MS, 2_000));
+    raydiumTimer = setInterval(() => {
+        const now = Date.now();
+        for (const [poolKeyStr, state] of raydiumState.entries()) {
+            const waitedMs = now - state.lastPushMs;
+            if (waitedMs < RAYDIUM_HEARTBEAT_MS) continue;
+            const priorHeartbeat = state.lastHeartbeatMs ?? 0;
+            const slotSeed = Math.max(state.lastSlotHint ?? 0, state.lastWsSlot ?? 0, lastObservedSlot || 0);
+            const synthetic = !(slotSeed > 0);
+            const ok = pushRaydiumSnapshot(state, "heartbeat", slotSeed > 0 ? slotSeed : null, synthetic);
+            if (!ok) continue;
+            if (now - priorHeartbeat >= RAYDIUM_HEARTBEAT_LOG_MS) {
+                logger.log("raydium_heartbeat_refresh", {
+                    pool: poolKeyStr,
+                    waited_ms: waitedMs,
+                    slot: state.lastSlotHint ?? null,
+                    synthetic,
+                    ws_age_ms: state.lastWsMs != null ? Math.max(0, now - state.lastWsMs) : null,
+                });
+            }
+        }
+    }, raydiumHeartbeatInterval);
+    raydiumTimer?.unref?.();
 
     function computeMeteoraPrice(state: MeteoraPoolState): number | null {
         if (!Number.isFinite(state.activeId) || !Number.isFinite(state.binStep)) return null;
@@ -557,9 +726,11 @@ export async function startWsMarkets(args: {
         return inv * Math.pow(10, state.quoteDecimals - state.baseDecimals);
     }
 
-    function pushMeteoraSnapshot(state: MeteoraPoolState, source: string, slot?: number | null): void {
+    type MeteoraPushResult = { ok: boolean; slotUsed?: number; syntheticSlot?: boolean };
+
+    function pushMeteoraSnapshot(state: MeteoraPoolState, source: string, slot?: number | null): MeteoraPushResult {
         const px = computeMeteoraPrice(state);
-        if (!Number.isFinite(px) || px == null || px <= 0) return;
+        if (!Number.isFinite(px) || px == null || px <= 0) return { ok: false };
 
         const baseAtoms = state.baseIsX ? state.reserveXAtoms : state.reserveYAtoms;
         const quoteAtoms = state.baseIsX ? state.reserveYAtoms : state.reserveXAtoms;
@@ -568,14 +739,27 @@ export async function startWsMarkets(args: {
         const quoteUi = quoteAtoms != null ? atomsToUi(quoteAtoms, state.quoteDecimals) : undefined;
 
         const now = Date.now();
-        const slotHint = Math.max(slot ?? 0, lastObservedSlot || 0);
+        const prevSlotHint = state.lastSlotHint ?? 0;
+        const cachedWsSlot = state.lastWsSlot ?? 0;
+        const slotHint = Math.max(slot ?? 0, cachedWsSlot, prevSlotHint, lastObservedSlot || 0);
+        const slotUsed = slotHint > 0 ? slotHint : undefined;
+        const slotProvided = typeof slot === "number" && slot > 0;
+        const syntheticSlot = slotUsed != null && !slotProvided;
+
+        const heartbeatAtValue = source === "heartbeat" ? now : state.lastHeartbeatMs ?? null;
+        const heartbeatSlotValue = source === "heartbeat" ? slotUsed : state.lastHeartbeatSlot ?? slotUsed ?? null;
+        const wsAtValue = slotUsed != null ? now : state.lastWsMs ?? null;
+        const heartbeatGrace = state.heartbeatGraceMs ?? Math.max(METEORA_HEARTBEAT_MS, 1_000) * 2;
+        const tradeableSoft = state.tradeableWhenDegradedPreferred && heartbeatAtValue != null
+            ? (now - heartbeatAtValue) <= heartbeatGrace
+            : false;
 
         args.joiner.upsertAmms({
             venue: "meteora",
             ammId: state.poolIdStr,
             px,
             ts: now,
-            slot: slotHint > 0 ? slotHint : undefined,
+            slot: slotUsed,
             feeBps: state.feeBps,
             poolKind: "dlmm",
             baseDecimals: state.baseDecimals,
@@ -585,7 +769,103 @@ export async function startWsMarkets(args: {
             base_ui: baseUi,
             quote_ui: quoteUi,
             source,
+            tradeable_when_degraded: tradeableSoft,
+            heartbeat_at: heartbeatAtValue,
+            heartbeat_slot: heartbeatSlotValue ?? null,
+            ws_at: wsAtValue,
+            synthetic_slot: syntheticSlot || undefined,
         });
+
+        recordHeartbeatMetric({
+            venue: "meteora",
+            poolId: state.poolIdStr,
+            heartbeatAt: heartbeatAtValue,
+            wsAt: wsAtValue,
+            source,
+            synthetic: syntheticSlot,
+        });
+
+        state.lastPushMs = now;
+        state.lastPushSlot = slotUsed;
+        state.lastPushSynthetic = syntheticSlot;
+        if (slotHint > 0) {
+            state.lastSlotHint = slotHint;
+            state.lastWsSlot = slotHint;
+        }
+        if (wsAtValue != null) state.lastWsMs = wsAtValue;
+        if (source === "heartbeat") {
+            state.lastHeartbeatMs = now;
+            state.lastHeartbeatSlot = slotUsed;
+            state.lastHeartbeatSynthetic = syntheticSlot;
+        } else if (source === "ws") {
+            if (slotUsed != null) state.lastWsSlot = slotUsed;
+        }
+        return { ok: true, slotUsed, syntheticSlot };
+    }
+
+    function pushRaydiumSnapshot(state: RaydiumPoolState, source: string, slotOverride?: number | null, syntheticHint = false): boolean {
+        if (!(state.base > 0n && state.quote > 0n)) return false;
+
+        const baseUi = atomsToUi(state.base, state.baseDecimals);
+        const quoteUi = atomsToUi(state.quote, state.quoteDecimals);
+        const px = quoteUi > 0 && baseUi > 0 ? quoteUi / baseUi : NaN;
+        if (!Number.isFinite(px) || !(px > 0)) return false;
+
+        const now = Date.now();
+        const prevSlotHint = state.lastSlotHint ?? 0;
+        const cachedSlot = state.lastWsSlot ?? 0;
+        const slotHint = Math.max(slotOverride ?? 0, cachedSlot, prevSlotHint, lastObservedSlot || 0);
+        const slotUsed = slotHint > 0 ? slotHint : undefined;
+        const slotProvided = typeof slotOverride === "number" && slotOverride > 0;
+        const syntheticSlot = slotUsed != null && (syntheticHint || !slotProvided);
+
+        const wsAtValue = slotUsed != null ? now : state.lastWsMs ?? null;
+        const heartbeatAtValue = source === "heartbeat" ? now : state.lastHeartbeatMs ?? null;
+        const heartbeatGrace = state.heartbeatGraceMs ?? AMM_TTL_MS * 2;
+        const tradeableSoft = state.tradeableWhenDegradedPreferred && heartbeatAtValue != null
+            ? (now - heartbeatAtValue) <= heartbeatGrace
+            : false;
+        const heartbeatSlotValue = heartbeatAtValue != null ? (slotUsed ?? state.lastSlotHint ?? null) : null;
+
+        args.joiner.upsertAmms({
+            venue: "raydium",
+            ammId: state.poolIdStr,
+            px,
+            ts: now,
+            slot: slotUsed,
+            feeBps: state.feeBps,
+            poolKind: "cpmm",
+            baseDecimals: state.baseDecimals,
+            quoteDecimals: state.quoteDecimals,
+            base_int: state.base.toString(),
+            quote_int: state.quote.toString(),
+            source,
+            tradeable_when_degraded: tradeableSoft,
+            heartbeat_at: heartbeatAtValue,
+            heartbeat_slot: heartbeatSlotValue,
+            ws_at: wsAtValue,
+            synthetic_slot: syntheticSlot || undefined,
+        });
+
+        recordHeartbeatMetric({
+            venue: "raydium",
+            poolId: state.poolIdStr,
+            heartbeatAt: heartbeatAtValue,
+            wsAt: wsAtValue,
+            source,
+            synthetic: syntheticSlot,
+        });
+
+        state.lastPushMs = now;
+        if (slotUsed != null) {
+            state.lastSlotHint = slotUsed;
+            state.lastWsSlot = slotUsed;
+        }
+        if (wsAtValue != null) state.lastWsMs = wsAtValue;
+        if (source === "heartbeat") {
+            state.lastHeartbeatMs = now;
+        }
+        return true;
     }
 
     const subscribeMeteoraReserve = async (
@@ -595,7 +875,12 @@ export async function startWsMarkets(args: {
     ): Promise<void> => {
         const subId = await ws.onAccountChange(account, (acc, context) => {
             const slot = slotFromContext(context, acc as any);
-            if (slot != null) lastObservedSlot = Math.max(lastObservedSlot, slot);
+            const nowMs = Date.now();
+            if (slot != null) {
+                lastObservedSlot = Math.max(lastObservedSlot, slot);
+                state.lastWsSlot = slot;
+            }
+            state.lastWsMs = nowMs;
             try {
                 const amount = decodeSplAmount(acc.data);
                 if (which === "x") state.reserveXAtoms = amount;
@@ -640,11 +925,14 @@ export async function startWsMarkets(args: {
 
     const loadMeteoraState = async (spec: NormalizedPoolSpec): Promise<MeteoraPoolState | null> => {
         try {
-            const info = await http.getAccountInfo(spec.poolId, COMMITMENT);
+            const infoResp = await http.getAccountInfoAndContext(spec.poolId, COMMITMENT);
+            const info = infoResp?.value;
             if (!info?.data) {
                 logger.log("ws_meteora_pool_missing", { pool: spec.poolIdStr });
                 return null;
             }
+
+            const primeSlot = typeof infoResp?.context?.slot === "number" ? infoResp.context.slot : undefined;
 
             const program = getMeteoraProgram();
             const pair = decodeMeteoraAccount(program, "lbPair", info.data) as any;
@@ -668,8 +956,19 @@ export async function startWsMarkets(args: {
             const reserveY = new PublicKey(pair.reserveY);
 
             const reserveInfos = await http.getMultipleAccountsInfo([reserveX, reserveY], { commitment: COMMITMENT });
-            const amountX = reserveInfos[0]?.data ? decodeSplAmount(reserveInfos[0].data) : undefined;
-            const amountY = reserveInfos[1]?.data ? decodeSplAmount(reserveInfos[1].data) : undefined;
+            const rawReserveX = reserveInfos[0]?.data ?? null;
+            const rawReserveY = reserveInfos[1]?.data ?? null;
+
+            if (!rawReserveX || !rawReserveY) {
+                logger.log("ws_meteora_reserve_pending", {
+                    pool: spec.poolIdStr,
+                    have_x: Boolean(rawReserveX),
+                    have_y: Boolean(rawReserveY),
+                });
+            }
+
+            const amountX = rawReserveX ? decodeSplAmount(rawReserveX) : undefined;
+            const amountY = rawReserveY ? decodeSplAmount(rawReserveY) : undefined;
 
             const activeId = Number(typeof pair.activeId?.toString === "function" ? pair.activeId.toString() : pair.activeId ?? 0);
             const binStep = Number(pair.binStep ?? 0);
@@ -692,9 +991,22 @@ export async function startWsMarkets(args: {
                 activeId,
                 reserveXAtoms: amountX,
                 reserveYAtoms: amountY,
+                lastPushMs: 0,
+                tradeableWhenDegradedPreferred: Boolean(spec.freshness?.tradeableWhenDegraded),
+                heartbeatGraceMs: Number.isFinite(spec.freshness?.heartbeatGraceMs)
+                    ? Number(spec.freshness?.heartbeatGraceMs)
+                    : undefined,
             };
 
-            pushMeteoraSnapshot(state, "prime");
+            const seedSlot = primeSlot ?? (lastObservedSlot || 0);
+            const seedNow = Date.now();
+            if (seedSlot > 0) {
+                state.lastWsSlot = seedSlot;
+                state.lastSlotHint = seedSlot;
+            }
+            state.lastWsMs = seedNow;
+
+            pushMeteoraSnapshot(state, "prime", seedSlot > 0 ? seedSlot : null);
             await ensureMeteoraVaultSubs(state);
             return state;
         } catch (e) {
@@ -713,7 +1025,10 @@ export async function startWsMarkets(args: {
 
         const subId = await ws.onAccountChange(spec.poolId, (acc, context) => {
             const slot = slotFromContext(context, acc as any);
-            if (slot != null) lastObservedSlot = Math.max(lastObservedSlot, slot);
+            const nowMs = Date.now();
+            if (slot != null) {
+                lastObservedSlot = Math.max(lastObservedSlot, slot);
+            }
             void (async () => {
                 try {
                     const program = getMeteoraProgram();
@@ -734,6 +1049,8 @@ export async function startWsMarkets(args: {
                     tracked.reserveY = reserveY;
                     if (reserveChanged) await ensureMeteoraVaultSubs(tracked);
 
+                    if (slot != null) tracked.lastWsSlot = slot;
+                    tracked.lastWsMs = nowMs;
                     pushMeteoraSnapshot(tracked, "ws", slot ?? null);
                 } catch (e) {
                     logger.log("ws_meteora_state_error", {
@@ -758,6 +1075,7 @@ export async function startWsMarkets(args: {
     // Main wire function (idempotent)
     const wireAll = async () => {
         meteoraState.clear();
+        raydiumState.clear();
 
         const poolSpecs = collectPoolSpecs(conf);
         for (const spec of poolSpecs) {
@@ -779,30 +1097,24 @@ export async function startWsMarkets(args: {
                     fee_bps: meta.feeBps,
                     source: "onchain",
                 });
-                const state = { base: 0n, quote: 0n };
-
-                const push = (now: number, slotOverride?: number) => {
-                    if (state.base <= 0n || state.quote <= 0n) return;
-                    const baseUi = atomsToUi(state.base, meta.baseDecimals);
-                    const quoteUi = atomsToUi(state.quote, meta.quoteDecimals);
-                    const px = quoteUi > 0 && baseUi > 0 ? (quoteUi / baseUi) : NaN;
-                    if (!Number.isFinite(px) || !(px > 0)) return;
-                    const slotResolved = Math.max(slotOverride ?? 0, lastObservedSlot || 0);
-                    args.joiner.upsertAmms({
-                        venue: "raydium",
-                        ammId: poolId.toBase58(),
-                        px,
-                        ts: now,
-                        slot: slotResolved > 0 ? slotResolved : undefined,
-                        feeBps: meta.feeBps,
-                        poolKind: "cpmm",
-                        baseDecimals: meta.baseDecimals,
-                        quoteDecimals: meta.quoteDecimals,
-                        base_int: state.base.toString(),
-                        quote_int: state.quote.toString(),
-                        source: "ws",
-                    });
+                const poolKeyStr = poolId.toBase58();
+                const state: RaydiumPoolState = {
+                    poolId,
+                    poolIdStr: poolKeyStr,
+                    baseVault: meta.baseVault,
+                    quoteVault: meta.quoteVault,
+                    baseDecimals: meta.baseDecimals,
+                    quoteDecimals: meta.quoteDecimals,
+                    feeBps: meta.feeBps,
+                    base: 0n,
+                    quote: 0n,
+                    lastPushMs: 0,
+                    tradeableWhenDegradedPreferred: Boolean(spec.freshness?.tradeableWhenDegraded),
+                    heartbeatGraceMs: Number.isFinite(spec.freshness?.heartbeatGraceMs)
+                        ? Number(spec.freshness?.heartbeatGraceMs)
+                        : undefined,
                 };
+                raydiumState.set(poolKeyStr, state);
 
                 // WS: vault balances (2-arg signature)
                 const subBase = await ws.onAccountChange(meta.baseVault, (acc, context) => {
@@ -810,7 +1122,7 @@ export async function startWsMarkets(args: {
                     if (slot != null) lastObservedSlot = Math.max(lastObservedSlot, slot);
                     try {
                         state.base = decodeSplAmount(acc.data);
-                        push(Date.now(), slot);
+                        pushRaydiumSnapshot(state, "ws", slot ?? null);
                     } catch { }
                 });
                 addSub(subBase, "ray_base_vault", meta.baseVault);
@@ -820,20 +1132,21 @@ export async function startWsMarkets(args: {
                     if (slot != null) lastObservedSlot = Math.max(lastObservedSlot, slot);
                     try {
                         state.quote = decodeSplAmount(acc.data);
-                        push(Date.now(), slot);
+                        pushRaydiumSnapshot(state, "ws", slot ?? null);
                     } catch { }
                 });
                 addSub(subQuote, "ray_quote_vault", meta.quoteVault);
 
                 // Prime via HTTP
                 try {
-                    const [bInfo, qInfo] = await Promise.all([
-                        http.getAccountInfo(meta.baseVault, COMMITMENT),
-                        http.getAccountInfo(meta.quoteVault, COMMITMENT),
-                    ]);
-                    if (bInfo?.data) state.base = decodeSplAmount(bInfo.data);
-                    if (qInfo?.data) state.quote = decodeSplAmount(qInfo.data);
-                    push(Date.now());
+                    const resp = await http.getMultipleAccountsInfoAndContext([meta.baseVault, meta.quoteVault], { commitment: COMMITMENT });
+                    const accounts = resp?.value ?? [];
+                    const primeSlot = typeof resp?.context?.slot === "number" ? resp.context.slot : undefined;
+                    if (accounts[0]?.data) state.base = decodeSplAmount(accounts[0].data);
+                    if (accounts[1]?.data) state.quote = decodeSplAmount(accounts[1].data);
+                    const seedSlot = primeSlot ?? (lastObservedSlot || 0);
+                    const syntheticPrime = !(typeof primeSlot === "number" && primeSlot > 0);
+                    pushRaydiumSnapshot(state, "prime", seedSlot > 0 ? seedSlot : null, syntheticPrime);
                 } catch { }
 
                 logger.log("ws_ray_cpmm_wired", {
@@ -862,6 +1175,10 @@ export async function startWsMarkets(args: {
                         lastPushMs: 0,
                         activeTickIndex: 0,
                         tickArrays: new Map<number, OrcaTickArrayState>(),
+                        lastSlotHint: undefined,
+                        lastWsSlot: undefined,
+                        lastWsMs: undefined,
+                        lastHeartbeatMs: undefined,
                     };
                     orcaState.set(poolKeyStr, poolState);
                 } else {
@@ -870,7 +1187,8 @@ export async function startWsMarkets(args: {
 
                 // Prime once from HTTP
                 try {
-                    const prime = await http.getAccountInfo(poolId, COMMITMENT);
+                    const primeResp = await http.getAccountInfoAndContext(poolId, COMMITMENT);
+                    const prime = primeResp?.value;
                     if (prime?.data) {
                         const parsed: any = ParsableWhirlpool.parse(poolId, { ...prime, owner: prime.owner, data: prime.data });
                         const sqrtRaw = parsed?.sqrtPrice ?? 0;
@@ -879,20 +1197,40 @@ export async function startWsMarkets(args: {
                             const px = computeOrcaQuotePerBaseFromSqrt(sqrtBN, ctx.decA, ctx.decB, ctx.baseIsA);
                             if (Number.isFinite(px) && px > 0) {
                                 const now = Date.now();
-                                const slotHintNum = Math.max(latestTickArraySlot(poolState) ?? 0, lastObservedSlot || 0);
+                                const primeSlot = typeof primeResp?.context?.slot === "number" ? primeResp.context.slot : undefined;
+                                const slotHintNum = Math.max(primeSlot ?? 0, latestTickArraySlot(poolState) ?? 0, lastObservedSlot || 0);
+                                const slotUsed = slotHintNum > 0 ? slotHintNum : undefined;
+                                const syntheticSlot = slotUsed != null && !(typeof primeSlot === "number" && primeSlot > 0);
+                                const wsAtValue = now;
                                 args.joiner.upsertAmms({
                                     venue: "orca",
                                     ammId: poolId.toBase58(),
                                     px,
                                     ts: now,
-                                    slot: slotHintNum > 0 ? slotHintNum : undefined,
+                                    slot: slotUsed,
                                     feeBps: ctx.feeBps,
                                     poolKind: "clmm",
                                     baseDecimals: ctx.baseIsA ? ctx.decA : ctx.decB,
                                     quoteDecimals: ctx.baseIsA ? ctx.decB : ctx.decA,
                                     source: "prime",
+                                    ws_at: wsAtValue,
+                                    heartbeat_at: wsAtValue,
+                                    synthetic_slot: syntheticSlot || undefined,
+                                });
+                                recordHeartbeatMetric({
+                                    venue: "orca",
+                                    poolId: poolId.toBase58(),
+                                    wsAt: wsAtValue,
+                                    heartbeatAt: wsAtValue,
+                                    source: "prime",
+                                    synthetic: syntheticSlot,
                                 });
                                 poolState.lastPushMs = now;
+                                if (slotUsed != null) {
+                                    poolState.lastSlotHint = slotUsed;
+                                    poolState.lastWsSlot = slotUsed;
+                                }
+                                poolState.lastWsMs = wsAtValue;
                                 const tickIdx = Number(parsed?.tickCurrentIndex);
                                 if (Number.isFinite(tickIdx)) {
                                     poolState.activeTickIndex = tickIdx;
@@ -921,20 +1259,39 @@ export async function startWsMarkets(args: {
                         const now = Date.now();
                         const state = orcaState.get(poolKeyStr);
                         const slotHintNum = Math.max(slot ?? 0, latestTickArraySlot(state) ?? 0, lastObservedSlot || 0);
+                        const slotUsed = slotHintNum > 0 ? slotHintNum : undefined;
+                        const syntheticSlot = slotUsed != null && !(typeof slot === "number" && slot > 0);
+                        const wsAtValue = now;
                         args.joiner.upsertAmms({
                             venue: "orca",
                             ammId: poolId.toBase58(),
                             px,
                             ts: now,
-                            slot: slotHintNum > 0 ? slotHintNum : undefined,
+                            slot: slotUsed,
                             feeBps: ctx.feeBps,   // exact per-pool fee (feeRate/100)
                             poolKind: "clmm",
                             baseDecimals: ctx.baseIsA ? ctx.decA : ctx.decB,
                             quoteDecimals: ctx.baseIsA ? ctx.decB : ctx.decA,
                             source: "ws",
+                            ws_at: wsAtValue,
+                            heartbeat_at: wsAtValue,
+                            synthetic_slot: syntheticSlot || undefined,
+                        });
+                        recordHeartbeatMetric({
+                            venue: "orca",
+                            poolId: poolId.toBase58(),
+                            wsAt: wsAtValue,
+                            heartbeatAt: wsAtValue,
+                            source: "ws",
+                            synthetic: syntheticSlot,
                         });
                         if (state) {
                             state.lastPushMs = now;
+                            if (slotUsed != null) {
+                                state.lastSlotHint = slotUsed;
+                                state.lastWsSlot = slotUsed;
+                            }
+                            state.lastWsMs = wsAtValue;
                             const tickIdx = Number(parsed?.tickCurrentIndex);
                             if (Number.isFinite(tickIdx)) {
                                 state.activeTickIndex = tickIdx;
@@ -991,6 +1348,8 @@ export async function startWsMarkets(args: {
             }
             keepaliveTimer && clearInterval(keepaliveTimer);
             orcaTimer && clearInterval(orcaTimer);
+            meteoraTimer && clearInterval(meteoraTimer);
+            raydiumTimer && clearInterval(raydiumTimer);
             try { await clearSubs(); } catch { }
             for (const state of orcaState.values()) {
                 for (const entry of state.tickArrays.values()) {
@@ -1002,6 +1361,7 @@ export async function startWsMarkets(args: {
             }
             orcaState.clear();
             meteoraState.clear();
+            raydiumState.clear();
             try { (ws as any)._rpcWebSocket?.off?.("open", onOpen); } catch { }
             try { (ws as any)._rpcWebSocket?.off?.("close", onClose); } catch { }
         },

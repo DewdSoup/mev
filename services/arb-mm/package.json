@@ -30,7 +30,8 @@
     "predev": ":",
     "prestart": ":",
     "prestart:prod": ":",
-    "live:multi": "tsx src/multipair.ts"
+    "live:multi": "tsx src/multipair.ts",
+    "meteora:baseline": "tsx scripts/meteora_baseline.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.29.0",

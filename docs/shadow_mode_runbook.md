@@ -18,12 +18,17 @@
 - `clmm_quote_snapshot_only_block` spam confirms CLMM quotes remain snapshot-only.
 - `orca_force_poll` should be infrequent (≥4.5 s apart) and now includes a `slot` hint; errors on this channel should stay at zero.
 - `market_provider_telemetry` should report `rateLimited:0` and avoid long runs of `degradedPools`.
+- `market_provider_telemetry.heartbeat` exposes `heartbeat_age_ms_max`/`ws_age_ms_max`; Meteora should stay <30s with `missingHeartbeat:0` before promoting a config.
 - No `submit_success`, `submit_error`, or `arb_shutdown` entries should appear during shadow soaks.
 
 ## What to watch for
 - Persistent `degradedPools` with `slot_gap` after the strike limit indicates the websocket fell behind; bump `ORCA_FORCE_POLL_MS` or investigate the upstream RPC.
 - Any `orca_force_poll_error` or `market_provider_amm_batch_error` means the fallback HTTP path is unhappy and needs attention before the next soak.
 - If the boot banner shows `LIVE_TRADING=1` unintentionally, re-run after correcting `.env.live`.
+
+## Freshness config knobs
+- Per-venue freshness defaults live alongside pool definitions in `configs/pairs.json` (`freshness.slotLagSlots`, `freshness.maxAgeMs`, `freshness.heartbeatGraceMs`).
+- Tune these values instead of the legacy globals; env vars such as `AMM_SLOT_MAX_LAG__METEORA` continue to override per-venue entries when rapid experiments are needed.
 
 ## Smoke-test sketch
 - Future CI hook: spawn `pnpm --filter @mev/arb-mm dev -- --shadow-smoke` (not yet implemented) that boots, waits for a single `would_trade` in shadow mode, and exits.

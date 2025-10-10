@@ -24,6 +24,12 @@ export interface AmmSnapshot {
   lastUpdateTs: number;
   ageMs?: number;
   slot?: number | null;
+  heartbeatAt?: number | null;
+  heartbeatSlot?: number | null;
+  wsAt?: number | null;
+  syntheticSlot?: boolean;
+  tradeableWhenDegraded?: boolean;
+  source?: string | null;
   stale?: boolean;
   degraded?: boolean;
   degradedReason?: string | null;
@@ -65,6 +71,12 @@ export interface TrackedPoolMeta {
   venue: AmmVenue;
   poolKind: PoolKind;
   feeHint?: number;
+  freshness?: {
+    slotLagSlots?: number;
+    maxAgeMs?: number;
+    heartbeatGraceMs?: number;
+    tradeableWhenDegraded?: boolean;
+  };
 }
 
 export interface MarketProviderConfig {

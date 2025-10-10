@@ -276,14 +276,14 @@ export async function getDlmmBinArrays(params: DlmmBinArrayParams): Promise<Dlmm
     const cache = await ensurePoolCache(poolId, connection);
     await maybeRefetchInstance(poolId, cache);
 
-    const now = Date.now();
+    const requestStart = Date.now();
     const key = binKey(swapForY, horizon);
     const cached = cache.binCache.get(key);
-    const ageMs = cached ? now - cached.ts : Number.POSITIVE_INFINITY;
+    const ageMs = cached ? requestStart - cached.ts : Number.POSITIVE_INFINITY;
 
     if (cached && ageMs <= maxAgeMs) {
-        cache.lastSuccessMs = now;
-        const stateFresh = (now - cache.lastSuccessMs) <= DLMM_STATE_MAX_AGE_MS;
+        cache.lastSuccessMs = requestStart;
+        const stateFresh = true;
         cache.failureCount = 0;
         cache.cooldownUntil = 0;
         cache.lastError = undefined;
@@ -301,9 +301,9 @@ export async function getDlmmBinArrays(params: DlmmBinArrayParams): Promise<Dlmm
     }
 
     const failure = cache.binFailures.get(key);
-    const blockedByCooldown = failure && now < failure.cooldownUntil;
+    const blockedByCooldown = failure && requestStart < failure.cooldownUntil;
 
-    let stateAgeMs = now - cache.lastSuccessMs;
+    let stateAgeMs = requestStart - cache.lastSuccessMs;
     let stateFresh = stateAgeMs <= DLMM_STATE_MAX_AGE_MS;
 
     if (!allowRefresh || blockedByCooldown) {
@@ -333,6 +333,7 @@ export async function getDlmmBinArrays(params: DlmmBinArrayParams): Promise<Dlmm
     const inFlight = cache.binFetchInFlight.get(key);
     if (inFlight) {
         const outcome = await inFlight;
+        const resolvedNow = Date.now();
         if (outcome.ok) {
             const ts = outcome.fetchedAt;
             cache.binCache.set(key, { ts, binArrays: outcome.binArrays });
@@ -342,14 +343,14 @@ export async function getDlmmBinArrays(params: DlmmBinArrayParams): Promise<Dlmm
             cache.cooldownUntil = 0;
             cache.lastError = undefined;
             logRecovery("meteora_dlmm_bin_fetch_recovered", `bin:${poolId}:${key}`, { pool: poolId, swap_for_y: swapForY });
-            stateAgeMs = now - cache.lastSuccessMs;
+            stateAgeMs = resolvedNow - cache.lastSuccessMs;
             stateFresh = stateAgeMs <= DLMM_STATE_MAX_AGE_MS;
             return {
                 ok: true,
                 instance: cache.instance,
                 binArrays: outcome.binArrays,
                 fresh: true,
-                ageMs: now - ts,
+                ageMs: resolvedNow - ts,
                 stateFresh,
                 stateAgeMs,
             };
@@ -358,7 +359,7 @@ export async function getDlmmBinArrays(params: DlmmBinArrayParams): Promise<Dlmm
         const failureState = cache.binFailures.get(key) ?? { failureCount: 0, cooldownUntil: 0 } as BinFailureState;
         failureState.failureCount += 1;
         failureState.lastError = outcome.err;
-        failureState.cooldownUntil = now + computeBackoff(failureState.failureCount);
+        failureState.cooldownUntil = resolvedNow + computeBackoff(failureState.failureCount);
         cache.binFailures.set(key, failureState);
         cache.lastError = outcome.err;
         logThrottled("meteora_dlmm_fetch_failed", `bin:${poolId}:${key}`, {
@@ -367,7 +368,7 @@ export async function getDlmmBinArrays(params: DlmmBinArrayParams): Promise<Dlmm
             horizon,
             err: outcome.err,
             failure_count: failureState.failureCount,
-            cooldown_ms: Math.max(0, failureState.cooldownUntil - now),
+            cooldown_ms: Math.max(0, failureState.cooldownUntil - resolvedNow),
         });
 
         if (cached && allowStale && ageMs <= staleToleranceMs) {
@@ -377,7 +378,7 @@ export async function getDlmmBinArrays(params: DlmmBinArrayParams): Promise<Dlmm
                 instance: cache.instance,
                 binArrays: cached.binArrays,
                 fresh: false,
-                ageMs,
+                ageMs: resolvedNow - cached.ts,
                 staleReason: outcome.err,
                 stateFresh,
                 stateAgeMs,
@@ -406,6 +407,7 @@ export async function getDlmmBinArrays(params: DlmmBinArrayParams): Promise<Dlmm
     cache.binFetchInFlight.set(key, fetchPromise);
 
     const outcome = await fetchPromise;
+    const finishedNow = Date.now();
     if (cache.binFetchInFlight.get(key) === fetchPromise) {
         cache.binFetchInFlight.delete(key);
     }
@@ -418,14 +420,14 @@ export async function getDlmmBinArrays(params: DlmmBinArrayParams): Promise<Dlmm
         cache.cooldownUntil = 0;
         cache.lastError = undefined;
         logRecovery("meteora_dlmm_bin_fetch_recovered", `bin:${poolId}:${key}`, { pool: poolId, swap_for_y: swapForY });
-        stateAgeMs = now - cache.lastSuccessMs;
+        stateAgeMs = finishedNow - cache.lastSuccessMs;
         stateFresh = stateAgeMs <= DLMM_STATE_MAX_AGE_MS;
         return {
             ok: true,
             instance: cache.instance,
             binArrays: outcome.binArrays,
             fresh: true,
-            ageMs: 0,
+            ageMs: finishedNow - outcome.fetchedAt,
             stateFresh,
             stateAgeMs,
         };
@@ -434,7 +436,7 @@ export async function getDlmmBinArrays(params: DlmmBinArrayParams): Promise<Dlmm
     const failureState = cache.binFailures.get(key) ?? ({ failureCount: 0, cooldownUntil: 0 } as BinFailureState);
     failureState.failureCount += 1;
     failureState.lastError = outcome.err;
-    failureState.cooldownUntil = now + computeBackoff(failureState.failureCount);
+    failureState.cooldownUntil = finishedNow + computeBackoff(failureState.failureCount);
     cache.binFailures.set(key, failureState);
     cache.lastError = outcome.err;
 
@@ -444,7 +446,7 @@ export async function getDlmmBinArrays(params: DlmmBinArrayParams): Promise<Dlmm
         horizon,
         err: outcome.err,
         failure_count: failureState.failureCount,
-        cooldown_ms: Math.max(0, failureState.cooldownUntil - now),
+        cooldown_ms: Math.max(0, failureState.cooldownUntil - finishedNow),
     });
 
     if (cached && allowStale && ageMs <= staleToleranceMs) {
@@ -454,7 +456,7 @@ export async function getDlmmBinArrays(params: DlmmBinArrayParams): Promise<Dlmm
             instance: cache.instance,
             binArrays: cached.binArrays,
             fresh: false,
-            ageMs,
+            ageMs: finishedNow - cached.ts,
             staleReason: outcome.err,
             stateFresh,
             stateAgeMs,

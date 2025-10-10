@@ -11,6 +11,12 @@ export type PairAmmVenue = {
     poolKind?: string;
     feeBps?: number;
     enabled?: boolean;
+    freshness?: {
+        slotLagSlots?: number;
+        maxAgeMs?: number;
+        heartbeatGraceMs?: number;
+        tradeableWhenDegraded?: boolean;
+    };
 };
 
 export type PairSpec = {
@@ -76,12 +82,27 @@ function normalizePairsJson(raw: any): PairSpec[] | undefined {
             if (!v || String(v.kind ?? "").toLowerCase() === "phoenix") continue;
             const poolId = String(v.id ?? v.poolId ?? "").trim();
             if (!poolId) continue;
+            const rawFreshness = typeof v.freshness === "object" && v.freshness !== null ? v.freshness as Record<string, unknown> : undefined;
+            let freshness: PairAmmVenue["freshness"] | undefined;
+            if (rawFreshness) {
+                const slotLag = Number(rawFreshness.slotLag ?? rawFreshness.slotLagSlots ?? rawFreshness.slot_lag ?? rawFreshness.slot_lag_slots);
+                const maxAge = Number(rawFreshness.maxAgeMs ?? rawFreshness.max_age_ms);
+                const heartbeatGrace = Number(rawFreshness.heartbeatGraceMs ?? rawFreshness.heartbeat_grace_ms ?? rawFreshness.heartbeatMs ?? rawFreshness.heartbeat_ms);
+                const tradeable = rawFreshness.tradeableWhenDegraded ?? rawFreshness.tradeable_when_degraded;
+                const tmp: PairAmmVenue["freshness"] = {};
+                if (Number.isFinite(slotLag) && Number(slotLag) > 0) tmp.slotLagSlots = Number(slotLag);
+                if (Number.isFinite(maxAge) && Number(maxAge) > 0) tmp.maxAgeMs = Number(maxAge);
+                if (Number.isFinite(heartbeatGrace) && Number(heartbeatGrace) > 0) tmp.heartbeatGraceMs = Number(heartbeatGrace);
+                if (typeof tradeable === "boolean") tmp.tradeableWhenDegraded = tradeable;
+                if (Object.keys(tmp).length) freshness = tmp;
+            }
             venues.push({
                 venue: String(v.kind ?? v.venue ?? "").toLowerCase(),
                 poolId,
                 poolKind: typeof v.poolKind === "string" ? v.poolKind : typeof v.pool_kind === "string" ? v.pool_kind : undefined,
                 feeBps: typeof v.feeBps === "number" ? v.feeBps : typeof v.fee_bps === "number" ? v.fee_bps : undefined,
                 enabled: typeof v.enabled === "boolean" ? v.enabled : undefined,
+                freshness,
             });
         }
 
