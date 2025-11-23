@@ -9,6 +9,7 @@ import {
 } from "@raydium-io/raydium-sdk";
 import { WHIRLPOOL_CODER, PriceMath } from "@orca-so/whirlpools-sdk";
 import BN from "bn.js";
+import Decimal from "decimal.js";
 
 import { rpc } from "@mev/rpc-facade";
 import { logger } from "../ml_logger.js";
@@ -32,6 +33,9 @@ import {
 } from "@meteora-ag/dlmm";
 import { getDlmmBinArrays, getDlmmInstance } from "../util/meteora_dlmm.js";
 import { summarizeHeartbeatByVenue } from "../runtime/metrics.js";
+import { refreshLifinitySnapshot, toUi as lifinityAtomsToUi } from "../util/lifinity.js";
+import { getPoolTuning, getVenueTuning } from "../config/venues.js";
+import { recordVenueFreshness } from "../runtime/telemetry.js";
 
 const DEFAULT_REFRESH_MS = Number(process.env.MARKET_PROVIDER_REFRESH_MS ?? 600);
 const DEFAULT_REFRESH_DEBOUNCE_MS = Number(
@@ -68,6 +72,10 @@ function resolveVenueNumber(venue: string | undefined, overrides: Record<string,
 const SLOT_LAG_OVERRIDES = loadVenueOverrides("AMM_SLOT_MAX_LAG");
 
 function slotLagLimitFor(venue: string | undefined): number {
+  const tuned = venue ? getVenueTuning(venue)?.slotLagSlots : undefined;
+  if (tuned != null && Number.isFinite(tuned)) {
+    return Number(tuned);
+  }
   return resolveVenueNumber(venue, SLOT_LAG_OVERRIDES, DEFAULT_SLOT_LAG);
 }
 
@@ -353,16 +361,18 @@ export class MarketStateProvider {
     const enableRaydiumClmm = String(process.env.ENABLE_AMM_RAYDIUM_CLMM ?? process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0";
     const enableOrcaClmm = String(process.env.ENABLE_AMM_ORCA ?? "0").trim() === "1";
     const enableMeteoraDlmm = String(process.env.ENABLE_AMM_METEORA ?? "1").trim() !== "0";
+    const enableLifinity = String(process.env.ENABLE_AMM_LIFINITY ?? "1").trim() !== "0";
     const seen = new Set<string>();
     const out: TrackedPoolMeta[] = [];
 
-    const push = (venue: PairAmmVenue) => {
+    const push = (pair: PairSpec, venue: PairAmmVenue) => {
       const rawPool = (venue.poolId ?? "").trim();
       if (!rawPool) return;
       if ((venue as any).enabled === false) return;
 
       const venueName = String(((venue as any).kind ?? venue.venue ?? "")).toLowerCase();
-      if (venueName !== "raydium" && venueName !== "orca" && venueName !== "meteora") return;
+      if (venueName === "lifinity" && !enableLifinity) return;
+      if (venueName !== "raydium" && venueName !== "orca" && venueName !== "meteora" && venueName !== "lifinity") return;
 
       const poolKind = String((venue.poolKind ?? "")).toLowerCase();
       if (poolKind === "clmm") {
@@ -376,17 +386,47 @@ export class MarketStateProvider {
       const key = `${venueName}:${rawPool}`;
       if (seen.has(key)) return;
       seen.add(key);
+      const venueDefaults = getVenueTuning(venueName) ?? {};
+      const poolDefaults = getPoolTuning(rawPool) ?? {};
+
+      const baseDecimalsHint = Number.isFinite(venue.baseDecimals) ? Number(venue.baseDecimals) : undefined;
+      const quoteDecimalsHint = Number.isFinite(venue.quoteDecimals) ? Number(venue.quoteDecimals) : undefined;
+      const baseMint = (pair.baseMint ?? "").trim();
+      const quoteMint = (pair.quoteMint ?? "").trim();
+      const feeHint = typeof venue.feeBps === "number"
+        ? venue.feeBps
+        : typeof poolDefaults.feeBps === "number"
+          ? poolDefaults.feeBps
+          : venueDefaults.feeBps;
+
+      const defaultFreshness: PairAmmVenue["freshness"] = {};
+      if (typeof venueDefaults.slotLagSlots === "number") defaultFreshness.slotLagSlots = venueDefaults.slotLagSlots;
+      if (typeof venueDefaults.snapshotMaxAgeMs === "number") defaultFreshness.maxAgeMs = venueDefaults.snapshotMaxAgeMs;
+      if (typeof venueDefaults.heartbeatGraceMs === "number") defaultFreshness.heartbeatGraceMs = venueDefaults.heartbeatGraceMs;
+      if (typeof venueDefaults.tradeableWhenDegraded === "boolean") defaultFreshness.tradeableWhenDegraded = venueDefaults.tradeableWhenDegraded;
+
+      let mergedFreshness: PairAmmVenue["freshness"] | undefined = undefined;
+      if (venue.freshness && typeof venue.freshness === "object") {
+        mergedFreshness = { ...defaultFreshness, ...venue.freshness };
+      } else if (Object.keys(defaultFreshness).length) {
+        mergedFreshness = { ...defaultFreshness };
+      }
+
       out.push({
         poolId: rawPool,
         venue: venueName as AmmVenue,
         poolKind: poolKind as PoolKind,
-        feeHint: typeof venue.feeBps === "number" ? venue.feeBps : undefined,
-        freshness: venue.freshness,
+        feeHint: typeof feeHint === "number" ? feeHint : undefined,
+        freshness: mergedFreshness,
+        baseMint: baseMint || undefined,
+        quoteMint: quoteMint || undefined,
+        baseDecimalsHint,
+        quoteDecimalsHint,
       });
     };
 
     for (const pair of this.pairs) {
-      for (const venue of pair.ammVenues ?? []) push(venue);
+      for (const venue of pair.ammVenues ?? []) push(pair, venue);
     }
 
     return out;
@@ -482,7 +522,11 @@ export class MarketStateProvider {
     info: AccountInfo<Buffer>,
     slot: number | null
   ): void {
-    if (pool.poolKind === "cpmm") {
+    if (pool.venue === "lifinity" && pool.poolKind === "cpmm") {
+      this.handleLifinityVault(pool, which, info, slot);
+      return;
+    }
+    if (pool.venue === "raydium" && pool.poolKind === "cpmm") {
       this.handleRaydiumCpmmVault(pool, which, info, slot);
       return;
     }
@@ -588,6 +632,109 @@ export class MarketStateProvider {
     }
     this.logAmmSnapshotChange(pool, prev ?? null, snap);
     this.requestEmit();
+  }
+
+  ingestExternalAmmSnapshot(payload: {
+    venue: string;
+    poolId: string;
+    poolKind: PoolKind;
+    price?: number | null;
+    feeBps?: number | null;
+    baseDecimals: number;
+    quoteDecimals: number;
+    baseReserveAtoms?: string | null;
+    quoteReserveAtoms?: string | null;
+    baseUi?: number | null;
+    quoteUi?: number | null;
+    baseVault?: string | null;
+    quoteVault?: string | null;
+    slot?: number | null;
+    ts?: number;
+    source?: string;
+    tradeableWhenDegraded?: boolean;
+    syntheticSlot?: boolean;
+  }): void {
+    const pool = this.getTrackedPoolMeta(payload.poolId);
+    if (!pool) return;
+    if (pool.venue !== payload.venue) return;
+    if (pool.poolKind !== payload.poolKind) return;
+
+    const prev = this.amms.get(pool.poolId);
+    const now = payload.ts ?? Date.now();
+
+    const parseAtoms = (value: string | null | undefined, decimals: number): number | null => {
+      if (!value) return null;
+      try {
+        const dec = new Decimal(value);
+        if (!dec.isFinite()) return null;
+        const ui = dec.div(new Decimal(10).pow(decimals));
+        const num = ui.toNumber();
+        return Number.isFinite(num) ? num : null;
+      } catch {
+        return null;
+      }
+    };
+
+    const baseUi =
+      (payload.baseUi != null && Number.isFinite(payload.baseUi) && payload.baseUi > 0
+        ? payload.baseUi
+        : parseAtoms(payload.baseReserveAtoms, payload.baseDecimals)) ??
+      prev?.baseReserve ??
+      null;
+
+    const quoteUi =
+      (payload.quoteUi != null && Number.isFinite(payload.quoteUi) && payload.quoteUi > 0
+        ? payload.quoteUi
+        : parseAtoms(payload.quoteReserveAtoms, payload.quoteDecimals)) ??
+      prev?.quoteReserve ??
+      null;
+
+    const priceCandidate = payload.price;
+    const inferredPrice =
+      baseUi != null && quoteUi != null && baseUi > 0 && quoteUi > 0
+        ? quoteUi / baseUi
+        : null;
+    const price =
+      priceCandidate != null && Number.isFinite(priceCandidate) && priceCandidate > 0
+        ? priceCandidate
+        : inferredPrice ?? prev?.price ?? null;
+
+    const slot = payload.slot ?? null;
+
+    const snap: AmmSnapshot = {
+      poolId: pool.poolId,
+      venue: pool.venue,
+      poolKind: pool.poolKind,
+      price,
+      feeBps: payload.feeBps ?? pool.feeHint ?? prev?.feeBps ?? null,
+      baseDecimals: payload.baseDecimals,
+      quoteDecimals: payload.quoteDecimals,
+      baseVault: payload.baseVault ?? prev?.baseVault,
+      quoteVault: payload.quoteVault ?? prev?.quoteVault,
+      baseReserve: baseUi,
+      quoteReserve: quoteUi,
+      baseReserveUi: baseUi,
+      quoteReserveUi: quoteUi,
+      baseReserveAtoms: payload.baseReserveAtoms ?? prev?.baseReserveAtoms ?? null,
+      quoteReserveAtoms: payload.quoteReserveAtoms ?? prev?.quoteReserveAtoms ?? null,
+      lastUpdateTs: now,
+      slot,
+      heartbeatAt: now,
+      heartbeatSlot: slot ?? prev?.heartbeatSlot ?? null,
+      wsAt: now,
+      syntheticSlot: payload.syntheticSlot ?? (slot == null ? prev?.syntheticSlot : false),
+      tradeableWhenDegraded:
+        payload.tradeableWhenDegraded ??
+        prev?.tradeableWhenDegraded ??
+        pool.freshness?.tradeableWhenDegraded,
+      source: payload.source ?? "ws",
+      stale: false,
+      meta: prev?.meta ?? null,
+    };
+
+    this.commitAmmSnapshot(pool, snap, slot);
+    const watcher = this.poolWatchers.get(pool.poolId);
+    if (watcher) this.ensurePoolVaultSubscriptions(watcher, snap);
   }
 
   private logAmmSnapshotChange(pool: TrackedPoolMeta, prev: AmmSnapshot | null, snap: AmmSnapshot): void {
@@ -841,6 +988,10 @@ export class MarketStateProvider {
         this.handleRaydiumClmmState(pool, info, slot);
         return;
       }
+      if (pool.venue === "lifinity" && pool.poolKind === "cpmm") {
+        void this.updateLifinitySnapshot(pool, slot, { viaWs: true });
+        return;
+      }
       if (pool.venue === "orca" && pool.poolKind === "clmm") {
         this.handleOrcaClmmState(pool, info, slot);
         return;
@@ -956,6 +1107,130 @@ export class MarketStateProvider {
     }
 
     this.commitAmmSnapshot(pool, next, slotHint);
+  }
+
+  private handleLifinityVault(
+    pool: TrackedPoolMeta,
+    which: "base" | "quote",
+    info: AccountInfo<Buffer>,
+    slot: number | null,
+  ): void {
+    const snap = this.amms.get(pool.poolId);
+    if (!snap) return;
+    const decoded: any = SPL_ACCOUNT_LAYOUT.decode(info.data);
+    const amount = new BN(decoded.amount.toString());
+    const atoms = BigInt(amount.toString());
+    const decimals = which === "base" ? snap.baseDecimals : snap.quoteDecimals;
+    const reserveUi = lifinityAtomsToUi(atoms, decimals);
+
+    const now = Date.now();
+    const slotHint = slot ?? snap.slot ?? null;
+    const heartbeatSlot = slot ?? snap.heartbeatSlot ?? slotHint ?? null;
+
+    const next: AmmSnapshot = {
+      ...snap,
+      lastUpdateTs: now,
+      slot: slotHint,
+      wsAt: now,
+      heartbeatAt: now,
+      heartbeatSlot,
+      syntheticSlot: slot != null ? false : snap.syntheticSlot,
+      stale: false,
+      source: snap.source ?? "provider",
+    };
+    if (which === "base") {
+      next.baseReserve = reserveUi;
+      next.baseReserveUi = reserveUi;
+      next.baseReserveAtoms = atoms.toString();
+    } else {
+      next.quoteReserve = reserveUi;
+      next.quoteReserveUi = reserveUi;
+      next.quoteReserveAtoms = atoms.toString();
+    }
+    if (
+      next.baseReserve != null &&
+      next.quoteReserve != null &&
+      next.baseReserve > 0 &&
+      next.quoteReserve > 0
+    ) {
+      const px = next.quoteReserve / next.baseReserve;
+      if (Number.isFinite(px) && px > 0) next.price = px;
+    }
+
+    this.commitAmmSnapshot(pool, next, slotHint);
+  }
+
+  private async buildLifinitySnapshot(pool: TrackedPoolMeta, slot: number | null): Promise<AmmSnapshot> {
+    const poolPk = new PublicKey(pool.poolId);
+    const baseMint = pool.baseMint ? new PublicKey(pool.baseMint) : this.findBaseMint(pool.poolId);
+    const quoteMint = pool.quoteMint ? new PublicKey(pool.quoteMint) : this.findQuoteMint(pool.poolId);
+    const snapshot = await refreshLifinitySnapshot({
+      connection: this.conn,
+      poolId: poolPk,
+      expectedBaseMint: baseMint ?? undefined,
+      expectedQuoteMint: quoteMint ?? undefined,
+      baseDecimalsHint: pool.baseDecimalsHint,
+      quoteDecimalsHint: pool.quoteDecimalsHint,
+      slot: slot ?? undefined,
+    });
+
+    const baseUi = lifinityAtomsToUi(snapshot.baseReserve, snapshot.meta.baseDecimals);
+    const quoteUi = lifinityAtomsToUi(snapshot.quoteReserve, snapshot.meta.quoteDecimals);
+    const price = baseUi > 0 ? quoteUi / baseUi : null;
+    const now = Date.now();
+    const slotHint = slot ?? snapshot.slot ?? null;
+    const tradeablePreferred = Boolean(pool.freshness?.tradeableWhenDegraded);
+
+    return {
+      poolId: pool.poolId,
+      venue: pool.venue,
+      poolKind: pool.poolKind,
+      price: price != null && Number.isFinite(price) && price > 0 ? price : null,
+      feeBps: pool.feeHint ?? snapshot.meta.feeBps ?? null,
+      baseDecimals: snapshot.meta.baseDecimals,
+      quoteDecimals: snapshot.meta.quoteDecimals,
+      baseVault: snapshot.meta.baseVault.toBase58(),
+      quoteVault: snapshot.meta.quoteVault.toBase58(),
+      baseReserve: baseUi,
+      quoteReserve: quoteUi,
+      baseReserveUi: baseUi,
+      quoteReserveUi: quoteUi,
+      baseReserveAtoms: snapshot.baseReserve.toString(),
+      quoteReserveAtoms: snapshot.quoteReserve.toString(),
+      lastUpdateTs: now,
+      slot: slotHint,
+      wsAt: now,
+      heartbeatAt: now,
+      heartbeatSlot: slotHint,
+      syntheticSlot: slotHint == null && snapshot.slot == null ? true : undefined,
+      tradeableWhenDegraded: tradeablePreferred,
+      source: "provider",
+      stale: false,
+      meta: {
+        feeBps: snapshot.meta.feeBps,
+        vaultSource: snapshot.vaultSource,
+      },
+    };
+  }
+
+  private async updateLifinitySnapshot(pool: TrackedPoolMeta, slot: number | null, opts?: { viaWs?: boolean }): Promise<void> {
+    try {
+      const snap = await this.buildLifinitySnapshot(pool, slot);
+      this.commitAmmSnapshot(pool, snap, snap.slot ?? slot ?? null);
+      const watcher = this.poolWatchers.get(pool.poolId);
+      if (watcher) this.ensurePoolVaultSubscriptions(watcher, snap);
+    } catch (err) {
+      const msg = String((err as any)?.message ?? err);
+      logger.log("market_provider_lifinity_error", {
+        pool: pool.poolId,
+        err: msg,
+        via_ws: opts?.viaWs || undefined,
+      });
+      if (!opts?.viaWs) {
+        this.setAmmDegraded(pool.poolId, "lifinity_refresh_failed");
+      }
+      if (!opts?.viaWs) throw err;
+    }
   }
 
   private handleClmmVault(
@@ -1465,6 +1740,8 @@ export class MarketStateProvider {
             this.handleRaydiumCpmmState(pool, info, slot);
           } else if (pool.venue === "raydium" && pool.poolKind === "clmm") {
             this.handleRaydiumClmmState(pool, info, slot);
+          } else if (pool.venue === "lifinity" && pool.poolKind === "cpmm") {
+            await this.updateLifinitySnapshot(pool, slot);
           } else if (pool.venue === "orca" && pool.poolKind === "clmm") {
             this.handleOrcaClmmState(pool, info, slot);
           } else if (pool.venue === "meteora" && pool.poolKind === "dlmm") {
@@ -1665,9 +1942,36 @@ export class MarketStateProvider {
 
     const baseAtomsStr = baseAmount.toString();
     const quoteAtomsStr = quoteAmount.toString();
-    const baseReserveUi = Number(baseAmount.toString()) / 10 ** baseDecimals;
-    const quoteReserveUi = Number(quoteAmount.toString()) / 10 ** quoteDecimals;
-    const price = baseReserveUi > 0 ? quoteReserveUi / baseReserveUi : null;
+
+    const baseAtomsDec = new Decimal(baseAtomsStr);
+    const quoteAtomsDec = new Decimal(quoteAtomsStr);
+    const scaleBase = new Decimal(10).pow(baseDecimals);
+    const scaleQuote = new Decimal(10).pow(quoteDecimals);
+
+    const baseReserveDec = baseAtomsDec.div(scaleBase);
+    const quoteReserveDec = quoteAtomsDec.div(scaleQuote);
+
+    const baseReserveUi = parseFloat(baseReserveDec.toString());
+    const quoteReserveUi = parseFloat(quoteReserveDec.toString());
+
+    let price: number | null = null;
+    if (baseReserveDec.gt(0) && quoteReserveDec.gt(0)) {
+      const pxDec = quoteReserveDec.div(baseReserveDec);
+      const pxNum = parseFloat(pxDec.toString());
+      if (Number.isFinite(pxNum) && pxNum > 0) {
+        price = pxNum;
+      }
+    }
+
+    if (price == null && Number.isFinite(baseReserveUi) && Number.isFinite(quoteReserveUi)) {
+      logger.log("raydium_cpmm_price_invalid", {
+        pool: pool.poolId,
+        base_reserve_ui: baseReserveUi,
+        quote_reserve_ui: quoteReserveUi,
+        base_decimals: baseDecimals,
+        quote_decimals: quoteDecimals,
+      });
+    }
 
     return {
       poolId: pool.poolId,
@@ -1841,11 +2145,42 @@ export class MarketStateProvider {
     return Math.round(num);
   }
 
+  private getTrackedPoolMeta(poolId: string): TrackedPoolMeta | undefined {
+    return this.trackedPools.find((p) => p.poolId === poolId);
+  }
+
   private findBaseMint(_pool: string): PublicKey | null {
+    const tracked = this.getTrackedPoolMeta(_pool);
+    if (tracked?.baseMint) {
+      try {
+        return new PublicKey(tracked.baseMint);
+      } catch {
+        /* fallback to registry scan */
+      }
+    }
     for (const pair of this.pairs) {
       for (const venue of pair.ammVenues ?? []) {
         if ((venue.poolId ?? "").trim() === _pool) {
           if (pair.baseMint) return new PublicKey(pair.baseMint);
+        }
+      }
+    }
+    return null;
+  }
+
+  private findQuoteMint(_pool: string): PublicKey | null {
+    const tracked = this.getTrackedPoolMeta(_pool);
+    if (tracked?.quoteMint) {
+      try {
+        return new PublicKey(tracked.quoteMint);
+      } catch {
+        /* fallback */
+      }
+    }
+    for (const pair of this.pairs) {
+      for (const venue of pair.ammVenues ?? []) {
+        if ((venue.poolId ?? "").trim() === _pool) {
+          if (pair.quoteMint) return new PublicKey(pair.quoteMint);
         }
       }
     }
@@ -2064,6 +2399,98 @@ export class MarketStateProvider {
     return { total, stale, healthy, missing };
   }
 
+  private summarizeHeartbeatFromSnapshots(now: number): {
+    byVenue: Record<string, {
+      pools: number;
+      withHeartbeat: number;
+      missingHeartbeat: number;
+      heartbeat_age_ms_max: number | null;
+      heartbeat_age_ms_avg: number | null;
+      ws_age_ms_max: number | null;
+      ws_age_ms_avg: number | null;
+    }>;
+    pools: Array<{ venue: string; poolId: string; heartbeatAt: number | null; wsAt: number | null }>;
+  } {
+    const buckets = new Map<string, {
+      pools: number;
+      withHeartbeat: number;
+      missingHeartbeat: number;
+      heartbeatAges: number[];
+      wsAges: number[];
+    }>();
+
+    const pools: Array<{ venue: string; poolId: string; heartbeatAt: number | null; wsAt: number | null }> = [];
+
+    for (const snap of this.amms.values()) {
+      const venue = String(snap.venue ?? "unknown");
+      let bucket = buckets.get(venue);
+      if (!bucket) {
+        bucket = { pools: 0, withHeartbeat: 0, missingHeartbeat: 0, heartbeatAges: [], wsAges: [] };
+        buckets.set(venue, bucket);
+      }
+
+      bucket.pools += 1;
+
+      const heartbeatAt = typeof snap.heartbeatAt === "number" && Number.isFinite(snap.heartbeatAt)
+        ? snap.heartbeatAt
+        : null;
+      const wsAt = typeof snap.wsAt === "number" && Number.isFinite(snap.wsAt)
+        ? snap.wsAt
+        : null;
+
+      if (heartbeatAt != null) {
+        bucket.withHeartbeat += 1;
+        bucket.heartbeatAges.push(Math.max(0, now - heartbeatAt));
+      } else {
+        bucket.missingHeartbeat += 1;
+      }
+
+      if (wsAt != null) {
+        bucket.wsAges.push(Math.max(0, now - wsAt));
+      }
+
+      pools.push({
+        venue,
+        poolId: snap.poolId,
+        heartbeatAt,
+        wsAt,
+      });
+    }
+
+    const byVenue: Record<string, {
+      pools: number;
+      withHeartbeat: number;
+      missingHeartbeat: number;
+      heartbeat_age_ms_max: number | null;
+      heartbeat_age_ms_avg: number | null;
+      ws_age_ms_max: number | null;
+      ws_age_ms_avg: number | null;
+    }> = {};
+
+    for (const [venue, bucket] of buckets.entries()) {
+      const hbMax = bucket.heartbeatAges.length ? Math.max(...bucket.heartbeatAges) : null;
+      const hbAvg = bucket.heartbeatAges.length
+        ? Math.round(bucket.heartbeatAges.reduce((acc, val) => acc + val, 0) / bucket.heartbeatAges.length)
+        : null;
+      const wsMax = bucket.wsAges.length ? Math.max(...bucket.wsAges) : null;
+      const wsAvg = bucket.wsAges.length
+        ? Math.round(bucket.wsAges.reduce((acc, val) => acc + val, 0) / bucket.wsAges.length)
+        : null;
+
+      byVenue[venue] = {
+        pools: bucket.pools,
+        withHeartbeat: bucket.withHeartbeat,
+        missingHeartbeat: bucket.missingHeartbeat,
+        heartbeat_age_ms_max: hbMax,
+        heartbeat_age_ms_avg: hbAvg,
+        ws_age_ms_max: wsMax,
+        ws_age_ms_avg: wsAvg,
+      };
+    }
+
+    return { byVenue, pools };
+  }
+
   private maybeLogRefreshSummary(reason: string, slot: number | null, extra: Record<string, unknown> = {}): void {
     const now = Date.now();
     const forceLog = ((extra as any)?.force === true);
@@ -2129,7 +2556,10 @@ export class MarketStateProvider {
     const staleAmms = ammHealth.stale;
     const degradedAmms = ammHealth.degraded;
     const stalePhoenix = phoenixHealth.stale;
-    const heartbeatSummary = summarizeHeartbeatByVenue(now);
+    let heartbeatSummary = summarizeHeartbeatByVenue(now);
+    if (Object.keys(heartbeatSummary.byVenue).length === 0 && this.amms.size > 0) {
+      heartbeatSummary = this.summarizeHeartbeatFromSnapshots(now);
+    }
 
     // Subscription counts
     const activeSubs = this.accountSubs.size;
@@ -2185,6 +2615,11 @@ export class MarketStateProvider {
         pools_tracked: heartbeatSummary.pools.length,
       }
     };
+
+    recordVenueFreshness({
+      timestamp: now,
+      byVenue: heartbeatSummary.byVenue,
+    });
 
     logger.log("market_provider_telemetry", telemetryData);
   }

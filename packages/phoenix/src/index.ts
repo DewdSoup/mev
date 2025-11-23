@@ -201,6 +201,79 @@ const TRY_WS = boolOr(process.env.PHOENIX_WS_ENABLED, true);
 
 // ── config file (optional) ────────────────────────────────────────────────────
 type MarketCfg = { symbol: string; phoenix?: { market: string } };
+
+const NON_EMPTY_STR = (value: unknown): string | null => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length ? trimmed : null;
+};
+
+function formatMarketErrors(source: string, errors: string[]): never {
+  const header = `[markets.json] invalid configuration (${source})`;
+  const body = errors.map((e) => ` - ${e}`).join("\n");
+  throw new Error(`${header}\n${body}`);
+}
+
+export function parseMarketsConfig(raw: unknown, source = "configs/markets.json"): MarketCfg[] {
+  const arr = Array.isArray(raw) ? raw : null;
+  if (!arr) {
+    throw new Error(`[markets.json] ${source} must be an array`);
+  }
+
+  const errors: string[] = [];
+  const out: MarketCfg[] = [];
+
+  arr.forEach((entry, index) => {
+    const ctx = `${source}[${index}]`;
+    if (!entry || typeof entry !== "object") {
+      errors.push(`${ctx} must be an object`);
+      return;
+    }
+
+    const enabledRaw = (entry as any).enabled;
+    const enabled = enabledRaw === undefined ? true : Boolean(enabledRaw);
+
+    const symbol = NON_EMPTY_STR((entry as any).symbol);
+    if (!symbol) errors.push(`${ctx}.symbol must be a non-empty string`);
+
+    const name = NON_EMPTY_STR((entry as any).name);
+    if (enabled && !name) {
+      errors.push(`${ctx}.name must be provided when enabled`);
+    }
+
+    const phoenixMarket =
+      NON_EMPTY_STR((entry as any)?.phoenix?.market) ??
+      NON_EMPTY_STR((entry as any).phoenixMarket);
+
+    if (enabled && !phoenixMarket) {
+      errors.push(`${ctx}.phoenix.market must be provided when enabled`);
+    }
+
+    const raydiumAmmId = NON_EMPTY_STR((entry as any)?.raydium?.ammId ?? (entry as any)?.raydium?.amm_id);
+    if (enabled && !raydiumAmmId) {
+      errors.push(`${ctx}.raydium.ammId must be provided when enabled`);
+    }
+
+    if (!enabled && !phoenixMarket && !raydiumAmmId) {
+      // relaxed validation for disabled rows with placeholders
+      out.push({ ...(entry as any) });
+      return;
+    }
+
+    if (symbol && phoenixMarket) {
+      out.push({
+        ...(entry as any),
+        symbol,
+        phoenix: { market: phoenixMarket },
+        name: name ?? (entry as any).name,
+      });
+    }
+  });
+
+  if (errors.length) formatMarketErrors(source, errors);
+  return out;
+}
+
 function loadMarketsConfig(): MarketCfg[] | null {
   const cands = [
     path.resolve(process.cwd(), "configs/markets.json"),
@@ -209,8 +282,9 @@ function loadMarketsConfig(): MarketCfg[] | null {
   for (const p of cands) {
     try {
       if (fs.existsSync(p)) {
-        const arr = JSON.parse(fs.readFileSync(p, "utf8")) as MarketCfg[];
-        if (Array.isArray(arr) && arr.length) return arr;
+        const arr = JSON.parse(fs.readFileSync(p, "utf8"));
+        const parsed = parseMarketsConfig(arr, p);
+        if (parsed.length) return parsed;
       }
     } catch {
       /* ignore */

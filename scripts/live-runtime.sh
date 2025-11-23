@@ -6,6 +6,7 @@ stamp() { date -u +"%Y-%m-%dT%H%M%S%3NZ"; }
 LIVE_MODE=${LIVE_MODE:-default}
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 RUNS_ROOT=${RUNS_ROOT:-$REPO_ROOT/data/runs}
+RUNS_ROOT=$(python -c 'import os,sys;print(os.path.abspath(sys.argv[1] if len(sys.argv)>1 else "."))' "$RUNS_ROOT")
 mkdir -p "$RUNS_ROOT"
 
 DEFAULT_RUN=0
@@ -17,9 +18,23 @@ else
   DEFAULT_RUN=1
   RUN_ID=${RUN_ID:-$(stamp)}
   RUNTIME_ROOT="$RUNS_ROOT/$RUN_ID"
-  RUN_ROOT="$RUNTIME_ROOT"
-  SINGLE_RUNTIME_DIR="$RUNTIME_ROOT"
 fi
+
+# Normalize to absolute paths so downstream processes never write to '/...'
+RUNTIME_ROOT=$(python -c 'import os,sys;print(os.path.abspath(sys.argv[1] if len(sys.argv)>1 else "."))' "$RUNTIME_ROOT")
+RUN_ROOT="$RUNTIME_ROOT"
+SINGLE_RUNTIME_DIR="$RUNTIME_ROOT"
+export RUN_ROOT
+export SINGLE_RUNTIME_DIR
+export RUNTIME_ROOT
+
+if [ -z "${TELEMETRY_DIR:-}" ]; then
+  TELEMETRY_DIR="$RUNTIME_ROOT/telemetry"
+fi
+export TELEMETRY_DIR
+
+PATH_PAIRS_LOG=${PATH_PAIRS_LOG:-$RUNTIME_ROOT/path-pairs.log}
+export PATH_PAIRS_LOG
 
 RUN_ID=${RUN_ID:-$(basename "$RUNTIME_ROOT")}
 mkdir -p "$RUNTIME_ROOT"

@@ -14,7 +14,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { PublicKey, Keypair } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
-import { logger } from "@mev/storage";
+import { logger } from "./ml_logger.js";
 
 import {
   EdgeJoiner,
@@ -36,6 +36,7 @@ import {
   emitLanded,
   emitRpcSample,
 } from "./ml_schema.js";
+import type { ExecutionLeg } from "./types/execution.js";
 
 import {
   pnlQuoteForSizeBase,
@@ -460,6 +461,18 @@ async function main() {
     if (fs.existsSync(defaultPairs)) process.env.PAIRS_JSON = defaultPairs;
   }
 
+  const PAIRS = loadPairsFromEnvOrDefault();
+  if (PAIRS.length) {
+    logger.log("arb_pairs_loaded", {
+      count: PAIRS.length,
+      pairs: PAIRS.map((p) => ({
+        id: p.id,
+        symbol: p.symbol,
+        venues: (p.ammVenues ?? []).map((v) => `${v.venue}:${v.poolId}`),
+      })),
+    });
+  }
+
   logger.log("arb_limiter_config", {
     limiter_enabled: String(process.env.RPC_FACADE_LIMITER ?? "1"),
     rps: Number(process.env.RPC_FACADE_RPS ?? "NaN"),
@@ -478,6 +491,8 @@ async function main() {
 
   const LIVE = boolFromEnv(process.env.LIVE_TRADING, true);
   const SHADOW = !LIVE && boolFromEnv(process.env.SHADOW_TRADING, true);
+  const EXEC_MODE = String(process.env.EXEC_MODE ?? (LIVE ? "LIVE" : "SIM_ONLY")).trim().toUpperCase();
+  const SIM_ONLY = EXEC_MODE === "SIM_ONLY";
 
   // Explicit boot banner (live-only)
   console.log(
@@ -485,6 +500,7 @@ async function main() {
       `BOOT rpc=${maskUrl(RPC)}`,
       `LIVE_TRADING=${LIVE ? 1 : 0}`,
       `SHADOW_TRADING=${SHADOW ? 1 : 0}`,
+      `EXEC_MODE=${EXEC_MODE}`,
       `EXEC_ALLOWED_PATH=${process.env.EXEC_ALLOWED_PATH ?? "both"}`,
       `USE_RPC_SIM=${process.env.USE_RPC_SIM ?? "(unset)"}`,
       `USE_RAYDIUM_SWAP_SIM=${process.env.USE_RAYDIUM_SWAP_SIM ?? "(unset)"}`,
@@ -496,6 +512,7 @@ async function main() {
     rpc: maskUrl(RPC),
     atomic_mode: process.env.ATOMIC_MODE ?? "none",
     live_forced: LIVE,
+    exec_mode: EXEC_MODE,
     env_live_locked: true,
   });
 
@@ -522,7 +539,7 @@ async function main() {
   let marketProvider: MarketStateProvider | null = null;
   if (ENABLE_MARKET_PROVIDER) {
     try {
-      marketProvider = new MarketStateProvider(conn, loadPairsFromEnvOrDefault());
+      marketProvider = new MarketStateProvider(conn, PAIRS);
       await marketProvider.start();
       logger.log("market_provider_started", {
         pools: marketProvider.getTrackedPools().length,
@@ -541,14 +558,30 @@ async function main() {
     const trimmed = value.trim();
     if (trimmed) warmupKeys.add(trimmed);
   };
-  tryPush(process.env.PHOENIX_MARKET);
-  tryPush(process.env.PHOENIX_MARKET_ID);
-  if (String(process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0") {
-    tryPush(process.env.RAYDIUM_POOL_ID);
-    tryPush(process.env.RAYDIUM_POOL_ID_SOL_USDC);
+  if (PAIRS.length) {
+    const enableRaydiumClmm = String(process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0";
+    for (const pair of PAIRS) {
+      tryPush(pair.phoenixMarket);
+      tryPush(pair.ammPool);
+      for (const venue of pair.ammVenues ?? []) {
+        if (!venue || venue.enabled === false) continue;
+        const venueName = String(venue.venue ?? "").toLowerCase();
+        if (!enableRaydiumClmm && venueName === "raydium" && String(venue.poolKind ?? "").toLowerCase() === "clmm") {
+          continue;
+        }
+        tryPush(venue.poolId);
+      }
+    }
+  } else {
+    tryPush(process.env.PHOENIX_MARKET);
+    tryPush(process.env.PHOENIX_MARKET_ID);
+    if (String(process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0") {
+      tryPush(process.env.RAYDIUM_POOL_ID);
+      tryPush(process.env.RAYDIUM_POOL_ID_SOL_USDC);
+    }
+    tryPush(process.env.ORCA_POOL_ID);
+    tryPush(process.env.RAYDIUM_CLMM_POOL_ID);
   }
-  tryPush(process.env.ORCA_POOL_ID);
-  tryPush(process.env.RAYDIUM_CLMM_POOL_ID);
 
   const warmupPubkeys: PublicKey[] = [];
   for (const key of warmupKeys) {
@@ -694,6 +727,8 @@ async function main() {
   // Keep undefined here to avoid mismatched signatures.
   const rpcSimFn: RpcSimFn | undefined = undefined;
 
+  let attemptCounter = 0;
+  const nextAttemptId = () => `att_${Date.now().toString(36)}_${(attemptCounter++).toString(36)}`;
   const mkShadowSig = () =>
     `shadow_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e9).toString(36)}`;
 
@@ -734,9 +769,48 @@ async function main() {
     }
     if (!d) { recordDecision(false, edgeNetBps, expPnl); return; }
 
+    const execSize =
+      (d.recommended_size_base && d.recommended_size_base > 0
+        ? d.recommended_size_base
+        : (Number(process.env.LIVE_SIZE_BASE ?? 0) || CFG.TRADE_SIZE_BASE));
+    const notional = coalesceRound(6, execSize * ((d.buy_px + d.sell_px) / 2));
+    const legs = Array.isArray((d as any).legs) ? (d.legs as ExecutionLeg[]) : [];
+    const phoenixLeg = legs.find((leg) => leg.kind === "phoenix") as any;
+    const firstAmmLeg = legs.find((leg) => leg.kind === "amm") as any;
+    const forcing = String(process.env.EXEC_AMM_VENUE ?? "").trim().toLowerCase();
+    const venueFromJoiner = (d.amm_venue ?? firstAmmLeg?.venue ?? "").toLowerCase();
+    const ammVenue = (forcing === "raydium" || forcing === "orca")
+      ? forcing
+      : (venueFromJoiner === "raydium" || venueFromJoiner === "orca" ? venueFromJoiner : "raydium");
+    const rayPoolEnv = (process.env.RAYDIUM_POOL_ID ?? process.env.RAYDIUM_POOL_ID_SOL_USDC ?? "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2").trim();
+    const orcaPoolEnv = (process.env.ORCA_POOL_ID ?? "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ").trim();
+    const poolIdHint = d.amm_pool_id ?? firstAmmLeg?.poolId;
+    const poolIdForVenue = ammVenue === "raydium" ? (poolIdHint ?? rayPoolEnv) : (poolIdHint ?? orcaPoolEnv);
+    const legsCount = legs.length;
+    const attemptId = nextAttemptId();
+    const threshold = Number(CFG.TRADE_THRESHOLD_BPS ?? 0);
+
     if (ALLOWED !== "both" && d.path && d.path !== ALLOWED) {
       logger.log("skip_due_to_path", { have: d.path, allowed: ALLOWED });
       recordDecision(false, edgeNetBps, expPnl);
+      try {
+        logger.log("opportunity_blocked", {
+          attempt_id: attemptId,
+          exec_mode: EXEC_MODE,
+          path: d.path,
+          size_base: roundN(execSize, 6),
+          expected_pnl_quote: Number(roundN(expPnl, 6)),
+          edge_net_bps: Number(roundN(edgeNetBps, 4)),
+          edge_gross_bps: (d as any)?.edge_bps_gross != null ? Number(roundN((d as any).edge_bps_gross, 4)) : undefined,
+          thresholds: {
+            trade_threshold_bps: threshold,
+            min_net_profit_bps: Number(process.env.MIN_NET_PROFIT_BPS ?? (CFG as any)?.MIN_NET_PROFIT_BPS ?? "") || undefined,
+            min_profitable_bps: Number(process.env.MIN_PROFITABLE_BPS ?? (CFG as any)?.MIN_PROFITABLE_BPS ?? "") || undefined,
+            pnl_safety_bps: Number(process.env.PNL_SAFETY_BPS ?? 0),
+          },
+          reason: "path_filtered",
+        });
+      } catch { }
       return;
     }
 
@@ -772,7 +846,6 @@ async function main() {
       emitMlLocal({ ts: Date.now(), ev: "decision", d });
     }
 
-    const threshold = Number(CFG.TRADE_THRESHOLD_BPS ?? 0);
     const execMinAbs = envNum("TEST_FORCE_SEND_IF_ABS_EDGE_BPS");
     const forceByAbs = execMinAbs != null && Math.abs(edgeNetBps) >= execMinAbs;
     const doExecute = (Boolean(_wouldTrade) && expPnl > 0 && edgeNetBps >= threshold) || forceByAbs;
@@ -780,27 +853,42 @@ async function main() {
     if (forceByAbs) console.log(`FORCE_EXEC absEdge=${edgeNetBps}bps >= ${execMinAbs}bps`);
 
     recordDecision(doExecute, edgeNetBps, expPnl);
-    if (!doExecute) return;
-
-    // Prefer recommended_size_base from joiner; fallback to LIVE_SIZE_BASE
-    const execSize =
-      (d.recommended_size_base && d.recommended_size_base > 0
-        ? d.recommended_size_base
-        : (Number(process.env.LIVE_SIZE_BASE ?? 0) || CFG.TRADE_SIZE_BASE));
-
-    const notional = coalesceRound(6, execSize * ((d.buy_px + d.sell_px) / 2));
-
-    // 👇 Honor joiner’s venue/pool & optional EXEC_AMM_VENUE override
-    const forcing = String(process.env.EXEC_AMM_VENUE ?? "").trim().toLowerCase();
-    const venueFromJoiner = (d.amm_venue ?? "").toLowerCase();
-    const ammVenue = (forcing === "raydium" || forcing === "orca")
-      ? forcing
-      : (venueFromJoiner === "raydium" || venueFromJoiner === "orca" ? venueFromJoiner : "raydium");
-
-    // Pick poolId by venue: use from joiner when available (esp. for Orca), else env
-    const rayPoolEnv = (process.env.RAYDIUM_POOL_ID ?? process.env.RAYDIUM_POOL_ID_SOL_USDC ?? "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2").trim();
-    const orcaPoolEnv = (process.env.ORCA_POOL_ID ?? "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ").trim();
-    const poolIdForVenue = ammVenue === "raydium" ? rayPoolEnv : (d.amm_pool_id ?? orcaPoolEnv);
+    try {
+      logger.log("opportunity_debug_marker", {
+        attempt_id: attemptId,
+        exec_mode: EXEC_MODE,
+        path: d.path,
+        do_execute: doExecute,
+        edge_net_bps: Number(roundN(edgeNetBps, 4)),
+        expected_pnl_quote: Number(roundN(expPnl, 6)),
+        decision_reason: (d as any)?.decision_reason ?? (expPnl <= 0 ? "negative_expected_pnl" : undefined),
+      });
+    } catch { /* marker is best-effort */ }
+    if (!doExecute) {
+      const minNetProfitBps = Number(process.env.MIN_NET_PROFIT_BPS ?? (CFG as any)?.MIN_NET_PROFIT_BPS ?? NaN);
+      const minProfitableBps = Number(process.env.MIN_PROFITABLE_BPS ?? (CFG as any)?.MIN_PROFITABLE_BPS ?? NaN);
+      const pnlSafetyBps = Number(process.env.PNL_SAFETY_BPS ?? 0);
+      const reason = (d as any)?.decision_reason ?? (expPnl <= 0 ? "negative_expected_pnl" : "edge_below_threshold");
+      try {
+        logger.log("opportunity_blocked", {
+          attempt_id: attemptId,
+          exec_mode: EXEC_MODE,
+          path: d.path,
+          size_base: roundN(execSize, 6),
+          expected_pnl_quote: Number(roundN(expPnl, 6)),
+          edge_net_bps: Number(roundN(edgeNetBps, 4)),
+          edge_gross_bps: (d as any)?.edge_bps_gross != null ? Number(roundN((d as any).edge_bps_gross, 4)) : undefined,
+          thresholds: {
+            trade_threshold_bps: threshold,
+            min_net_profit_bps: Number.isFinite(minNetProfitBps) ? minNetProfitBps : undefined,
+            min_profitable_bps: Number.isFinite(minProfitableBps) ? minProfitableBps : undefined,
+            pnl_safety_bps: pnlSafetyBps,
+          },
+          reason,
+        });
+      } catch { }
+      return;
+    }
 
     const payload: any = {
       path: d.path,
@@ -808,17 +896,27 @@ async function main() {
       buy_px: d.buy_px,
       sell_px: d.sell_px,
       notional_quote: notional,
-      phoenix: {
-        market: (CFG.PHOENIX_MARKET || process.env.PHOENIX_MARKET_ID || "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg").trim(),
-        side: d.side as "buy" | "sell",
-        limit_px: d.side === "buy" ? d.buy_px : d.sell_px,
-      },
       amm_venue: ammVenue,               // 👈 carry venue choice
       amm_pool_id: poolIdForVenue,       // 👈 explicit pool id (executor checks this first)
       amm: { pool: poolIdForVenue },     // 👈 backward-compat payload
       amm_meta: (d as any).amm_meta,     // 👈 pass-through meta if joiner provided it
+      legs,
       atomic: true,
     };
+
+    if (phoenixLeg) {
+      payload.phoenix = {
+        market: String(phoenixLeg.market ?? (CFG.PHOENIX_MARKET || process.env.PHOENIX_MARKET_ID || "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg")).trim(),
+        side: (phoenixLeg.side ?? d.side) as "buy" | "sell",
+        limit_px: (phoenixLeg.side ?? d.side) === "buy" ? d.buy_px : d.sell_px,
+      };
+    } else if (d.side) {
+      payload.phoenix = {
+        market: (CFG.PHOENIX_MARKET || process.env.PHOENIX_MARKET_ID || "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg").trim(),
+        side: d.side as "buy" | "sell",
+        limit_px: d.side === "buy" ? d.buy_px : d.sell_px,
+      };
+    }
 
     if (d.path === "AMM->AMM") {
       const joinerDstVenue = String(d.amm_dst_venue ?? "").toLowerCase();
@@ -832,6 +930,26 @@ async function main() {
       payload.amm_dst = { pool: dstPoolId };
       if ((d as any)?.amm_dst_meta) payload.amm_dst_meta = (d as any).amm_dst_meta;
     }
+
+    const attemptMeta = {
+      attempt_id: attemptId,
+      exec_mode: EXEC_MODE,
+      path: payload.path,
+      size_base: roundN(execSize, 6),
+      expected_pnl_quote: Number(roundN(expPnl, 6)),
+      edge_bps: Number(roundN(edgeNetBps, 4)),
+      amm_venue: ammVenue,
+      amm_pool_id: poolIdForVenue,
+      notional_quote: notional,
+      legs: legsCount,
+    };
+    try {
+      logger.log("opportunity_attempt", attemptMeta);
+    } catch { /* logging best-effort */ }
+    payload.attempt_id = attemptId;
+    payload.expected_pnl_quote = expPnl;
+    payload.edge_bps = edgeNetBps;
+    payload.exec_mode = EXEC_MODE;
 
     console.log(
       `EXEC (EV>0) ${payload.path} base=${roundN(payload.size_base, 6)} ` +
@@ -913,6 +1031,7 @@ async function main() {
       wsUrl: process.env.RPC_WSS_URL || process.env.WSS_URL || process.env.WS_URL,
       pairsPath: process.env.PAIRS_JSON,
       joiner,
+      provider: marketProvider ?? undefined,
     });
   }
 
@@ -924,6 +1043,15 @@ async function main() {
       try {
         if (providerIncludeAmms) {
           for (const s of state.amms) {
+            const price = typeof s.price === "number" && Number.isFinite(s.price) && s.price > 0 ? s.price : undefined;
+            const validationPassed = price != null;
+            if (!validationPassed && typeof s.price === "number" && Number.isNaN(s.price)) {
+              logger.log("amm_price_invalid_nan", {
+                venue: s.venue,
+                pool: s.poolId,
+                pool_kind: s.poolKind,
+              });
+            }
             const obj = {
               event: "amms_price",
               symbol: "SOL/USDC",
@@ -933,7 +1061,7 @@ async function main() {
               ts: s.lastUpdateTs,
               baseDecimals: s.baseDecimals,
               quoteDecimals: s.quoteDecimals,
-              px: s.price ?? undefined,
+              px: price,
               feeBps: s.feeBps ?? undefined,
               base_vault: s.baseVault ?? undefined,
               quote_vault: s.quoteVault ?? undefined,
@@ -956,7 +1084,7 @@ async function main() {
               synthetic_slot: typeof s.syntheticSlot === "boolean" ? s.syntheticSlot : undefined,
               tradeable_when_degraded: typeof s.tradeableWhenDegraded === "boolean" ? s.tradeableWhenDegraded : undefined,
               source: s.source ?? "provider",
-              validation_passed: s.price != null,
+              validation_passed: validationPassed,
             };
             joiner.upsertAmms(obj);
 

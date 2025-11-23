@@ -40,6 +40,7 @@ const orcaInflight = new Map<string, Promise<number>>();
 
 const phxCache = new Map<string, FeeEntry>();
 const phxInflight = new Map<string, Promise<number>>();
+const lifinityCache = new Map<string, FeeEntry>();
 
 export function cacheRaydiumFee(id: string | PublicKey, feeBps: number): void {
   remember(rayCache, id, feeBps);
@@ -51,6 +52,10 @@ export function cacheOrcaFee(id: string | PublicKey, feeBps: number): void {
 
 export function cachePhoenixFee(id: string | PublicKey, feeBps: number): void {
   remember(phxCache, id, feeBps);
+}
+
+export function cacheLifinityFee(id: string | PublicKey, feeBps: number): void {
+  remember(lifinityCache, id, feeBps);
 }
 
 export function getCachedRaydiumFee(id: string | PublicKey): number | null {
@@ -65,6 +70,11 @@ export function getCachedOrcaFee(id: string | PublicKey): number | null {
 
 export function getCachedPhoenixFee(id: string | PublicKey): number | null {
   const cached = phxCache.get(keyOf(id));
+  return isFresh(cached) ? cached.bps : null;
+}
+
+export function getCachedLifinityFee(id: string | PublicKey): number | null {
+  const cached = lifinityCache.get(keyOf(id));
   return isFresh(cached) ? cached.bps : null;
 }
 

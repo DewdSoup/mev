@@ -44,6 +44,7 @@
     "//live": "──────────── One-button sessions (manual stop with Ctrl+C) ────────────",
     "prelive": ":",
     "live": "pnpm exec dotenv -e .env.live -- scripts/live-runtime.sh",
+    "staging": "pnpm exec dotenv -e configs/staging.env -- scripts/live-runtime.sh",
     "prelive:jito": ":",
     "live:jito": "pnpm exec dotenv -e .env.live -- env LIVE_MODE=jito scripts/live-runtime.sh",
     "//prod": "──────────── Prod-style runners ────────────",

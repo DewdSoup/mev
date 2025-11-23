@@ -21,6 +21,7 @@
     "dump:raydium": "tsx scripts/dump_raydium_pool_keys.ts",
     "phoenix:diag": "tsx src/diag.ts",
     "ml:tap": "tsx scripts/ml_tap.ts",
+    "staging": "dotenv -e ../../configs/staging.env -- ../../scripts/live-runtime.sh",
     "start": "node --enable-source-maps dist/src/bootstrap.js",
     "start:prod": "node --enable-source-maps dist/src/bootstrap.js",
     "//_logs": "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 Log path unification (no code changes) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
@@ -31,7 +32,11 @@
     "prestart": ":",
     "prestart:prod": ":",
     "live:multi": "tsx src/multipair.ts",
-    "meteora:baseline": "tsx scripts/meteora_baseline.ts"
+    "meteora:baseline": "tsx scripts/meteora_baseline.ts",
+    "test": "vitest run",
+    "staging:test": "pnpm run test",
+    "staging:replay": "tsx scripts/replay_run.ts",
+    "staging:check": "pnpm run typecheck && pnpm vitest run test/routes.spec.ts && pnpm run staging:replay"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.29.0",
@@ -54,6 +59,7 @@
   },
   "devDependencies": {
     "tsx": "^4.20.5",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^1.6.0"
   }
 }

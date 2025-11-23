@@ -30,7 +30,14 @@ import Decimal from "decimal.js";
 
 import { logger } from "../ml_logger.js";
 import type { EdgeJoiner } from "../edge/joiner.js";
-import { cacheRaydiumFee, cacheOrcaFee } from "../util/fee_cache.js";
+import type { MarketStateProvider } from "../market/provider.js";
+import { cacheRaydiumFee, cacheOrcaFee, cacheLifinityFee } from "../util/fee_cache.js";
+import {
+    loadLifinityPoolMeta,
+    refreshLifinitySnapshot,
+    toUi as lifinityAtomsToUi,
+    lifinityQuoteFromSnapshot,
+} from "../util/lifinity.js";
 import { recordHeartbeatMetric } from "../runtime/metrics.js";
 
 type VenueCfg = {
@@ -40,6 +47,8 @@ type VenueCfg = {
     poolKind?: string;
     enabled?: boolean;
     feeBps?: number;
+    baseDecimals?: number;
+    quoteDecimals?: number;
     freshness?: {
         slotLagSlots?: number;
         maxAgeMs?: number;
@@ -71,8 +80,16 @@ const METEORA_HEARTBEAT_LOG_MS = Math.max(5_000, Number(process.env.METEORA_HEAR
 const RAYDIUM_HEARTBEAT_MS = Math.max(1_000, Number(process.env.RAYDIUM_HEARTBEAT_MS ?? 2_000));
 const RAYDIUM_HEARTBEAT_LOG_MS = Math.max(5_000, Number(process.env.RAYDIUM_HEARTBEAT_LOG_MS ?? 30_000));
 const ORCA_TICKARRAY_HORIZON = Math.max(1, Math.min(6, Number(process.env.ORCA_TICKARRAY_HORIZON ?? 2)));
+const LIFINITY_HEARTBEAT_MS = Math.max(1_000, Number(process.env.LIFINITY_HEARTBEAT_MS ?? 3_000));
+const LIFINITY_HEARTBEAT_LOG_MS = Math.max(5_000, Number(process.env.LIFINITY_HEARTBEAT_LOG_MS ?? 20_000));
 
 function getenv(k: string) { const v = process.env[k]; return typeof v === "string" && v.trim() ? v.trim() : undefined; }
+function httpToWs(url?: string): string | undefined {
+    if (!url) return undefined;
+    if (url.startsWith("http://")) return "ws://" + url.slice("http://".length);
+    if (url.startsWith("https://")) return "wss://" + url.slice("https://".length);
+    return url;
+}
 function envTrue(k: string, d = false) {
     const v = String(process.env[k] ?? "").trim().toLowerCase();
     if (!v) return d;
@@ -149,6 +166,8 @@ type NormalizedPoolSpec = {
     quoteMint: PublicKey;
     symbol: string;
     freshness?: VenueCfg["freshness"];
+    baseDecimalsHint?: number;
+    quoteDecimalsHint?: number;
 };
 
 type MeteoraPoolState = {
@@ -206,6 +225,24 @@ type RaydiumPoolState = {
     heartbeatGraceMs?: number;
 };
 
+type LifinityPoolState = {
+    poolId: PublicKey;
+    poolIdStr: string;
+    meta: Awaited<ReturnType<typeof loadLifinityPoolMeta>>;
+    baseReserve: bigint;
+    quoteReserve: bigint;
+    lastPushMs: number;
+    lastSlotHint?: number;
+    lastWsSlot?: number;
+    lastWsMs?: number;
+    lastHeartbeatMs?: number;
+    lastHeartbeatLogMs?: number;
+    tradeableWhenDegradedPreferred?: boolean;
+    heartbeatGraceMs?: number;
+    baseDecimalsHint?: number;
+    quoteDecimalsHint?: number;
+};
+
 function collectPoolSpecs(conf: PairsFile): NormalizedPoolSpec[] {
     const out: NormalizedPoolSpec[] = [];
     const seen = new Set<string>();
@@ -251,6 +288,13 @@ function collectPoolSpecs(conf: PairsFile): NormalizedPoolSpec[] {
             }
 
             const feeBps = typeof venue.feeBps === "number" ? venue.feeBps : undefined;
+            const baseDecimalsHint = Number.isFinite(Number((venue as any)?.baseDecimals))
+                ? Number((venue as any).baseDecimals)
+                : undefined;
+            const quoteDecimalsHint = Number.isFinite(Number((venue as any)?.quoteDecimals))
+                ? Number((venue as any).quoteDecimals)
+                : undefined;
+
             out.push({
                 poolId: poolPk,
                 poolIdStr,
@@ -261,6 +305,8 @@ function collectPoolSpecs(conf: PairsFile): NormalizedPoolSpec[] {
                 quoteMint: quoteMintPk,
                 symbol: pair.symbol ?? `${baseMintStr}/${quoteMintStr}`,
                 freshness: venue.freshness,
+                baseDecimalsHint,
+                quoteDecimalsHint,
             });
             seen.add(key);
         }
@@ -402,9 +448,17 @@ export async function startWsMarkets(args: {
     wsUrl?: string;
     pairsPath?: string;
     joiner: EdgeJoiner;
+    provider?: MarketStateProvider | null;
 }): Promise<{ close: () => Promise<void> }> {
     const httpUrl = args.httpUrl || getenv("RPC_URL") || getenv("HELIUS_HTTP")!;
-    const wsUrl = args.wsUrl || getenv("RPC_WSS_URL") || getenv("WSS_URL") || getenv("WS_URL") || (httpUrl?.replace("https://", "wss://"))!;
+    const wsUrl =
+        args.wsUrl ||
+            getenv("RPC_WSS_URL") ||
+            getenv("WS_URL") ||
+            getenv("WSS_URL") ||
+            getenv("RPC_WSS_FALLBACK") ||
+            getenv("WS_FALLBACK") ||
+            httpToWs(httpUrl)!;
     const pairsPath = args.pairsPath || getenv("PAIRS_JSON") || path.resolve(process.cwd(), "configs", "pairs.json");
 
     const http = new Connection(httpUrl, {
@@ -416,6 +470,13 @@ export async function startWsMarkets(args: {
         wsEndpoint: wsUrl,
         disableRetryOnRateLimit: false,
     });
+    const wsEndpointLabel = (() => {
+        const lower = String(wsUrl ?? "").toLowerCase();
+        if (!lower) return "unknown";
+        if (lower.includes("localhost") || lower.includes("127.0.0.1")) return "local";
+        if (lower.includes("helius")) return "helius";
+        return "custom";
+    })();
 
     const conf = JSON.parse(fs.readFileSync(pairsPath, "utf8")) as PairsFile;
     if (!conf?.pairs?.length) {
@@ -430,9 +491,27 @@ export async function startWsMarkets(args: {
     }
 
     // Track subs to rewire on close
-    type Sub = { id: number; label: string; pk: PublicKey };
+    type Sub = { id: number; label: string; pk: PublicKey; venue?: string; marketOrPoolKey?: string };
     const subs: Sub[] = [];
-    const addSub = (id: number, label: string, pk: PublicKey) => subs.push({ id, label, pk });
+    const logWsSubscription = (venue: string, marketOrPoolKey: string, label?: string) => {
+        logger.log("ws_subscription", {
+            type: "ws_subscription",
+            source: "ws_markets",
+            venue,
+            marketOrPoolKey,
+            ws_url: wsUrl,
+            label,
+            event: "subscribe",
+            ts: Date.now(),
+        });
+    };
+    const addSub = (id: number, label: string, pk: PublicKey, meta?: { venue?: string; marketOrPoolKey?: string }) => {
+        const entry: Sub = { id, label, pk, venue: meta?.venue, marketOrPoolKey: meta?.marketOrPoolKey };
+        subs.push(entry);
+        if (meta?.venue || meta?.marketOrPoolKey) {
+            logWsSubscription(meta.venue ?? "unknown", meta.marketOrPoolKey ?? pk.toBase58(), label);
+        }
+    };
     const removeTrackedSub = async (id?: number) => {
         if (id == null) return;
         const idx = subs.findIndex((entry) => entry.id === id);
@@ -457,11 +536,14 @@ export async function startWsMarkets(args: {
     let orcaTimer: NodeJS.Timeout | null = null;
     let meteoraTimer: NodeJS.Timeout | null = null;
     let raydiumTimer: NodeJS.Timeout | null = null;
+    let lifinityTimer: NodeJS.Timeout | null = null;
+    const provider = args.provider ?? null;
 
     // ── Per-pool freshness state (for Orca forced refreshes)
     const orcaState = new Map<string, OrcaPoolState>();
     const meteoraState = new Map<string, MeteoraPoolState>();
     const raydiumState = new Map<string, RaydiumPoolState>();
+    const lifinityState = new Map<string, LifinityPoolState>();
     let meteoraProgram: any | null = null;
 
     const ensureTickArrayLock = new Set<string>();
@@ -481,11 +563,11 @@ export async function startWsMarkets(args: {
         ensureTickArrayLock.add(pendingKey);
         try {
             const { publicKey } = PDAUtil.getTickArray(state.ctx.programId, poolKey, startTick);
-            state.tickArrays.set(startTick, {
-                startTick,
-                pubkey: publicKey,
-                subId: -1,
-                data: existing?.data,
+                state.tickArrays.set(startTick, {
+                    startTick,
+                    pubkey: publicKey,
+                    subId: -1,
+                    data: existing?.data,
                 lastSlot: existing?.lastSlot,
             });
             const subId = await ws.onAccountChange(publicKey, (acc, context) => {
@@ -513,6 +595,7 @@ export async function startWsMarkets(args: {
                 entry.pubkey = publicKey;
             }
             logger.log("orca_tick_array_subscribed", { pool: poolIdStr, start_tick: startTick, pda: publicKey.toBase58() });
+            logWsSubscription("orca", `${poolIdStr}:tick:${startTick}`, "orca_tick_array");
         } catch (e) {
             state.tickArrays.delete(startTick);
             logger.log("orca_tick_array_sub_error", {
@@ -621,6 +704,8 @@ export async function startWsMarkets(args: {
                     heartbeatAt: wsAtValue,
                     source: "ws+poll",
                     synthetic: syntheticSlot,
+                    wsUrl,
+                    endpointLabel: wsEndpointLabel,
                 });
                 state.lastPushMs = now;
                 if (slotUsed != null) {
@@ -714,6 +799,50 @@ export async function startWsMarkets(args: {
     }, raydiumHeartbeatInterval);
     raydiumTimer?.unref?.();
 
+    lifinityTimer = setInterval(() => {
+        const now = Date.now();
+        for (const state of lifinityState.values()) {
+            const waitedMs = now - state.lastPushMs;
+            if (waitedMs < LIFINITY_HEARTBEAT_MS) continue;
+            void (async () => {
+                try {
+                    const snapshot = await refreshLifinitySnapshot({
+                        connection: http,
+                        poolId: state.poolId,
+                        expectedBaseMint: state.meta.baseMint,
+                        expectedQuoteMint: state.meta.quoteMint,
+                        baseDecimalsHint: state.baseDecimalsHint ?? state.meta.baseDecimals,
+                        quoteDecimalsHint: state.quoteDecimalsHint ?? state.meta.quoteDecimals,
+                    });
+                    state.baseReserve = snapshot.baseReserve;
+                    state.quoteReserve = snapshot.quoteReserve;
+                    state.meta = snapshot.meta;
+                    state.baseDecimalsHint = snapshot.meta.baseDecimals;
+                    state.quoteDecimalsHint = snapshot.meta.quoteDecimals;
+                    cacheLifinityFee(state.poolId, state.meta.feeBps);
+                    const pushed = pushLifinitySnapshot(state, "heartbeat", snapshot.slot ?? null);
+                    if (pushed) {
+                        const lastLog = state.lastHeartbeatLogMs ?? 0;
+                        if (now - lastLog >= LIFINITY_HEARTBEAT_LOG_MS) {
+                            state.lastHeartbeatLogMs = now;
+                            logger.log("lifinity_heartbeat_refresh", {
+                                pool: state.poolIdStr,
+                                waited_ms: waitedMs,
+                                slot: snapshot.slot ?? null,
+                            });
+                        }
+                    }
+                } catch (err) {
+                    logger.log("lifinity_heartbeat_error", {
+                        pool: state.poolIdStr,
+                        err: String((err as any)?.message ?? err),
+                    });
+                }
+            })();
+        }
+    }, Math.max(1_000, Math.min(LIFINITY_HEARTBEAT_MS, 2_000)));
+    lifinityTimer?.unref?.();
+
     function computeMeteoraPrice(state: MeteoraPoolState): number | null {
         if (!Number.isFinite(state.activeId) || !Number.isFinite(state.binStep)) return null;
         const ratio = Number(getPriceOfBinByBinId(state.activeId, state.binStep));
@@ -783,6 +912,8 @@ export async function startWsMarkets(args: {
             wsAt: wsAtValue,
             source,
             synthetic: syntheticSlot,
+            wsUrl,
+            endpointLabel: wsEndpointLabel,
         });
 
         state.lastPushMs = now;
@@ -801,6 +932,115 @@ export async function startWsMarkets(args: {
             if (slotUsed != null) state.lastWsSlot = slotUsed;
         }
         return { ok: true, slotUsed, syntheticSlot };
+    }
+
+    function pushLifinitySnapshot(state: LifinityPoolState, source: string, slotOverride?: number | null): boolean {
+        const baseUi = lifinityAtomsToUi(state.baseReserve, state.meta.baseDecimals);
+        const quoteUi = lifinityAtomsToUi(state.quoteReserve, state.meta.quoteDecimals);
+        if (!(baseUi > 0) || !(quoteUi > 0)) return false;
+
+        const rawPx = baseUi > 0 ? quoteUi / baseUi : null;
+
+        const snapshotForQuote = {
+            poolId: state.poolId,
+            ts: Date.now(),
+            slot: slotOverride ?? state.lastSlotHint ?? state.lastWsSlot,
+            baseReserve: state.baseReserve,
+            quoteReserve: state.quoteReserve,
+            meta: state.meta,
+        };
+
+        const probeSizeBase = 1e-4;
+        let probePx: number | null = null;
+        try {
+            const probe = lifinityQuoteFromSnapshot({
+                snapshot: snapshotForQuote as any,
+                sizeBase: probeSizeBase,
+                direction: "baseToQuote",
+            });
+            if (probe.ok && Number.isFinite(probe.price) && probe.price > 0 && probe.price < 10_000) {
+                probePx = probe.price;
+            }
+        } catch {
+            /* fall back to raw ratio */
+        }
+
+        const px = Number.isFinite(probePx) && (probePx as number) > 0 ? (probePx as number) : rawPx;
+        if (!Number.isFinite(px) || !(px as number > 0)) return false;
+
+        const now = Date.now();
+        const slotHint = Math.max(slotOverride ?? 0, state.lastSlotHint ?? 0, lastObservedSlot || 0);
+        const slotUsed = slotHint > 0 ? slotHint : undefined;
+        const slotProvided = typeof slotOverride === "number" && slotOverride > 0;
+        const syntheticSlot = slotUsed != null && !slotProvided;
+
+        args.joiner.upsertAmms({
+            venue: "lifinity",
+            ammId: state.poolIdStr,
+            ts: now,
+            slot: slotUsed,
+            px,
+            feeBps: state.meta.feeBps,
+            poolKind: "cpmm",
+            baseDecimals: state.meta.baseDecimals,
+            quoteDecimals: state.meta.quoteDecimals,
+            base_int: state.baseReserve.toString(),
+            quote_int: state.quoteReserve.toString(),
+            px_raw_ratio: rawPx ?? undefined,
+            source,
+            tradeable_when_degraded: state.tradeableWhenDegradedPreferred ?? false,
+        });
+
+        logger.log("lifinity_price_debug", {
+            venue: "lifinity",
+            pool: state.poolIdStr,
+            px_quoter: probePx ?? null,
+            px_raw_ratio: rawPx,
+            base_ui: baseUi,
+            quote_ui: quoteUi,
+        });
+
+        recordHeartbeatMetric({
+            venue: "lifinity",
+            poolId: state.poolIdStr,
+            heartbeatAt: now,
+            wsAt: now,
+            source,
+            synthetic: syntheticSlot,
+            wsUrl,
+            endpointLabel: wsEndpointLabel,
+        });
+
+        state.lastPushMs = now;
+        state.lastHeartbeatMs = now;
+        if (slotUsed != null) {
+            state.lastSlotHint = slotUsed;
+            state.lastWsSlot = slotUsed;
+        }
+        state.lastWsMs = now;
+        state.lastHeartbeatLogMs = now;
+        cacheLifinityFee(state.poolId, state.meta.feeBps);
+        provider?.ingestExternalAmmSnapshot({
+            venue: "lifinity",
+            poolId: state.poolIdStr,
+            poolKind: "cpmm",
+            price: px,
+            feeBps: state.meta.feeBps,
+            baseDecimals: state.meta.baseDecimals,
+            quoteDecimals: state.meta.quoteDecimals,
+            baseReserveAtoms: state.baseReserve.toString(),
+            quoteReserveAtoms: state.quoteReserve.toString(),
+            baseUi,
+            quoteUi,
+            baseVault: state.meta.baseVault.toBase58(),
+            quoteVault: state.meta.quoteVault.toBase58(),
+            slot: slotUsed ?? null,
+            ts: now,
+            source,
+            tradeableWhenDegraded: state.tradeableWhenDegradedPreferred ?? false,
+            syntheticSlot,
+        });
+        return true;
     }
 
     function pushRaydiumSnapshot(state: RaydiumPoolState, source: string, slotOverride?: number | null, syntheticHint = false): boolean {
@@ -854,6 +1094,8 @@ export async function startWsMarkets(args: {
             wsAt: wsAtValue,
             source,
             synthetic: syntheticSlot,
+            wsUrl,
+            endpointLabel: wsEndpointLabel,
         });
 
         state.lastPushMs = now;
@@ -895,6 +1137,7 @@ export async function startWsMarkets(args: {
             }
         });
         addSub(subId, which === "x" ? "meteora_reserve_x" : "meteora_reserve_y", account);
+        logWsSubscription("meteora", state.poolIdStr, which === "x" ? "meteora_reserve_x" : "meteora_reserve_y");
         if (which === "x") {
             state.reserveXSubId = subId;
             state.reserveXTarget = account.toBase58();
@@ -1061,6 +1304,7 @@ export async function startWsMarkets(args: {
             })();
         });
         addSub(subId, "meteora_pair", spec.poolId);
+        logWsSubscription("meteora", spec.poolIdStr, "meteora_pair");
         state.stateSubId = subId;
 
         logger.log("ws_meteora_dlmm_wired", {
@@ -1072,10 +1316,106 @@ export async function startWsMarkets(args: {
         });
     };
 
+    const loadLifinityState = async (spec: NormalizedPoolSpec): Promise<LifinityPoolState | null> => {
+        try {
+            const meta = await loadLifinityPoolMeta({
+                connection: http,
+                poolId: spec.poolId,
+                expectedBaseMint: spec.baseMint,
+                expectedQuoteMint: spec.quoteMint,
+                baseDecimalsHint: spec.baseDecimalsHint,
+                quoteDecimalsHint: spec.quoteDecimalsHint,
+            });
+
+            const snapshot = await refreshLifinitySnapshot({
+                connection: http,
+                poolId: spec.poolId,
+                expectedBaseMint: spec.baseMint,
+                expectedQuoteMint: spec.quoteMint,
+                baseDecimalsHint: spec.baseDecimalsHint,
+                quoteDecimalsHint: spec.quoteDecimalsHint,
+            });
+
+            logger.log("lifinity_vaults_resolved", {
+                pool: spec.poolIdStr,
+                base_vault: snapshot.meta.baseVault.toBase58(),
+                quote_vault: snapshot.meta.quoteVault.toBase58(),
+                source: snapshot.vaultSource ?? "unknown",
+            });
+
+            const now = Date.now();
+            const state: LifinityPoolState = {
+                poolId: spec.poolId,
+                poolIdStr: spec.poolIdStr,
+                meta,
+                baseReserve: snapshot.baseReserve,
+                quoteReserve: snapshot.quoteReserve,
+                lastPushMs: now,
+                lastSlotHint: snapshot.slot ?? undefined,
+                lastWsSlot: snapshot.slot ?? undefined,
+                lastWsMs: now,
+                lastHeartbeatMs: now,
+                lastHeartbeatLogMs: now,
+                tradeableWhenDegradedPreferred: Boolean(spec.freshness?.tradeableWhenDegraded),
+                heartbeatGraceMs: spec.freshness?.heartbeatGraceMs,
+                baseDecimalsHint: spec.baseDecimalsHint ?? meta.baseDecimals,
+                quoteDecimalsHint: spec.quoteDecimalsHint ?? meta.quoteDecimals,
+            };
+
+            pushLifinitySnapshot(state, "prime", snapshot.slot ?? null);
+            cacheLifinityFee(spec.poolId, meta.feeBps);
+            return state;
+        } catch (err) {
+            logger.log("lifinity_state_load_error", {
+                pool: spec.poolIdStr,
+                err: String((err as any)?.message ?? err),
+            });
+            return null;
+        }
+    };
+
+    const subscribeLifinityVault = async (
+        state: LifinityPoolState,
+        kind: "base" | "quote",
+        vault: PublicKey,
+    ): Promise<void> => {
+        const subId = await ws.onAccountChange(vault, (acc, context) => {
+            try {
+                const amount = decodeSplAmount(acc.data);
+                if (kind === "base") state.baseReserve = amount;
+                else state.quoteReserve = amount;
+                const slot = slotFromContext(context, acc as any);
+                if (slot != null) {
+                    lastObservedSlot = Math.max(lastObservedSlot, slot);
+                    state.lastWsSlot = slot;
+                }
+                state.lastWsMs = Date.now();
+                pushLifinitySnapshot(state, "ws", slot ?? null);
+            } catch (e) {
+                logger.log("lifinity_vault_update_error", {
+                    pool: state.poolIdStr,
+                    role: kind,
+                    err: String((e as any)?.message ?? e),
+                });
+            }
+        });
+        addSub(subId, kind === "base" ? "lifinity_base_vault" : "lifinity_quote_vault", vault);
+        logWsSubscription("lifinity", state.poolIdStr, kind === "base" ? "lifinity_base_vault" : "lifinity_quote_vault");
+    };
+
+    const wireLifinityPool = async (spec: NormalizedPoolSpec): Promise<void> => {
+        const state = await loadLifinityState(spec);
+        if (!state) return;
+        lifinityState.set(spec.poolIdStr, state);
+        await subscribeLifinityVault(state, "base", state.meta.baseVault);
+        await subscribeLifinityVault(state, "quote", state.meta.quoteVault);
+    };
+
     // Main wire function (idempotent)
     const wireAll = async () => {
         meteoraState.clear();
         raydiumState.clear();
+        lifinityState.clear();
 
         const poolSpecs = collectPoolSpecs(conf);
         for (const spec of poolSpecs) {
@@ -1085,6 +1425,11 @@ export async function startWsMarkets(args: {
 
             if (venue === "meteora" && poolKind === "dlmm") {
                 await wireMeteoraPool(spec);
+                continue;
+            }
+
+            if (venue === "lifinity") {
+                await wireLifinityPool(spec);
                 continue;
             }
 
@@ -1126,6 +1471,7 @@ export async function startWsMarkets(args: {
                     } catch { }
                 });
                 addSub(subBase, "ray_base_vault", meta.baseVault);
+                logWsSubscription("raydium", poolKeyStr, "ray_base_vault");
 
                 const subQuote = await ws.onAccountChange(meta.quoteVault, (acc, context) => {
                     const slot = slotFromContext(context, acc as any);
@@ -1136,6 +1482,7 @@ export async function startWsMarkets(args: {
                     } catch { }
                 });
                 addSub(subQuote, "ray_quote_vault", meta.quoteVault);
+                logWsSubscription("raydium", poolKeyStr, "ray_quote_vault");
 
                 // Prime via HTTP
                 try {
@@ -1217,14 +1564,16 @@ export async function startWsMarkets(args: {
                                     heartbeat_at: wsAtValue,
                                     synthetic_slot: syntheticSlot || undefined,
                                 });
-                                recordHeartbeatMetric({
-                                    venue: "orca",
-                                    poolId: poolId.toBase58(),
-                                    wsAt: wsAtValue,
-                                    heartbeatAt: wsAtValue,
-                                    source: "prime",
-                                    synthetic: syntheticSlot,
-                                });
+                    recordHeartbeatMetric({
+                        venue: "orca",
+                        poolId: poolId.toBase58(),
+                        wsAt: wsAtValue,
+                        heartbeatAt: wsAtValue,
+                        source: "prime",
+                        synthetic: syntheticSlot,
+                        wsUrl,
+                        endpointLabel: wsEndpointLabel,
+                    });
                                 poolState.lastPushMs = now;
                                 if (slotUsed != null) {
                                     poolState.lastSlotHint = slotUsed;
@@ -1284,6 +1633,8 @@ export async function startWsMarkets(args: {
                             heartbeatAt: wsAtValue,
                             source: "ws",
                             synthetic: syntheticSlot,
+                            wsUrl,
+                            endpointLabel: wsEndpointLabel,
                         });
                         if (state) {
                             state.lastPushMs = now;
@@ -1303,6 +1654,7 @@ export async function startWsMarkets(args: {
                     }
                 });
                 addSub(subId, "orca_whirlpool", poolId);
+                logWsSubscription("orca", poolKeyStr, "orca_whirlpool");
 
                 logger.log("ws_orca_clmm_wired", {
                     pool: poolId.toBase58(),
@@ -1317,25 +1669,45 @@ export async function startWsMarkets(args: {
 
     // Rewire on open/close
     let reconnectTimer: NodeJS.Timeout | null = null;
+    const logWsState = (evt: "connect" | "disconnect" | "reconnect" | "error", error?: any) => {
+        logger.log("ws_connection_state", {
+            type: "ws_connection_state",
+            source: "ws_markets",
+            venue: "multi",
+            marketOrPoolKey: "*",
+            ws_url: wsUrl,
+            event: evt,
+            ts: Date.now(),
+            error_message: error ? String((error as any)?.message ?? error) : undefined,
+        });
+    };
     const onOpen = () => {
         logger.log("ws_open", { wsUrl });
+        logWsState("connect");
     };
     const onClose = () => {
         logger.log("ws_closed", { wsUrl });
+        logWsState("disconnect");
         if (reconnectTimer) return;
         reconnectTimer = setTimeout(async () => {
             reconnectTimer = null;
             try {
                 await clearSubs();
                 await wireAll();
+                logWsState("reconnect");
             } catch (e) {
                 logger.log("ws_rewire_error", { err: String((e as any)?.message ?? e) });
+                logWsState("error", e);
             }
         }, WS_RETRY_MS);
         reconnectTimer?.unref?.();
     };
+    const onError = (err: any) => {
+        logWsState("error", err);
+    };
     (ws as any)._rpcWebSocket?.on?.("open", onOpen);
     (ws as any)._rpcWebSocket?.on?.("close", onClose);
+    (ws as any)._rpcWebSocket?.on?.("error", onError);
 
     await wireAll();
     logger.log("ws_provider_ready", { httpUrl, wsUrl, pairsPath });
@@ -1350,6 +1722,7 @@ export async function startWsMarkets(args: {
             orcaTimer && clearInterval(orcaTimer);
             meteoraTimer && clearInterval(meteoraTimer);
             raydiumTimer && clearInterval(raydiumTimer);
+            lifinityTimer && clearInterval(lifinityTimer);
             try { await clearSubs(); } catch { }
             for (const state of orcaState.values()) {
                 for (const entry of state.tickArrays.values()) {
@@ -1362,8 +1735,10 @@ export async function startWsMarkets(args: {
             orcaState.clear();
             meteoraState.clear();
             raydiumState.clear();
+            lifinityState.clear();
             try { (ws as any)._rpcWebSocket?.off?.("open", onOpen); } catch { }
             try { (ws as any)._rpcWebSocket?.off?.("close", onClose); } catch { }
+            try { (ws as any)._rpcWebSocket?.off?.("error", onError); } catch { }
         },
     };
 }

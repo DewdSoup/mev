@@ -12,7 +12,12 @@ import { logger } from "@mev/storage";
 import { withRpcBackoff, type RpcRateLimitInfo } from "./backoff.js";
 
 const DEFAULT_HTTP_ENDPOINT = String(process.env.RPC_URL ?? process.env.RPC_PRIMARY ?? "").trim();
-const DEFAULT_WS_ENDPOINT = process.env.RPC_WSS_URL?.trim();
+const DEFAULT_WS_ENDPOINT =
+  process.env.RPC_WSS_URL?.trim() ||
+  process.env.WS_URL?.trim() ||
+  process.env.WSS_URL?.trim() ||
+  process.env.RPC_WSS_FALLBACK?.trim() ||
+  process.env.WS_FALLBACK?.trim();
 
 if (!DEFAULT_HTTP_ENDPOINT) {
   throw new Error("rpc_facade_missing_rpc_url");

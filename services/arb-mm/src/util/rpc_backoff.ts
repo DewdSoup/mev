@@ -17,8 +17,6 @@
 
 import { logger } from "../ml_logger.js";
 
-type AnyFn = (...args: any[]) => Promise<any>;
-
 function envNum(name: string, def: number): number {
     const v = Number(process.env[name]);
     return Number.isFinite(v) && v > 0 ? v : def;
@@ -104,7 +102,12 @@ function classifyError(e: any): { retry: boolean; rateLimited: boolean } {
         msg.includes("internal server error") ||
         msg.includes("502") ||
         msg.includes("503") ||
-        msg.includes("504");
+        msg.includes("504") ||
+        msg.includes("fetch failed") ||
+        msg.includes("failed to fetch") ||
+        msg.includes("connection refused") ||
+        msg.includes("connection reset") ||
+        msg.includes("network error");
     return { retry: transient, rateLimited };
 }
 
@@ -112,7 +115,7 @@ function classifyError(e: any): { retry: boolean; rateLimited: boolean } {
  * Wrap a single async call with retry/backoff.
  * fn: a function which returns a Promise.
  */
-async function callWithRetry<T>(fn: AnyFn, opts?: {
+export async function callWithRetry<T>(fn: () => Promise<T>, opts?: {
     maxRetries?: number;
     baseMs?: number;
     maxMs?: number;

@@ -1,4 +1,4 @@
-export type Venue = "raydium" | "orca" | "meteora" | "phoenix";
+export type Venue = "raydium" | "orca" | "meteora" | "lifinity" | "phoenix";
 export type Pair = {
     symbol: string;
     baseMint: string;

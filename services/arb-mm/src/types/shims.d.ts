@@ -4,6 +4,7 @@ declare module "@mev/risk" {
 }
 declare module "@mev/storage" {
     export const logger: { log: (name: string, obj?: any) => void };
+    export function getRunRoot(): string;
 }
 declare module "@mev/phoenix" {
     const anything: any;

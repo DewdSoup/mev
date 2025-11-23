@@ -5,9 +5,9 @@ import { config as dotenvConfig } from "dotenv";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const repoRoot = path.resolve(__dirname, "..", "..", "..");
 
 function loadExactEnvLive() {
-  const repoRoot = path.resolve(__dirname, "..", "..", "..");
   const repoEnvLive = path.resolve(repoRoot, ".env.live");
   const svcEnvLive = path.resolve(__dirname, "..", ".env.live");
   const explicit = process.env.DOTENV_CONFIG_PATH
@@ -42,4 +42,55 @@ function loadExactEnvLive() {
 
 loadExactEnvLive();
 
-await import("./main.js");
+function resolvePairsPath(): string | null {
+  const fromEnv = process.env.PAIRS_JSON?.trim();
+  if (fromEnv) {
+    const abs = path.isAbsolute(fromEnv) ? fromEnv : path.resolve(fromEnv);
+    if (fs.existsSync(abs)) return abs;
+  }
+
+  const candidates = [
+    path.resolve(repoRoot, "configs", "pairs.json"),
+    path.resolve(__dirname, "..", "configs", "pairs.json"),
+  ];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
+  return null;
+}
+
+function shouldRunMultipair(): boolean {
+  const override = String(process.env.ARB_RUNNER ?? "").trim().toLowerCase();
+  if (override === "single") return false;
+  if (override === "multi") return true;
+
+  const pairsPath = resolvePairsPath();
+  if (!pairsPath) return false;
+
+  try {
+    const raw = JSON.parse(fs.readFileSync(pairsPath, "utf8"));
+    const norm = Array.isArray(raw?.pairs) ? raw.pairs : Array.isArray(raw) ? raw : [];
+    if (!norm.length) return false;
+
+    if (norm.length > 1) return true;
+
+    const venues = Array.isArray(norm[0]?.venues) ? norm[0].venues : [];
+    const ammVenues = venues.filter(
+      (v: any) => v && String(v.kind ?? v.venue ?? "").toLowerCase() !== "phoenix",
+    );
+    return ammVenues.length > 1;
+  } catch {
+    return false;
+  }
+}
+
+const target = shouldRunMultipair() ? "./multipair.js" : "./main.js";
+
+if (!process.env.QUIET_BOOT) {
+  const mode = target.includes("multi") ? "multipair" : "single";
+  console.log(`[boot] runner=${mode}`);
+}
+
+await import(target);

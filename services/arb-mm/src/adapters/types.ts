@@ -16,7 +16,7 @@ export type QuoteReq = {
 
 export type QuoteResp =
     | { ok: true; price: number; feeBps?: number; minOut?: number; meta?: any }
-    | { ok: false; err: string };
+    | { ok: false; err: string; meta?: any };
 
 export interface AmmAdapter {
     kind: string;

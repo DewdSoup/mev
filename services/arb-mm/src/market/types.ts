@@ -1,4 +1,4 @@
-export type AmmVenue = "raydium" | "orca" | "meteora";
+export type AmmVenue = "raydium" | "orca" | "meteora" | "lifinity";
 export type PoolKind = "cpmm" | "clmm" | "dlmm";
 
 export interface AmmSnapshot {
@@ -77,6 +77,10 @@ export interface TrackedPoolMeta {
     heartbeatGraceMs?: number;
     tradeableWhenDegraded?: boolean;
   };
+  baseMint?: string;
+  quoteMint?: string;
+  baseDecimalsHint?: number;
+  quoteDecimalsHint?: number;
 }
 
 export interface MarketProviderConfig {

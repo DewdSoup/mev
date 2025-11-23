@@ -12,15 +12,10 @@ import {
   VersionedTransaction,
   TransactionMessage,
   AddressLookupTableAccount,
+  ComputeBudgetProgram,
 } from "@solana/web3.js";
 import { LIQUIDITY_STATE_LAYOUT_V4 } from "@raydium-io/raydium-sdk";
-import { logger } from "../ml_logger.js";
-import { buildRaydiumCpmmSwapIx } from "./buildRaydiumCpmmIx.js";
-import { buildRaydiumClmmSwapIx } from "./buildRaydiumClmmIx.js";
-import { buildOrcaWhirlpoolSwapIx } from "./buildOrcaWhirlpoolIx.js";
-import { buildMeteoraDlmmSwapIx } from "./buildMeteoraDlmmIx.js";
-import { buildPhoenixSwapIxs } from "../util/phoenix.js";
-import { toIxArray, assertIxArray } from "../util/ix.js";
+import { logger, logTxExecEvent } from "../ml_logger.js";
 import { submitAtomic, buildPreIxs } from "../tx/submit.js";
 import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
@@ -28,11 +23,15 @@ import { withRpcBackoff } from "../util/rpc_backoff.js";
 import { rpcSimFn as rpcSimTx } from "../tx/rpcSim.js";            // <- NEW
 import { canActuallySendNow } from "../tx/sendGate.js";           // <- NEW
 import { getRpcP95Ms } from "../runtime/metrics.js";              // <- NEW
+import { buildExecutionLegSequence } from "./transaction_builder.js";
+import type { ExecutionLeg, AmmExecutionLeg, PhoenixExecutionLeg } from "../types/execution.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __here = path.dirname(__filename);
 
 const SLIPPAGE_BPS = Number(process.env.MAX_SLIPPAGE_BPS || "50");
+const EXEC_MODE = String(process.env.EXEC_MODE ?? "LIVE").trim().toUpperCase();
+const SIM_ONLY = EXEC_MODE === "SIM_ONLY";
 
 // Defaults to your SOL/USDC pools (override with env if you prefer)
 const DEFAULT_RAYDIUM_POOL_ID = (
@@ -116,11 +115,179 @@ function envNum(k: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+function readU32LE(data: Uint8Array, offset: number): number {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  return view.getUint32(offset, true);
+}
+
+function readU64LE(data: Uint8Array, offset: number): bigint {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  return view.getBigUint64(offset, true);
+}
+
+function extractComputeBudgetSettings(ixs: TransactionInstruction[]): { limit?: number; price?: number } {
+  const settings: { limit?: number; price?: number } = {};
+  for (const ix of ixs) {
+    if (!ix || !ix.programId?.equals?.(ComputeBudgetProgram.programId)) continue;
+    if (!ix.data || ix.data.length === 0) continue;
+    const discriminator = ix.data[0];
+    if (discriminator === 2 && ix.data.length >= 5) {
+      const units = readU32LE(ix.data, 1);
+      settings.limit = Math.max(settings.limit ?? 0, units);
+    } else if (discriminator === 3 && ix.data.length >= 9) {
+      const price = Number(readU64LE(ix.data, 1));
+      settings.price = Math.max(settings.price ?? 0, price);
+    }
+  }
+  return settings;
+}
+
+function stripComputeBudgetIxs(ixs: TransactionInstruction[]): TransactionInstruction[] {
+  return ixs.filter((ix) => !ix.programId?.equals?.(ComputeBudgetProgram.programId));
+}
+
+function dedupeComputeBudgetIxs(ixs: TransactionInstruction[]): TransactionInstruction[] {
+  const seen = new Set<string>();
+  const programId = ComputeBudgetProgram.programId.toBase58();
+  const out: TransactionInstruction[] = [];
+  for (const ix of ixs) {
+    if (!ix || !ix.programId?.equals?.(ComputeBudgetProgram.programId)) {
+      out.push(ix);
+      continue;
+    }
+    const tag = (ix.data && ix.data.length > 0) ? ix.data[0] : -1;
+    const key = `${programId}:${tag}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ix);
+  }
+  return out;
+}
+
 // Types / helpers
-export type AtomicPath = "PHX->AMM" | "AMM->PHX" | "AMM->AMM";
+export type AtomicPath = string;
 function uiToAtoms(ui: number, decimals: number): bigint { return BigInt(Math.floor(ui * 10 ** decimals)); }
 function applyBpsDownBig(x: bigint, bps: number): bigint {
   const BPS = 10_000n; const b = BigInt(Math.max(0, Math.min(10_000, Math.ceil(bps)))); return (x * (BPS - b)) / BPS;
+}
+
+function toPathLabel(path: AtomicPath): string | undefined {
+  const p = String(path || "").toLowerCase();
+  if (!p) return undefined;
+  if (p === "phx->amm") return "phx_amm";
+  if (p === "amm->phx") return "amm_phx";
+  if (p === "amm->amm") return "amm_amm";
+  const norm = p.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return norm || undefined;
+}
+
+function classifySimError(err: unknown): { type?: string; message?: string; raw?: string } {
+  if (err == null) return {};
+  const raw = typeof err === "string" ? err : JSON.stringify(err);
+  if (!raw) return {};
+  const lower = raw.toLowerCase();
+  let type: string | undefined;
+  if (raw.includes("InsufficientFundsForFee")) type = "InsufficientFundsForFee";
+  else if (lower.includes("instructionerror")) type = "InstructionError";
+  else if (lower.includes("blockhashnotfound")) type = "BlockhashNotFound";
+  else if (lower.includes("accountnotfound")) type = "AccountNotFound";
+  else if (lower.includes("slippage")) type = "Slippage";
+  const message = raw.length > 240 ? raw.slice(0, 240) : raw;
+  return { type, message, raw };
+}
+
+function isAmmExecutionLeg(leg: ExecutionLeg): leg is AmmExecutionLeg {
+  return leg.kind === "amm";
+}
+
+function isPhoenixExecutionLeg(leg: ExecutionLeg): leg is PhoenixExecutionLeg {
+  return leg.kind === "phoenix";
+}
+
+function normalizeExecutionLeg(raw: any): ExecutionLeg | null {
+  if (!raw || typeof raw !== "object") return null;
+  const kind = String(raw.kind ?? "").toLowerCase();
+  if (kind === "phoenix") {
+    const market = String(raw.market ?? raw.phoenixMarket ?? "").trim();
+    const side = String(raw.side ?? raw.direction ?? "buy").toLowerCase() === "sell" ? "sell" : "buy";
+    const sizeBase = Number(raw.sizeBase ?? raw.size_base ?? raw.size ?? 0);
+    const limitPx = Number(raw.limitPx ?? raw.limit_px ?? raw.price ?? 0);
+    if (!(market && sizeBase > 0 && limitPx > 0)) return null;
+    const slippageBps = raw.slippageBps != null ? Number(raw.slippageBps) : undefined;
+    return { kind: "phoenix", market, side, sizeBase, limitPx, slippageBps };
+  }
+  if (kind === "amm") {
+    const venue = String(raw.venue ?? raw.ammVenue ?? raw.amm_venue ?? "").trim().toLowerCase();
+    const poolId = String(raw.poolId ?? raw.pool_id ?? raw.pool ?? "").trim();
+    const directionRaw = String(raw.direction ?? raw.flow ?? "baseToQuote").toLowerCase();
+    const direction: "baseToQuote" | "quoteToBase" = directionRaw === "quotetobase" ? "quoteToBase" : directionRaw === "baseToquote" ? "baseToQuote" : (directionRaw === "quotetobase" || directionRaw === "qtb") ? "quoteToBase" : directionRaw === "base" ? "baseToQuote" : (directionRaw === "quoteToBase" ? "quoteToBase" : "baseToQuote");
+    const sizeBase = Number(raw.sizeBase ?? raw.size_base ?? raw.size ?? 0);
+    const refPx = Number(raw.refPx ?? raw.ref_px ?? raw.price ?? 0);
+    if (!(venue && sizeBase > 0 && refPx > 0)) return null;
+    const poolKind = raw.poolKind ?? raw.pool_kind ?? undefined;
+    const label = raw.label ?? undefined;
+    const baseMint = raw.baseMint ?? raw.base_mint ?? undefined;
+    const quoteMint = raw.quoteMint ?? raw.quote_mint ?? undefined;
+    return {
+      kind: "amm",
+      venue,
+      poolId,
+      poolKind: typeof poolKind === "string" ? poolKind : undefined,
+      direction: direction === "quoteToBase" ? "quoteToBase" : "baseToQuote",
+      sizeBase,
+      refPx,
+      baseMint: typeof baseMint === "string" ? baseMint : undefined,
+      quoteMint: typeof quoteMint === "string" ? quoteMint : undefined,
+      label: typeof label === "string" ? label : undefined,
+    };
+  }
+  return null;
+}
+
+function buildLegacyLegs(payload: any): ExecutionLeg[] {
+  const legs: ExecutionLeg[] = [];
+  const path = (payload?.path as AtomicPath) ?? "PHX->AMM";
+  const sizeBase = Number(payload?.size_base ?? payload?.trade_size_base ?? 0);
+  if (!(sizeBase > 0)) return legs;
+  const market = String(payload?.phoenix?.market ?? payload?.phoenix_market ?? "").trim();
+  const buyPx = Number(payload?.buy_px ?? 0);
+  const sellPx = Number(payload?.sell_px ?? 0);
+  const ammVenue = String(payload?.amm_venue ?? payload?.amm?.venue ?? "raydium").toLowerCase();
+  const poolId = String(payload?.amm_pool_id ?? payload?.amm?.pool ?? "").trim();
+  const poolKind = String(payload?.amm_meta?.poolKind ?? payload?.amm?.meta?.poolKind ?? "").trim();
+  const dstVenue = String(payload?.amm_dst_venue ?? payload?.amm_dst?.venue ?? "").toLowerCase();
+  const dstPoolId = String(payload?.amm_dst_pool_id ?? payload?.amm_dst?.pool ?? "").trim();
+  const dstPoolKind = String(payload?.amm_dst_meta?.poolKind ?? payload?.amm_dst?.meta?.poolKind ?? "").trim();
+
+  if (path === "PHX->AMM") {
+    if (market) legs.push({ kind: "phoenix", market, side: "buy", sizeBase, limitPx: buyPx });
+    legs.push({ kind: "amm", venue: ammVenue, poolId, poolKind, direction: "baseToQuote", sizeBase, refPx: sellPx, label: "amm" });
+  } else if (path === "AMM->PHX") {
+    legs.push({ kind: "amm", venue: ammVenue, poolId, poolKind, direction: "quoteToBase", sizeBase, refPx: buyPx, label: "amm" });
+    if (market) legs.push({ kind: "phoenix", market, side: "sell", sizeBase, limitPx: sellPx });
+  } else if (path === "AMM->AMM") {
+    legs.push({ kind: "amm", venue: ammVenue, poolId, poolKind, direction: "quoteToBase", sizeBase, refPx: buyPx, label: "src" });
+    legs.push({ kind: "amm", venue: dstVenue || ammVenue, poolId: dstPoolId, poolKind: dstPoolKind, direction: "baseToQuote", sizeBase, refPx: sellPx, label: "dst" });
+  }
+
+  return legs.filter(Boolean);
+}
+
+function extractExecutionLegs(payload: any): ExecutionLeg[] {
+  if (Array.isArray(payload?.legs)) {
+    const normalized = payload.legs.map(normalizeExecutionLeg);
+    return normalized.filter((leg: ExecutionLeg | null): leg is ExecutionLeg => leg != null);
+  }
+  return buildLegacyLegs(payload);
+}
+
+function inferAtomicPathFromLegs(legs: ExecutionLeg[], fallback: AtomicPath): AtomicPath {
+  if (legs.length > 2) return "MULTI";
+  if (!legs.length) return fallback;
+  if (legs.every(isAmmExecutionLeg)) return "AMM->AMM";
+  if (legs.length >= 2 && isPhoenixExecutionLeg(legs[0]) && isAmmExecutionLeg(legs[1])) return "PHX->AMM";
+  if (legs.length >= 2 && isAmmExecutionLeg(legs[0]) && legs.slice(1).some(isPhoenixExecutionLeg)) return "AMM->PHX";
+  return fallback;
 }
 
 type PoolMeta = { baseMint: PublicKey; quoteMint: PublicKey; baseVault?: PublicKey; quoteVault?: PublicKey };
@@ -337,54 +504,104 @@ export class LiveExecutor {
 
   async maybeExecute(payload: any): Promise<void> {
     try {
-      const atomicPath = (payload?.path as AtomicPath) || "PHX->AMM";
+      const legs = extractExecutionLegs(payload);
+      if (!legs.length) {
+        logger.log("submit_error", { where: "maybe_execute", error: "no_execution_legs" });
+        return;
+      }
+
+      const isMultiHop = legs.length > 2;
+      const multiHopExecEnabled = envTrue("ENABLE_MULTI_HOP_EXEC");
+      if (isMultiHop && !multiHopExecEnabled) {
+        logger.log("multi_hop_execution_disabled", {
+          legs: legs.length,
+          path: payload?.path ?? inferAtomicPathFromLegs(legs, "PHX->AMM"),
+        });
+        return;
+      }
+
+      const fallbackPath = (payload?.path as AtomicPath) || "PHX->AMM";
+      const atomicPath = inferAtomicPathFromLegs(legs, fallbackPath);
+      const pathLabel = toPathLabel(atomicPath);
       const isAmmAmm = atomicPath === "AMM->AMM";
+      const attemptId = typeof payload?.attempt_id === "string" ? payload.attempt_id : undefined;
+
+      const ammLegs = legs.filter(isAmmExecutionLeg);
+      const phoenixLegs = legs.filter(isPhoenixExecutionLeg);
+      const primaryAmmLeg = ammLegs[0] ?? null;
+      const secondaryAmmLeg = ammLegs[1] ?? null;
+      const primaryPhoenixLeg = phoenixLegs[0] ?? null;
+
+      let sizeBase = Number(payload?.size_base ?? payload?.trade_size_base ?? primaryAmmLeg?.sizeBase ?? primaryPhoenixLeg?.sizeBase ?? 0);
+
+      let buy_px = Number(payload?.buy_px ?? 0);
+      if (!(buy_px > 0)) {
+        if (atomicPath === "PHX->AMM" && primaryPhoenixLeg) buy_px = primaryPhoenixLeg.limitPx;
+        else if (primaryAmmLeg) buy_px = primaryAmmLeg.refPx;
+      }
+
+      let sell_px = Number(payload?.sell_px ?? 0);
+      if (!(sell_px > 0)) {
+        if (atomicPath === "AMM->PHX" && primaryPhoenixLeg) sell_px = primaryPhoenixLeg.limitPx;
+        else if (atomicPath === "PHX->AMM" && primaryAmmLeg) sell_px = primaryAmmLeg.refPx;
+        else if (secondaryAmmLeg) sell_px = secondaryAmmLeg.refPx;
+      }
+
       const ammVenue = String(
         payload?.amm_venue ??
         payload?.amm?.venue ??
         payload?.ammVenue ??
+        primaryAmmLeg?.venue ??
         "raydium"
-      ).toLowerCase() as "raydium" | "orca" | "meteora";
+      ).toLowerCase() as "raydium" | "orca" | "lifinity" | "meteora";
+
       const poolFromPayload = String(
         payload?.amm_pool_id ??
         payload?.amm?.pool ??
+        primaryAmmLeg?.poolId ??
         ""
       ).trim();
+
       const poolKind = String(
         payload?.amm_meta?.poolKind ??
         payload?.amm?.meta?.poolKind ??
         payload?.amm_pool_kind ??
+        primaryAmmLeg?.poolKind ??
         ""
       )
         .trim()
         .toLowerCase();
+
       const ammDstVenue = String(
         payload?.amm_dst_venue ??
         payload?.amm_dst?.venue ??
+        secondaryAmmLeg?.venue ??
         ""
-      ).toLowerCase() as "raydium" | "orca" | "meteora" | "";
+      ).toLowerCase() as "raydium" | "orca" | "lifinity" | "meteora" | "";
+
       const ammDstPoolId = String(
         payload?.amm_dst_pool_id ??
         payload?.amm_dst?.pool ??
+        secondaryAmmLeg?.poolId ??
         ""
       ).trim();
+
       const ammDstPoolKind = String(
         payload?.amm_dst_meta?.poolKind ??
         payload?.amm_dst?.meta?.poolKind ??
+        secondaryAmmLeg?.poolKind ??
         ""
       )
         .trim()
         .toLowerCase();
 
-      const baseMintStr = (String(payload?.base_mint ?? payload?.amm_meta?.baseMint ?? "").trim()) || DEFAULT_BASE_MINT.toBase58();
-      const quoteMintStr = (String(payload?.quote_mint ?? payload?.amm_meta?.quoteMint ?? "").trim()) || DEFAULT_QUOTE_MINT.toBase58();
-      const dstBaseMintStr = (String(payload?.amm_dst_meta?.baseMint ?? baseMintStr).trim()) || baseMintStr;
-      const dstQuoteMintStr = (String(payload?.amm_dst_meta?.quoteMint ?? quoteMintStr).trim()) || quoteMintStr;
+      const baseMintStr = (String(payload?.base_mint ?? payload?.amm_meta?.baseMint ?? primaryAmmLeg?.baseMint ?? "").trim()) || DEFAULT_BASE_MINT.toBase58();
+      const quoteMintStr = (String(payload?.quote_mint ?? payload?.amm_meta?.quoteMint ?? primaryAmmLeg?.quoteMint ?? "").trim()) || DEFAULT_QUOTE_MINT.toBase58();
+      const dstBaseMintStr = (String(payload?.amm_dst_meta?.baseMint ?? secondaryAmmLeg?.baseMint ?? baseMintStr).trim()) || baseMintStr;
+      const dstQuoteMintStr = (String(payload?.amm_dst_meta?.quoteMint ?? secondaryAmmLeg?.quoteMint ?? quoteMintStr).trim()) || quoteMintStr;
 
-      let sizeBase = Number(payload?.size_base ?? payload?.trade_size_base ?? 0);
-      const phoenix = payload?.phoenix || {};
-      const buy_px = Number(payload?.buy_px ?? 0);
-      const sell_px = Number(payload?.sell_px ?? 0);
+      const phoenixMarket = String(payload?.phoenix?.market ?? primaryPhoenixLeg?.market ?? "").trim();
+      const hasPhoenixLeg = !!primaryPhoenixLeg || !!phoenixMarket;
 
       const FORCE = envTrue("FORCE_EXECUTE_EVEN_IF_NEG");
       const MAX_FORCE_BASE = envNum("FORCE_EXECUTE_MAX_BASE");
@@ -446,7 +663,7 @@ export class LiveExecutor {
         });
       }
 
-      if (!isAmmAmm && !phoenix?.market) {
+      if (!isAmmAmm && !hasPhoenixLeg) {
         logger.log("submit_error", { where: "maybe_execute", error: "missing_phoenix_market" });
         return;
       }
@@ -459,222 +676,52 @@ export class LiveExecutor {
         return poolId;
       };
 
-      type BuiltLeg = { ixs: TransactionInstruction[]; lookupTables: PublicKey[] };
-
-      const buildAmmLeg = async (leg: {
-        venue: string;
-        poolId: string;
-        poolKind?: string;
-        baseIn: boolean;
-        sizeBase: number;
-        refPx: number;
-        baseMint?: string;
-        quoteMint?: string;
-        label: string;
-      }): Promise<BuiltLeg> => {
-        const venue = leg.venue.toLowerCase();
-        const poolKind = (leg.poolKind ?? "").toLowerCase();
-        const poolId = resolvePoolId(venue, leg.poolId);
-        if (!poolId) {
-          throw new Error(`missing_pool_id_${venue}`);
-        }
-        if (!(leg.refPx > 0)) {
-          throw new Error(`${venue}_no_ref_px`);
-        }
-
-        if (venue === "meteora") {
-          const baseMintStr = (leg.baseMint ?? DEFAULT_BASE_MINT.toBase58()).trim() || DEFAULT_BASE_MINT.toBase58();
-          const quoteMintStr = (leg.quoteMint ?? DEFAULT_QUOTE_MINT.toBase58()).trim() || DEFAULT_QUOTE_MINT.toBase58();
-          const built = await buildMeteoraDlmmSwapIx({
-            connection: this.conn,
-            user: this.payer.publicKey,
-            poolId,
-            baseIn: leg.baseIn,
-            sizeBase: leg.sizeBase,
-            refPx: leg.refPx,
-            slippageBps: SLIPPAGE_BPS,
-            baseMint: baseMintStr,
-            quoteMint: quoteMintStr,
-          });
-          if (!built.ok) throw new Error(built.reason);
-          const ixs = built.ixs;
-          assertIxArray(ixs, "meteora");
-          logger.log("meteora_build_ok", { ixs: ixs.length, pool: poolId, leg: leg.label });
-          return { ixs, lookupTables: [] };
-        }
-
-        if (venue === "raydium" && poolKind === "clmm") {
-          const amountInAtoms = leg.baseIn
-            ? uiToAtoms(leg.sizeBase, 9)
-            : uiToAtoms(leg.sizeBase * leg.refPx, 6);
-
-          const expectedOutAtoms = leg.baseIn
-            ? uiToAtoms(leg.sizeBase * leg.refPx, 6)
-            : uiToAtoms(leg.sizeBase, 9);
-
-          const clmm = await buildRaydiumClmmSwapIx({
-            connection: this.conn,
-            user: this.payer.publicKey,
-            poolId,
-            baseIn: leg.baseIn,
-            amountInAtoms,
-            expectedOutAtoms,
-            slippageBps: SLIPPAGE_BPS,
-          });
-          if (!clmm.ok) throw new Error(clmm.reason);
-          const ixs = clmm.ixs;
-          assertIxArray(ixs, "raydium_clmm");
-          logger.log("raydium_clmm_build_ok", { ixs: ixs.length, pool: poolId, leg: leg.label });
-          return { ixs, lookupTables: clmm.lookupTables ?? [] };
-        }
-
-        if (venue === "raydium") {
-          const poolPk = new PublicKey(poolId);
-          const meta = await ensureRaydiumPoolMeta(this.conn, poolPk);
-          const amountInAtoms = leg.baseIn
-            ? uiToAtoms(leg.sizeBase, 9)
-            : uiToAtoms(leg.sizeBase * leg.refPx, 6);
-
-          const dynExtra = Number.parseFloat(process.env.DYNAMIC_SLIPPAGE_EXTRA_BPS ?? "0");
-          const bufferBps = Number.parseFloat(process.env.RAYDIUM_MINOUT_BUFFER_BPS ?? "0");
-          const usedSlip = Math.max(0, SLIPPAGE_BPS + dynExtra + bufferBps);
-
-          const inMint: PublicKey = leg.baseIn ? meta.baseMint : meta.quoteMint;
-          const outMint: PublicKey = leg.baseIn ? meta.quoteMint : meta.baseMint;
-
-          let outAtoms: bigint;
-          if (leg.baseIn) {
-            const inUi = Number(amountInAtoms) / 1e9;
-            const outUi = inUi * leg.refPx;
-            outAtoms = BigInt(Math.floor(outUi * 1e6));
-          } else {
-            const inUi = Number(amountInAtoms) / 1e6;
-            const outUi = inUi / leg.refPx;
-            outAtoms = BigInt(Math.floor(outUi * 1e9));
-          }
-          const minOut = applyBpsDownBig(outAtoms, usedSlip);
-
-          const ixs = await buildRaydiumCpmmSwapIx({
-            connection: this.conn,
-            owner: this.payer.publicKey,
-            poolId: poolPk,
-            inMint,
-            outMint,
-            amountIn: amountInAtoms,
-            amountOutMin: minOut,
-          });
-          assertIxArray(ixs, "raydium_cpmm");
-          logger.log("raydium_build_ok", { ixs: ixs.length, pool: poolId, leg: leg.label });
-          return { ixs, lookupTables: [] };
-        }
-
-        if (venue === "orca") {
-          const whirlpoolPk = new PublicKey(poolId);
-          const amountInAtoms = leg.baseIn
-            ? uiToAtoms(leg.sizeBase, 9)
-            : uiToAtoms(leg.sizeBase * leg.refPx, 6);
-          const built = await buildOrcaWhirlpoolSwapIx({
-            connection: this.conn,
-            user: this.payer.publicKey,
-            poolId: whirlpoolPk.toBase58(),
-            baseIn: leg.baseIn,
-            amountInAtoms,
-            slippageBps: SLIPPAGE_BPS,
-          });
-          if (!built.ok) throw new Error(built.reason);
-          const ixs = built.ixs;
-          assertIxArray(ixs, "orca");
-          logger.log("orca_build_ok", { ixs: ixs.length, pool: whirlpoolPk.toBase58(), leg: leg.label });
-          return { ixs, lookupTables: [] };
-        }
-
-        throw new Error(`unsupported_amm_venue_${venue}`);
+      // ── Build legs ─────────────────────────────────────────────────────
+      const legMintHints = (leg: ExecutionLeg): { baseMint?: string; quoteMint?: string } => {
+        if (!isAmmExecutionLeg(leg)) return {};
+        if (leg.label === "dst") return { baseMint: dstBaseMintStr, quoteMint: dstQuoteMintStr };
+        return { baseMint: baseMintStr, quoteMint: quoteMintStr };
       };
 
-      // ── Build legs ─────────────────────────────────────────────────────
-      let phxIxs: TransactionInstruction[] = [];
-      let ammSrcIxs: TransactionInstruction[] = [];
-      let ammDstIxs: TransactionInstruction[] = [];
+      const builtLegs = await buildExecutionLegSequence({
+        connection: this.conn,
+        payer: this.payer,
+        legs,
+        slippageBps: SLIPPAGE_BPS,
+        phoenixSlippageBps: Number(process.env.PHOENIX_SLIPPAGE_BPS ?? "3"),
+        resolvePoolId,
+        getMintHints: legMintHints,
+      });
+
       const lutSet = new Map<string, PublicKey>();
-      const pushLuts = (luts: PublicKey[] = []) => {
-        for (const pk of luts) {
+      for (const built of builtLegs) {
+        for (const pk of built.lookupTables) {
           if (!pk) continue;
           lutSet.set(pk.toBase58(), pk);
         }
-      };
-
-      if (isAmmAmm) {
-        const srcPoolId = resolvePoolId(ammVenue, poolFromPayload);
-        const dstPoolId = resolvePoolId(ammDstVenue, ammDstPoolId);
-        if (!srcPoolId || !dstPoolId) {
-          logger.log("submit_error", { where: "amm_amm_build", error: "missing_pool_id", srcPoolId, dstPoolId });
-          return;
-        }
-        const srcLeg = await buildAmmLeg({
-          venue: ammVenue,
-          poolId: srcPoolId,
-          poolKind,
-          baseIn: false, // quote -> base
-          sizeBase,
-          refPx: buy_px,
-          baseMint: baseMintStr,
-          quoteMint: quoteMintStr,
-          label: "src",
-        });
-        const dstLeg = await buildAmmLeg({
-          venue: ammDstVenue || ammVenue,
-          poolId: dstPoolId,
-          poolKind: ammDstPoolKind,
-          baseIn: true, // base -> quote
-          sizeBase,
-          refPx: sell_px,
-          baseMint: dstBaseMintStr,
-          quoteMint: dstQuoteMintStr,
-          label: "dst",
-        });
-        ammSrcIxs = srcLeg.ixs;
-        ammDstIxs = dstLeg.ixs;
-        pushLuts(srcLeg.lookupTables);
-        pushLuts(dstLeg.lookupTables);
-      } else {
-        const market = new PublicKey(phoenix.market);
-        phxIxs = Array.isArray(payload?.phxIxs) ? toIxArray(payload.phxIxs) : [];
-        if (!phxIxs.length) {
-          const limitPx = Number(phoenix.limit_px ?? phoenix.limitPx ?? (payload?.sell_px ?? payload?.buy_px));
-          const slippageBps = Number(process.env.PHOENIX_SLIPPAGE_BPS ?? "3");
-          logger.log("phoenix_build_params", { market: market.toBase58(), side: phoenix.side, sizeBase, limitPx, slippageBps });
-          const built: any = await buildPhoenixSwapIxs({
-            connection: this.conn,
-            owner: this.payer.publicKey,
-            market,
-            side: phoenix.side,
-            sizeBase,
-            limitPx,
-            slippageBps,
-          } as any);
-          if (Array.isArray(built)) phxIxs = toIxArray(built);
-          else if (built && typeof built === "object" && "ixs" in built) phxIxs = toIxArray((built as any).ixs);
-          else if (built && typeof built === "object" && "ok" in built && (built as any).ok && (built as any).ixs) phxIxs = toIxArray((built as any).ixs);
-          if (!phxIxs.length) throw new Error("phoenix_build_returned_no_instructions");
-          logger.log("phoenix_build_ok", { ixs: phxIxs.length });
-        }
-        assertIxArray(phxIxs, "phoenix");
-
-        const srcPoolId = resolvePoolId(ammVenue, poolFromPayload);
-        const leg = await buildAmmLeg({
-          venue: ammVenue,
-          poolId: srcPoolId,
-          poolKind,
-          baseIn: atomicPath === "PHX->AMM",
-          sizeBase,
-          refPx: atomicPath === "PHX->AMM" ? sell_px : buy_px,
-          baseMint: baseMintStr,
-          quoteMint: quoteMintStr,
-          label: "amm",
-        });
-        ammSrcIxs = leg.ixs;
-        pushLuts(leg.lookupTables);
       }
+
+      const phoenixBuilt = builtLegs.filter((b) => b.kind === "phoenix");
+      const ammBuilt = builtLegs.filter((b) => b.kind === "amm");
+
+      const phxIxsRaw = phoenixBuilt.flatMap((b) => b.instructions);
+      const ammSrcIxsRaw = isAmmAmm
+        ? (ammBuilt[0]?.instructions ?? [])
+        : ammBuilt.flatMap((b) => b.instructions);
+      const ammDstIxsRaw = isAmmAmm ? (ammBuilt[1]?.instructions ?? []) : [];
+
+      if (isAmmAmm && (!ammSrcIxsRaw.length || !ammDstIxsRaw.length)) {
+        logger.log("submit_error", { where: "amm_amm_build", error: "missing_leg_ixs" });
+        return;
+      }
+
+      const computeBudgetHints = extractComputeBudgetSettings([...phxIxsRaw, ...ammSrcIxsRaw, ...ammDstIxsRaw]);
+      const mergedCuLimit = Math.max(CU_LIMIT, computeBudgetHints.limit ?? 0);
+      const mergedCuPrice = Math.max(usedCuPrice, computeBudgetHints.price ?? 0);
+
+      const phxIxs = stripComputeBudgetIxs(phxIxsRaw);
+      const ammSrcIxs = stripComputeBudgetIxs(ammSrcIxsRaw);
+      const ammDstIxs = stripComputeBudgetIxs(ammDstIxsRaw);
 
       // ── PRE-TX BALANCES & LOG (Step 7a) ────────────────────────────────
       const pre = await getUiBalances(this.conn, this.payer.publicKey);
@@ -693,11 +740,13 @@ export class LiveExecutor {
       });
 
       // ── BUILD ATOMIC (for simulation) (Step 4) ─────────────────────────
-      const preIxs = buildPreIxs(CU_LIMIT, usedCuPrice);
+      const preIxs = buildPreIxs(mergedCuLimit, mergedCuPrice);
 
-      const instructions = isAmmAmm
-        ? [...preIxs, ...ammSrcIxs, ...ammDstIxs]
-        : [...preIxs, ...phxIxs, ...ammSrcIxs];
+      const instructions = dedupeComputeBudgetIxs(
+        isAmmAmm
+          ? [...preIxs, ...ammSrcIxs, ...ammDstIxs]
+          : [...preIxs, ...phxIxs, ...ammSrcIxs]
+      );
 
       const lutAccounts = await this.getLookupTableAccounts(Array.from(lutSet.values()));
       if (lutSet.size && lutAccounts.length < lutSet.size) {
@@ -718,7 +767,97 @@ export class LiveExecutor {
       tx.sign([this.payer]);
 
       // ── RPC SIM (Step 6) ───────────────────────────────────────────────
+      const txVenueDst = isAmmAmm ? ammDstVenue : hasPhoenixLeg ? "phoenix" : undefined;
+      const txPoolSrc = poolFromPayload || undefined;
+      const txPoolDst = isAmmAmm ? (ammDstPoolId || undefined) : undefined;
+
+      logger.log("tx_sim_start", {
+        attempt_id: attemptId,
+        path: atomicPath,
+        size_base: sizeBase,
+        amm_src: ammVenue,
+        amm_dst: isAmmAmm ? ammDstVenue : undefined,
+        exec_mode: EXEC_MODE,
+      });
+      if (attemptId) {
+        logTxExecEvent({
+          phase: "sim_start",
+          attempt_id: attemptId,
+          exec_mode: EXEC_MODE,
+          path_label: pathLabel,
+          venue_src: ammVenue,
+          venue_dst: txVenueDst,
+          pool_src: txPoolSrc,
+          pool_dst: txPoolDst,
+          size_base: sizeBase,
+        });
+      }
+      if (SIM_ONLY) {
+        logger.log("tx_sim_debug", {
+          attempt_id: attemptId,
+          path: atomicPath,
+          path_label: isAmmAmm ? "amm_amm" : hasPhoenixLeg ? "phx_amm" : "amm_only",
+          exec_mode: EXEC_MODE,
+          ix_count: instructions.length,
+          program_ids: instructions.map((ix) => ix.programId.toBase58?.() ?? String(ix.programId)),
+        });
+      }
       const sim = await rpcSimTx(this.conn, tx, { sigVerify: true, commitment: "processed" });
+      const simLogBase = {
+        attempt_id: attemptId,
+        path: atomicPath,
+        size_base: sizeBase,
+        amm_src: ammVenue,
+        amm_dst: isAmmAmm ? ammDstVenue : undefined,
+        exec_mode: EXEC_MODE,
+        units: sim.unitsConsumed,
+        err: sim.err,
+        logs_tail: sim.logs?.slice?.(-6),
+      };
+      const simUnits = Number.isFinite(sim.unitsConsumed) ? Number(sim.unitsConsumed) : null;
+      const simLogsTail = Array.isArray(sim.logs) ? sim.logs : simLogBase.logs_tail;
+      if (sim.ok) {
+        logger.log("tx_sim_ok", simLogBase);
+        if (attemptId) {
+          logTxExecEvent({
+            phase: "sim_ok",
+            attempt_id: attemptId,
+            exec_mode: EXEC_MODE,
+            path_label: pathLabel,
+            venue_src: ammVenue,
+            venue_dst: txVenueDst,
+            pool_src: txPoolSrc,
+            pool_dst: txPoolDst,
+            size_base: sizeBase,
+            units_consumed: simUnits,
+            logs_tail: simLogsTail ?? undefined,
+            sim_ok: true,
+          });
+        }
+      } else {
+        logger.log("tx_sim_err", simLogBase);
+        if (attemptId) {
+          const simErrInfo = classifySimError(sim.err);
+          logTxExecEvent({
+            phase: "sim_err",
+            attempt_id: attemptId,
+            exec_mode: EXEC_MODE,
+            path_label: pathLabel,
+            venue_src: ammVenue,
+            venue_dst: txVenueDst,
+            pool_src: txPoolSrc,
+            pool_dst: txPoolDst,
+            size_base: sizeBase,
+            units_consumed: simUnits,
+            logs_tail: simLogsTail ?? undefined,
+            sim_ok: false,
+            sim_err_type: simErrInfo.type,
+            sim_err_message: simErrInfo.message,
+            sim_err_raw: simErrInfo.raw,
+          });
+        }
+        return;
+      }
 
       // Compute final fixed cost using simulated units (fallback to pre-estimate)
       const unitsUsed = Number.isFinite(Number(sim.unitsConsumed)) ? Number(sim.unitsConsumed) : EST_UNITS_BEFORE_SIM;
@@ -737,26 +876,43 @@ export class LiveExecutor {
           sell_px,
           ev_quote: evQuoteFinal,
           fixed_cost_final: fixedCostFinal,
-          units_used: unitsUsed
+          units_used: unitsUsed,
+          attempt_id: attemptId,
         });
         return;
       }
 
       logger.log("rpc_sim", {
+        attempt_id: attemptId,
         ok: sim.ok,
         units: sim.unitsConsumed,
         logs_tail: sim.logs?.slice?.(-6),
         err: sim.err,
       });
 
+      if (SIM_ONLY) {
+        logger.log("tx_sim_dry_run_complete", {
+          attempt_id: attemptId,
+          path: atomicPath,
+          size_base: sizeBase,
+          amm_src: ammVenue,
+          amm_dst: isAmmAmm ? ammDstVenue : undefined,
+          exec_mode: EXEC_MODE,
+          simulated_ev_quote: Number(evQuoteFinal.toFixed(6)),
+          fixed_cost_quote: fixedCostFinal,
+          units_used: unitsUsed,
+        });
+        return;
+      }
+
       const gate = await canActuallySendNow(this.conn, { env: process.env, owner: this.payer.publicKey });
       if (!gate) {
-        logger.log("send_gate_off", { reason: "sim_only_or_unfunded", sim_ok: sim.ok, err: sim.err });
+        logger.log("send_gate_off", { reason: "sim_only_or_unfunded", sim_ok: sim.ok, err: sim.err, attempt_id: attemptId });
         return;
       }
 
       if (!sim.ok) {
-        logger.log("submit_error", { where: "rpc_sim", error: sim.err ?? "simulation_failed" });
+        logger.log("submit_error", { where: "rpc_sim", error: sim.err ?? "simulation_failed", attempt_id: attemptId });
         return;
       }
 
@@ -793,7 +949,7 @@ export class LiveExecutor {
         amm_dst: isAmmAmm ? ammDstVenue : undefined,
         size_base: sizeBase,
         ix_count: total,
-        cu_limit: CU_LIMIT,
+        cu_limit: mergedCuLimit,
         sig,
         live: true,
         shadow: false,

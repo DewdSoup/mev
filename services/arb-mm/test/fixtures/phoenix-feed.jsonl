@@ -1,0 +1,2 @@
+{"event":"phoenix_l2","ts":1760689200000,"market":"4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg","symbol":"SOL/USDC","best_bid":187.2,"best_ask":187.25,"phoenix_mid":187.225,"levels_bids":[{"px":187.2,"qty":50}],"levels_asks":[{"px":187.25,"qty":50}],"slot":100}
+{"event":"phoenix_l2","ts":1760689200100,"market":"4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg","symbol":"SOL/USDC","best_bid":188.5,"best_ask":188.6,"phoenix_mid":188.55,"levels_bids":[{"px":188.5,"qty":40}],"levels_asks":[{"px":188.6,"qty":40}],"slot":101}

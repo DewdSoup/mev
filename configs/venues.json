@@ -1,0 +1,33 @@
+{
+  "venues": {
+    "raydium": {
+      "slotLagSlots": 25,
+      "snapshotMaxAgeMs": 20000,
+      "heartbeatGraceMs": 20000,
+      "tradeableWhenDegraded": true,
+      "feeBps": 25
+    },
+    "orca": {
+      "slotLagSlots": 40,
+      "snapshotMaxAgeMs": 25000,
+      "heartbeatGraceMs": 25000,
+      "tradeableWhenDegraded": true,
+      "feeBps": 30
+    },
+    "meteora": {
+      "slotLagSlots": 80,
+      "snapshotMaxAgeMs": 60000,
+      "heartbeatGraceMs": 30000,
+      "tradeableWhenDegraded": true,
+      "feeBps": 10
+    },
+    "lifinity": {
+      "slotLagSlots": 40,
+      "snapshotMaxAgeMs": 45000,
+      "heartbeatGraceMs": 45000,
+      "tradeableWhenDegraded": true,
+      "feeBps": 13
+    }
+  },
+  "pools": {}
+}

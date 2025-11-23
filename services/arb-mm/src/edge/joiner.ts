@@ -28,7 +28,10 @@ import { quoteDlmm } from "./dlmm_quoter.js";
 import Decimal from "decimal.js";
 import { getCachedOrcaFee, getCachedRaydiumFee } from "../util/fee_cache.js";
 import { cpmmBuyQuotePerBase, cpmmSellQuotePerBase } from "../util/cpmm.js";
+import { recordCandidateStat } from "../runtime/telemetry.js";
 import type { PairSpec } from "../registry/pairs.js";
+import { enumerateRoutePlans, type RoutePlan, type PhoenixIntent } from "../routing/graph.js";
+import type { ExecutionLeg, AmmExecutionLeg, PhoenixExecutionLeg } from "../types/execution.js";
 
 Decimal.set({ precision: 40, rounding: Decimal.ROUND_HALF_EVEN });
 
@@ -304,9 +307,9 @@ type AmmSnap = {
   freshnessSource?: string | null;
 };
 
-// Unified node abstraction for 2-leg paths
-type VenueNode =
-  | { kind: "phx"; id: "phoenix" | "phoenix_buy" | "phoenix_sell"; feeBps: number }
+// Unified node abstraction for route enumeration (compatible with routing graph helpers)
+type RouteNode =
+  | { kind: "phx"; id: string; feeBps: number; market: string; intent?: PhoenixIntent }
   | { kind: "amm"; id: string; feeBps: number; amm: AmmSnap };
 
 export interface JoinerParams {
@@ -336,22 +339,28 @@ export interface JoinerCfg {
   decisionMinEdgeDeltaBps: number;
   useRpcSim: boolean;
   decisionMinBase?: number;
+  allowPnlMismatchInSim?: boolean;
 }
 
-// NB: Keep DecisionHookDetails.path as a superset; callers can ignore AMM->AMM.
+// NB: Keep DecisionHookDetails.path as a superset; callers can ignore unhandled paths.
 export type DecisionHookDetails = {
-  path: "AMM->PHX" | "PHX->AMM" | "AMM->AMM";
+  path: string;
   side: "buy" | "sell";
   buy_px: number;
   sell_px: number;
   rpc_eff_px?: number;
   recommended_size_base?: number;
+  edge_bps_gross?: number;
+  edge_bps_net?: number;
+  expected_pnl_quote?: number;
+  decision_reason?: string;
   amm_venue?: string;
   amm_pool_id?: string;       // exact pool to hit
   amm_dst_venue?: string;     // for AMM->AMM
   amm_dst_pool_id?: string;   // for AMM->AMM
   amm_meta?: { poolKind?: string; feeBps?: number; slot?: number | null; ts?: number };
   amm_dst_meta?: { poolKind?: string; feeBps?: number; slot?: number | null; ts?: number };
+  legs?: ExecutionLeg[];
 };
 
 export type DecisionHook = (
@@ -381,15 +390,37 @@ export type RpcSimFn = (input: {
 } | undefined>;
 
 type PathCandidate = {
-  path: "AMM->PHX" | "PHX->AMM" | "AMM->AMM";
-  amm: AmmSnap;
-  ammDst?: AmmSnap;
+  path: string;
+  nodes: RouteNode[];
+  legs: ExecutionLeg[];
   size: number;
   buyPx: number;
   sellPx: number;
   bpsGross: number;
   bpsNet: number;
   pnlNet: number;
+  pnlGross: number;
+  quoteSpent: number;
+  quoteReceived: number;
+  startAction: "buy" | "sell";
+  primaryAmm?: AmmSnap;
+  secondaryAmm?: AmmSnap;
+  quotes: {
+    node: RouteNode;
+    side: "buy" | "sell";
+    price?: number;
+    feeBps: number;
+    used: "adapter" | "local" | "fallback";
+    meta?: any;
+  }[];
+};
+
+type ValidationDebugContext = {
+  edgeBpsGross?: number;
+  edgeBpsNet?: number;
+  legs?: ExecutionLeg[];
+  primaryVenue?: string | null;
+  secondaryVenue?: string | null;
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -966,13 +997,8 @@ export class EdgeJoiner {
     );
   }
 
-  private pickTradeSize(args: {
-    path: "AMM->PHX" | "PHX->AMM" | "AMM->AMM";
-    nodeSrc: VenueNode;
-    nodeDst: VenueNode;
-    refPx: number;
-  }): number | undefined {
-    const minBase = this.computeMinTradeBase(args.refPx);
+  private pickTradeSizeForNodes(path: string, nodes: RouteNode[], refPx: number): number | undefined {
+    const minBase = this.computeMinTradeBase(refPx);
     const liveOverrideRaw = envNum("LIVE_SIZE_BASE");
     const liveOverride = liveOverrideRaw != null && Number.isFinite(liveOverrideRaw) && liveOverrideRaw > 0 ? liveOverrideRaw : undefined;
     const basePreferred = this.probeSizeBase ?? liveOverride ?? this.P.tradeSizeBase;
@@ -989,8 +1015,8 @@ export class EdgeJoiner {
     const fracCandidate = fracRaw != null && Number.isFinite(fracRaw) ? fracRaw : this.C.cpmmMaxPoolTradeFrac;
     const maxFrac = Math.max(0, Math.min(1, fracCandidate));
 
-    const applyCap = (node: VenueNode | undefined) => {
-      if (!node || node.kind !== "amm") return;
+    const applyCap = (node: RouteNode) => {
+      if (node.kind !== "amm") return;
       const reserves = node.amm.reserves;
       if (!reserves || !(reserves.base > 0) || !Number.isFinite(reserves.base)) return;
       if (!(maxFrac > 0)) return;
@@ -998,14 +1024,14 @@ export class EdgeJoiner {
       if (cap > 0) size = Math.min(size, cap);
     };
 
-    if (args.path === "AMM->PHX") {
-      applyCap(args.nodeSrc);
-    } else if (args.path === "PHX->AMM") {
-      applyCap(args.nodeDst);
-    } else {
-      applyCap(args.nodeSrc);
-      applyCap(args.nodeDst);
+    const uniqueAmms = new Map<string, RouteNode>();
+    for (const node of nodes) {
+      if (node.kind === "amm" && !uniqueAmms.has(node.id)) uniqueAmms.set(node.id, node);
     }
+    for (const node of uniqueAmms.values()) applyCap(node);
+
+    const involvesOrca = Array.from(uniqueAmms.values()).some((node) => node.kind === "amm" && node.amm.venue === "orca");
+    if (involvesOrca) size = Math.max(size, MIN_ORCA_BASE_SIZE);
 
     if (!(size > 0) || !Number.isFinite(size)) return undefined;
     if (absMax && size > absMax) size = absMax;
@@ -1014,40 +1040,31 @@ export class EdgeJoiner {
     return Number(size.toFixed(9));
   }
 
-  private enforceVenueMinSize(size: number, src: VenueNode, dst: VenueNode): number | undefined {
-    if (!(size > 0) || !Number.isFinite(size)) return undefined;
-    if (
-      (src.kind === "amm" && src.amm.venue === "orca") ||
-      (dst.kind === "amm" && dst.amm.venue === "orca")
-    ) {
-      return Math.max(size, MIN_ORCA_BASE_SIZE);
-    }
-    return size;
-  }
-
-  private async evaluatePathCandidate(args: {
-    nodeSrc: VenueNode;
-    nodeDst: VenueNode;
-    path: PathCandidate["path"];
+  private async evaluateRoutePlan(args: {
+    plan: RoutePlan<AmmSnap>;
     bid: number;
     ask: number;
     midRef: number;
-    trackAmmAmm: boolean;
-    execAmmAmm: boolean;
-    latestAmm: AmmSnap | undefined;
   }): Promise<PathCandidate | null> {
-    const { nodeSrc, nodeDst, path, bid, ask, midRef, trackAmmAmm, execAmmAmm, latestAmm } = args;
+    const { plan, bid, ask, midRef } = args;
+    const nodes: RouteNode[] = plan.nodes.map((node) =>
+      node.kind === "phx"
+        ? { kind: "phx", id: node.id, feeBps: node.feeBps, market: node.market, intent: node.intent }
+        : { kind: "amm", id: node.id, feeBps: node.feeBps, amm: node.amm }
+    );
+    if (nodes.length < 2) return null;
 
-    const describeNode = (node: VenueNode): string =>
-      node.kind === "amm" ? `${node.amm.venue}:${node.amm.ammId}` : node.id;
+    const describeNode = (node: RouteNode): string =>
+      node.kind === "amm"
+        ? `${node.amm.venue}:${node.amm.ammId}`
+        : `phx:${node.market}${node.intent ? `:${node.intent}` : ""}`;
 
     const logPathSkip = (reason: string, extras?: Record<string, unknown>) => {
       try {
         logger.log("path_candidate_skip", {
           symbol: this.symbol,
-          path,
-          src: describeNode(nodeSrc),
-          dst: describeNode(nodeDst),
+          path: plan.path,
+          nodes: nodes.map(describeNode),
           reason,
           ...(extras ?? {}),
         });
@@ -1056,71 +1073,178 @@ export class EdgeJoiner {
       }
     };
 
-    const pickedSize = this.pickTradeSize({ path, nodeSrc, nodeDst, refPx: midRef });
+    const pickedSize = this.pickTradeSizeForNodes(plan.path, nodes, midRef);
     if (!(pickedSize && pickedSize > 0)) {
       logPathSkip("size_not_available");
       return null;
     }
 
-    const adjusted = this.enforceVenueMinSize(pickedSize, nodeSrc, nodeDst);
-    if (!(adjusted && adjusted > 0)) {
-      logPathSkip("size_adjustment_failed");
-      return null;
-    }
-
-    const size = Number(adjusted.toFixed(9));
+    const size = Number(pickedSize.toFixed(9));
 
     try {
       logger.log("size_probe", {
         symbol: this.symbol,
-        path,
-        src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
-        dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
+        path: plan.path,
+        nodes: nodes.map(describeNode),
         size_base: size,
-        size_raw: pickedSize,
         min_base: this.computeMinTradeBase(midRef),
       });
     } catch { /* noop */ }
 
-    const qBuy = await this.quoteNodeAvgPerBase(nodeSrc, "buy", size, midRef);
-    const qSell = await this.quoteNodeAvgPerBase(nodeDst, "sell", size, midRef);
-    const buyPx = qBuy.px;
-    const sellPx = qSell.px;
+    const startAction: "buy" | "sell" = nodes.length % 2 === 0 ? "buy" : "sell";
+    let action = startAction;
+    let baseBalance = action === "sell" ? size : 0;
+    const quoteDetails: PathCandidate["quotes"] = [];
+    const legs: ExecutionLeg[] = [];
 
-    if (buyPx == null || sellPx == null) {
-      logPathSkip("quote_missing", {
-        buy_origin: qBuy.used,
-        sell_origin: qSell.used,
-        buy_meta: qBuy.meta ?? null,
-        sell_meta: qSell.meta ?? null,
+    let quoteSpent = 0;
+    let quoteReceived = 0;
+    let firstBuyPx: number | undefined;
+    let lastBuyPx: number | undefined;
+    let firstSellPx: number | undefined;
+    let lastSellPx: number | undefined;
+
+    for (let idx = 0; idx < nodes.length; idx++) {
+      const node = nodes[idx];
+      if (node.kind === "phx" && node.intent && node.intent !== action) {
+        logPathSkip("phoenix_intent_mismatch", {
+          node: describeNode(node),
+          required_side: action,
+          node_intent: node.intent,
+        });
+        return null;
+      }
+      const fallbackMid = node.kind === "amm"
+        ? node.amm.px
+        : action === "buy"
+          ? ask
+          : bid;
+      const quote = await this.quoteNodeAvgPerBase(node, action, size, fallbackMid);
+      const price = quote.px;
+      if (!(price != null && Number.isFinite(price) && price > 0)) {
+        logPathSkip("quote_missing", {
+          node: describeNode(node),
+          side: action,
+          quote_origin: quote.used,
+          quote_meta: quote.meta ?? null,
+        });
+        return null;
+      }
+
+      if (action === "buy") {
+        quoteSpent += price * size;
+        baseBalance += size;
+        if (firstBuyPx == null) firstBuyPx = price;
+        lastBuyPx = price;
+      } else {
+        if (baseBalance + 1e-9 < size) {
+          logPathSkip("insufficient_base_for_sell", {
+            node: describeNode(node),
+            required: size,
+            available: baseBalance,
+          });
+          return null;
+        }
+        quoteReceived += price * size;
+        baseBalance -= size;
+        if (firstSellPx == null) firstSellPx = price;
+        lastSellPx = price;
+      }
+
+      quoteDetails.push({
+        node,
+        side: action,
+        price,
+        feeBps: quote.feeBps,
+        used: quote.used,
+        meta: quote.meta ?? null,
       });
+
+      if (node.kind === "phx") {
+        legs.push({
+          kind: "phoenix",
+          market: node.market,
+          side: action,
+          sizeBase: size,
+          limitPx: price,
+          slippageBps: this.C.phoenixSlippageBps,
+        });
+      } else {
+        legs.push({
+          kind: "amm",
+          venue: node.amm.venue,
+          poolId: node.amm.ammId,
+          poolKind: node.amm.poolKind,
+          direction: action === "buy" ? "quoteToBase" : "baseToQuote",
+          sizeBase: size,
+          refPx: price,
+          baseMint: this.baseMint,
+          quoteMint: this.quoteMint,
+          label: `${plan.path}:${idx}`,
+        });
+      }
+
+      action = action === "buy" ? "sell" : "buy";
+    }
+
+    if (Math.abs(baseBalance) > 1e-6) {
+      logPathSkip("residual_base_balance", { residual_base: baseBalance });
       return null;
     }
 
-    const pnl = (sellPx - buyPx) * size - this.P.fixedTxCostQuote;
-    const notional = buyPx * size;
-    const srcMid = nodeSrc.kind === "amm" ? nodeSrc.amm.px : ask;
-    const dstMid = nodeDst.kind === "amm" ? nodeDst.amm.px : bid;
-    const bpsGross = ((dstMid / srcMid) - 1) * 10_000;
-    const bpsNet = ((sellPx / buyPx) - 1) * 10_000;
+    const grossQuote = quoteReceived - quoteSpent;
+    const pnlNet = grossQuote - this.P.fixedTxCostQuote;
+    const notional = Math.max(
+      quoteSpent,
+      quoteReceived,
+      Number.isFinite(firstBuyPx ?? 0) ? (firstBuyPx ?? 0) * size : 0,
+      Number.isFinite(lastSellPx ?? 0) ? (lastSellPx ?? 0) * size : 0,
+      size * midRef,
+    );
 
-    const ok = this.validateOpportunity(path, size, buyPx, sellPx, pnl, this.P.fixedTxCostQuote, bpsNet, notional);
+    const buyLegs = quoteDetails.filter((q) => q.side === "buy");
+    const sellLegs = quoteDetails.filter((q) => q.side === "sell");
+    const avg = (arr: PathCandidate["quotes"]) => arr.length
+      ? arr.reduce((sum, q) => sum + (q.price ?? 0), 0) / arr.length
+      : 0;
+    const buyPx = avg(buyLegs) || firstBuyPx || lastBuyPx || midRef;
+    const sellPx = avg(sellLegs) || lastSellPx || firstSellPx || midRef;
+    const bpsGross = notional > 0 ? (grossQuote / notional) * 10_000 : 0;
+    const bpsNet = notional > 0 ? (pnlNet / notional) * 10_000 : 0;
+    const primaryAmm = nodes.find((n) => n.kind === "amm")?.amm;
+    const secondaryAmm = nodes.filter((n) => n.kind === "amm").map((n) => n.amm)[1];
+    const ok = this.validateOpportunity(
+      plan.path,
+      size,
+      buyPx,
+      sellPx,
+      pnlNet,
+      this.P.fixedTxCostQuote,
+      bpsNet,
+      notional,
+      {
+        edgeBpsGross: bpsGross,
+        edgeBpsNet: bpsNet,
+        legs,
+        primaryVenue: primaryAmm?.venue ?? null,
+        secondaryVenue: secondaryAmm?.venue ?? null,
+      }
+    );
 
     const candidatePayload = {
       symbol: this.symbol,
-      path,
-      src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
-      dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
+      path: plan.path,
+      nodes: nodes.map(describeNode),
       size_base: size,
       buy_px: buyPx,
       sell_px: sellPx,
-      buy_quote_source: qBuy.used,
-      sell_quote_source: qSell.used,
-      buy_fee_bps: qBuy.feeBps,
-      sell_fee_bps: qSell.feeBps,
-      buy_meta: qBuy.meta ?? null,
-      sell_meta: qSell.meta ?? null,
-      pnl,
+      buy_quote_source: buyLegs[0]?.used ?? null,
+      sell_quote_source: sellLegs[sellLegs.length - 1]?.used ?? null,
+      buy_fee_bps: buyLegs[0]?.feeBps ?? null,
+      sell_fee_bps: sellLegs[sellLegs.length - 1]?.feeBps ?? null,
+      quote_spent: quoteSpent,
+      quote_received: quoteReceived,
+      pnl: pnlNet,
       fixed_cost: this.P.fixedTxCostQuote,
       edge_bps_gross: bpsGross,
       edge_bps_net: bpsNet,
@@ -1131,73 +1255,89 @@ export class EdgeJoiner {
 
     try { logger.log("candidate_evaluated", candidatePayload); } catch { /* ignore */ }
 
+    if (ok.valid && ok.reason?.startsWith("pnl_mismatch")) {
+      const firstNode = nodes[0];
+      const lastNode = nodes[nodes.length - 1];
+      const srcVenue = firstNode?.kind === "amm" ? firstNode.amm.venue : "phoenix";
+      const dstVenue = lastNode?.kind === "amm" ? lastNode.amm.venue : "phoenix";
+      recordCandidateStat({
+        ts: Date.now(),
+        symbol: this.symbol,
+        path: plan.path,
+        srcVenue,
+        dstVenue,
+        wouldTrade: false,
+        edgeBps: Number.isFinite(bpsNet) ? round(bpsNet, 4) : 0,
+        pnlQuote: Number.isFinite(pnlNet) ? round(pnlNet, 6) : 0,
+        sizeBase: Number.isFinite(size) ? round(size, 9) : 0,
+        reason: ok.reason,
+      });
+    }
+
     if (!ok.valid) {
+      const firstNode = nodes[0];
+      const lastNode = nodes[nodes.length - 1];
+      const srcVenue = firstNode?.kind === "amm" ? firstNode.amm.venue : "phoenix";
+      const dstVenue = lastNode?.kind === "amm" ? lastNode.amm.venue : "phoenix";
+      recordCandidateStat({
+        ts: Date.now(),
+        symbol: this.symbol,
+        path: plan.path,
+        srcVenue,
+        dstVenue,
+        wouldTrade: false,
+        edgeBps: Number.isFinite(bpsNet) ? round(bpsNet, 4) : 0,
+        pnlQuote: Number.isFinite(pnlNet) ? round(pnlNet, 6) : 0,
+        sizeBase: Number.isFinite(size) ? round(size, 9) : 0,
+        reason: ok.reason ?? "validation_failed",
+      });
       logger.log("opportunity_rejected", {
-        path,
-        venue: nodeSrc.kind === "amm" ? nodeSrc.amm.venue : "phx",
+        path: plan.path,
         size,
         buy_px: buyPx,
         sell_px: sellPx,
-        pnl,
+        pnl: pnlNet,
         reason: ok.reason,
-        src_origin: qBuy.used,
-        dst_origin: qSell.used,
-        src_fee_bps: qBuy.feeBps,
-        dst_fee_bps: qSell.feeBps,
-        expected_pnl: pnl,
-        notional_quote: notional,
-      });
-      logPathSkip(ok.reason ?? "validation_failed", {
-        edge_bps_net: bpsNet,
-        expected_pnl: pnl,
-        notional_quote: notional,
+        quotes: quoteDetails.map((q) => ({
+          node: describeNode(q.node),
+          side: q.side,
+          origin: q.used,
+          fee_bps: q.feeBps,
+          price: q.price ?? null,
+        })),
       });
       return null;
     }
-
-    if (path === "AMM->AMM" && !execAmmAmm) {
-      if (trackAmmAmm) {
-        logger.log("amm_amm_tracked", {
-          symbol: this.symbol,
-          src: (nodeSrc as any).amm?.venue ?? "phx",
-          dst: (nodeDst as any).amm?.venue ?? "phx",
-          size_base: round(size, 9),
-          buy_px: round(buyPx),
-          sell_px: round(sellPx),
-          edge_bps_net: round(bpsNet, 4),
-          expected_pnl: round(pnl, 6),
-          note: "not executable in this phase",
-        });
-      }
-      return null;
-    }
-
-    const snapSrc = nodeSrc.kind === "amm" ? nodeSrc.amm : latestAmm;
-    const snapDst = nodeDst.kind === "amm" ? nodeDst.amm : undefined;
-    if (!snapSrc) return null;
 
     return {
-      path,
-      amm: snapSrc,
-      ammDst: snapDst,
+      path: plan.path,
+      nodes,
+      legs,
       size,
       buyPx,
       sellPx,
       bpsGross,
       bpsNet,
-      pnlNet: pnl,
+      pnlNet,
+      pnlGross: grossQuote,
+      quoteSpent,
+      quoteReceived,
+      startAction,
+      primaryAmm,
+      secondaryAmm,
+      quotes: quoteDetails,
     };
   }
-
   private validateOpportunity(
-    path: "AMM->PHX" | "PHX->AMM" | "AMM->AMM",
+    path: string,
     sizeBase: number,
     buyPx: number,
     sellPx: number,
     expectedPnl: number,
     fixedCost: number,
     netBps: number,
-    notional: number
+    notional: number,
+    context?: ValidationDebugContext
   ): { valid: boolean; reason?: string } {
     if (!(buyPx > 0 && sellPx > 0 && sizeBase > 0)) {
       return { valid: false, reason: "invalid_prices_or_size" };
@@ -1228,7 +1368,52 @@ export class EdgeJoiner {
     const pnlDiff = Math.abs(calculatedPnl - expectedPnl);
     const tolerance = Math.max(1e-6, Math.abs(expectedPnl) * 0.001);
     if (pnlDiff > tolerance) {
-      return { valid: false, reason: `pnl_mismatch_${pnlDiff.toFixed(6)}` };
+      const recomputedNetBps = (calculatedPnl / notional) * 10_000;
+      const relDiff = Math.abs(expectedPnl) > 1e-9 ? pnlDiff / Math.abs(expectedPnl) : null;
+      try {
+        const legsSummary = context?.legs?.map((leg) => {
+          if (leg.kind === "amm") {
+            const ammLeg = leg as AmmExecutionLeg;
+            return {
+              kind: leg.kind,
+              venue: ammLeg.venue ?? null,
+              pool: ammLeg.poolId ?? null,
+              label: (ammLeg as any)?.label ?? null,
+            };
+          }
+          if (leg.kind === "phoenix") {
+            const phxLeg = leg as PhoenixExecutionLeg;
+            return { kind: leg.kind, market: phxLeg.market ?? null, side: phxLeg.side ?? null };
+          }
+          return { kind: "unknown" };
+        });
+        logger.log("pnl_mismatch_debug", {
+          symbol: this.symbol,
+          path,
+          size_base: round(sizeBase, 9),
+          edge_bps_gross_pre: round(context?.edgeBpsGross ?? grossSpread, 4),
+          edge_bps_net_pre: round(context?.edgeBpsNet ?? netBps, 4),
+          recomputed_edge_bps: round(recomputedNetBps, 4),
+          expected_pnl_quote: round(expectedPnl, 6),
+          recomputed_pnl_quote: round(calculatedPnl, 6),
+          pnl_diff_abs: round(pnlDiff, 6),
+          pnl_diff_rel: relDiff != null ? round(relDiff, 6) : null,
+          tolerance_abs: round(tolerance, 6),
+          tolerance_formula: "max(1e-6, |expected| * 0.001)",
+          notional_quote: round(notional, 6),
+          fixed_cost_quote: round(fixedCost, 6),
+          legs: legsSummary,
+          venues: {
+            primary: context?.primaryVenue ?? null,
+            secondary: context?.secondaryVenue ?? null,
+          },
+        });
+      } catch { /* logging best-effort */ }
+      const reason = `pnl_mismatch_${pnlDiff.toFixed(6)}`;
+      if (this.C.allowPnlMismatchInSim) {
+        return { valid: true, reason };
+      }
+      return { valid: false, reason };
     }
     const profitBps = (expectedPnl / notional) * 10_000;
     if (profitBps > MAX_REALISTIC_PROFIT_BPS) {
@@ -1497,7 +1682,7 @@ export class EdgeJoiner {
 
   // Node-agnostic quote (PHX or AMM)
   private async quoteNodeAvgPerBase(
-    node: VenueNode,
+    node: RouteNode,
     side: "buy" | "sell",
     sizeBase: number,
     fallbackMid: number
@@ -1580,558 +1765,636 @@ export class EdgeJoiner {
     const ask = (book as any).best_ask;
     if (!(bid > 0 && ask > 0)) return;
 
-    // Filter AMM snapshots by staleness + config allow-list
-    const freshAmms: AmmSnap[] = [];
-    const staleAmms: { snap: AmmSnap; reason: string; skew?: number; ageMs?: number }[] = [];
-    for (const a of this.amms.values()) {
-      const tradeablePreferred = CONFIG_TRADEABLE_BY_VENUE.get(a.venue.toLowerCase());
-      if (tradeablePreferred) {
-        a.tradeableWhenDegraded = true;
-      }
-      const slotLagLimit = resolveSlotLagLimit(a.venue);
-      const fallbackAgeMs = resolveSnapshotAgeLimit(a.venue);
-      const heartbeatGraceMs = resolveHeartbeatGraceMs(a.venue);
-      const bookTtl = this.C.bookTtlMs != null ? Math.max(this.C.bookTtlMs, fallbackAgeMs) : undefined;
+    let decisionSent = false;
 
-      const freshness = checkAmmFreshness(
-        { ts: a.ts, slot: a.slot ?? null, venue: a.venue, ammId: a.ammId },
-        this.phxSlot ?? null,
-        now,
-        slotLagLimit,
-        fallbackAgeMs,
-        bookTtl
-      );
-
-      let snapshot: AmmSnap | null = null;
-      const memoKey = `${a.venue}:${a.ammId}`;
-
-      if (!freshness.ok) {
-        const reason = freshness.reason ?? "stale";
-
-        if (isSoftStaleEligible(a, reason, now, heartbeatGraceMs, Boolean(tradeablePreferred))) {
-          const soft: AmmSnap = { ...a, softStale: true, stale: true, staleReason: reason };
-          snapshot = soft;
-          this.logSoftStale(soft, reason, freshness, now);
+    try {
+      // Filter AMM snapshots by staleness + config allow-list
+      const freshAmms: AmmSnap[] = [];
+      const staleAmms: { snap: AmmSnap; reason: string; skew?: number; ageMs?: number }[] = [];
+      for (const a of this.amms.values()) {
+        const tradeablePreferred = CONFIG_TRADEABLE_BY_VENUE.get(a.venue.toLowerCase());
+        if (tradeablePreferred) {
+          a.tradeableWhenDegraded = true;
+        }
+        const slotLagLimit = resolveSlotLagLimit(a.venue);
+        const fallbackAgeMs = resolveSnapshotAgeLimit(a.venue);
+        const heartbeatGraceMs = resolveHeartbeatGraceMs(a.venue);
+        const bookTtl = this.C.bookTtlMs != null ? Math.max(this.C.bookTtlMs, fallbackAgeMs) : undefined;
+  
+        const freshness = checkAmmFreshness(
+          { ts: a.ts, slot: a.slot ?? null, venue: a.venue, ammId: a.ammId },
+          this.phxSlot ?? null,
+          now,
+          slotLagLimit,
+          fallbackAgeMs,
+          bookTtl
+        );
+  
+        let snapshot: AmmSnap | null = null;
+        const memoKey = `${a.venue}:${a.ammId}`;
+  
+        if (!freshness.ok) {
+          const reason = freshness.reason ?? "stale";
+  
+          if (isSoftStaleEligible(a, reason, now, heartbeatGraceMs, Boolean(tradeablePreferred))) {
+            const soft: AmmSnap = { ...a, softStale: true, stale: true, staleReason: reason };
+            snapshot = soft;
+            this.logSoftStale(soft, reason, freshness, now);
+            this.degradedLogMemo.delete(memoKey);
+            this.ignoredLogMemo.delete(memoKey);
+          } else {
+            const canUseStale = ALLOW_STALE_DECISIONS && (
+              reason.startsWith("slot_skew") ||
+              reason.startsWith("age_ms") ||
+              reason.includes("slot") ||
+              reason.includes("age")
+            );
+  
+            if (canUseStale) {
+              const degraded: AmmSnap = {
+                ...a,
+                degraded: true,
+                degradedReason: reason,
+                stale: true,
+                staleReason: reason,
+                softStale: false,
+              };
+              const last = this.degradedLogMemo.get(memoKey);
+              if (!last || last.reason !== reason || now - last.atMs >= AMM_DEGRADE_LOG_WINDOW_MS) {
+                logger.log("amm_snapshot_degraded", {
+                  venue: degraded.venue,
+                  ammId: degraded.ammId,
+                  reason,
+                  ts: degraded.ts,
+                  slot: degraded.slot ?? null,
+                  phoenix_slot: this.phxSlot ?? null,
+                  slot_skew: freshness.skew,
+                  slot_skew_max: slotLagLimit,
+                  age_ms: freshness.ageMs,
+                  age_limit_ms: fallbackAgeMs,
+                  heartbeat_ms: a.heartbeatAt != null ? Math.max(0, now - (a.heartbeatAt as number)) : null,
+                  ws_age_ms: a.wsAt != null ? Math.max(0, now - (a.wsAt as number)) : null,
+                  synthetic_slot: a.syntheticSlot ?? false,
+                });
+                this.degradedLogMemo.set(memoKey, { reason, atMs: now });
+              }
+              this.softStaleLogMemo.delete(memoKey);
+              snapshot = degraded;
+            } else {
+              const last = this.ignoredLogMemo.get(memoKey);
+              if (!last || last.reason !== reason || now - last.atMs >= AMM_DEGRADE_LOG_WINDOW_MS) {
+                logger.log("amm_snapshot_ignored", {
+                  venue: a.venue,
+                  ammId: a.ammId,
+                  reason,
+                  ts: a.ts,
+                  slot: a.slot ?? null,
+                  phoenix_slot: this.phxSlot ?? null,
+                  slot_skew: freshness.skew,
+                  slot_skew_max: slotLagLimit,
+                  age_ms: freshness.ageMs,
+                  age_limit_ms: fallbackAgeMs,
+                });
+                this.ignoredLogMemo.set(memoKey, { reason, atMs: now });
+              }
+              this.degradedLogMemo.delete(memoKey);
+              this.softStaleLogMemo.delete(memoKey);
+              staleAmms.push({ snap: a, reason, skew: freshness.skew, ageMs: freshness.ageMs });
+              continue;
+            }
+          }
+        } else {
+          const fresh = {
+            ...a,
+            softStale: false,
+            staleReason: null,
+            degraded: false,
+            degradedReason: null,
+            stale: false,
+          } as AmmSnap;
+          snapshot = fresh;
           this.degradedLogMemo.delete(memoKey);
           this.ignoredLogMemo.delete(memoKey);
-        } else {
-          const canUseStale = ALLOW_STALE_DECISIONS && (
-            reason.startsWith("slot_skew") ||
-            reason.startsWith("age_ms") ||
-            reason.includes("slot") ||
-            reason.includes("age")
-          );
-
-          if (canUseStale) {
-            const degraded: AmmSnap = {
-              ...a,
-              degraded: true,
-              degradedReason: reason,
-              stale: true,
-              staleReason: reason,
-              softStale: false,
-            };
-            const last = this.degradedLogMemo.get(memoKey);
-            if (!last || last.reason !== reason || now - last.atMs >= AMM_DEGRADE_LOG_WINDOW_MS) {
-              logger.log("amm_snapshot_degraded", {
-                venue: degraded.venue,
-                ammId: degraded.ammId,
-                reason,
-                ts: degraded.ts,
-                slot: degraded.slot ?? null,
-                phoenix_slot: this.phxSlot ?? null,
-                slot_skew: freshness.skew,
-                slot_skew_max: slotLagLimit,
-                age_ms: freshness.ageMs,
-                age_limit_ms: fallbackAgeMs,
-                heartbeat_ms: a.heartbeatAt != null ? Math.max(0, now - (a.heartbeatAt as number)) : null,
-                ws_age_ms: a.wsAt != null ? Math.max(0, now - (a.wsAt as number)) : null,
-                synthetic_slot: a.syntheticSlot ?? false,
-              });
-              this.degradedLogMemo.set(memoKey, { reason, atMs: now });
-            }
-            this.softStaleLogMemo.delete(memoKey);
-            snapshot = degraded;
-          } else {
-            const last = this.ignoredLogMemo.get(memoKey);
-            if (!last || last.reason !== reason || now - last.atMs >= AMM_DEGRADE_LOG_WINDOW_MS) {
-              logger.log("amm_snapshot_ignored", {
-                venue: a.venue,
-                ammId: a.ammId,
-                reason,
-                ts: a.ts,
-                slot: a.slot ?? null,
-                phoenix_slot: this.phxSlot ?? null,
-                slot_skew: freshness.skew,
-                slot_skew_max: slotLagLimit,
-                age_ms: freshness.ageMs,
-                age_limit_ms: fallbackAgeMs,
-              });
-              this.ignoredLogMemo.set(memoKey, { reason, atMs: now });
-            }
-            this.degradedLogMemo.delete(memoKey);
-            this.softStaleLogMemo.delete(memoKey);
-            staleAmms.push({ snap: a, reason, skew: freshness.skew, ageMs: freshness.ageMs });
-            continue;
-          }
+          this.softStaleLogMemo.delete(memoKey);
         }
-      } else {
-        const fresh = {
-          ...a,
-          softStale: false,
-          staleReason: null,
-          degraded: false,
-          degradedReason: null,
-          stale: false,
-        } as AmmSnap;
-        snapshot = fresh;
-        this.degradedLogMemo.delete(memoKey);
-        this.ignoredLogMemo.delete(memoKey);
-        this.softStaleLogMemo.delete(memoKey);
-      }
-
-      if (!snapshot) continue;
-      if (!snapshot.degraded) {
-        this.degradedLogMemo.delete(memoKey);
-        this.ignoredLogMemo.delete(memoKey);
-      }
-      if (!snapshot.softStale) {
-        this.softStaleLogMemo.delete(memoKey);
-      }
-      if (this.allowedPools.size && !this.allowedPools.has(`${snapshot.venue}:${snapshot.ammId}`)) continue;
-      freshAmms.push(snapshot);
-    }
-    const validAmms: AmmSnap[] = freshAmms;
-
-    if (validAmms.length === 0) {
-      if (now - this.lastWaitLog >= this.P.waitLogMs) {
-        this.lastWaitLog = now;
-        logger.log("edge_waiting", {
-          have_raydium: false,
-          have_orca: false,
-          have_phoenix_mid: !!this.phxMid,
-          have_phoenix_book: !!this.phxBook,
-          reason: staleAmms.length ? "all_amm_snapshots_stale" : "no_amms",
-        });
-      }
-      return;
-    }
-
-    const stateSigParts: string[] = [];
-    if (Number.isFinite(bid) && Number.isFinite(ask)) {
-      stateSigParts.push(`phx:${bid.toFixed(6)}:${ask.toFixed(6)}`);
-    }
-    for (const a of validAmms) {
-      const mid = Number.isFinite(a.px) ? (a.px as number).toFixed(6) : "nan";
-      stateSigParts.push(`${a.venue}:${a.ammId}:${mid}:${a.ts ?? 0}`);
-    }
-    const evalSig = stateSigParts.join("|");
-    const bucketMs = Math.max(50, this.C.decisionBucketMs ?? 0);
-    let deltaBps = Number.POSITIVE_INFINITY;
-    if (this.lastEvalContext) {
-      const prev = this.lastEvalContext;
-      deltaBps = 0;
-      if (prev.bid > 0 && bid > 0) deltaBps = Math.max(deltaBps, Math.abs(bid / prev.bid - 1) * 10_000);
-      if (prev.ask > 0 && ask > 0) deltaBps = Math.max(deltaBps, Math.abs(ask / prev.ask - 1) * 10_000);
-      for (const a of validAmms) {
-        const key = `${a.venue}:${a.ammId}`;
-        const prevMid = prev.amms[key];
-        if (prevMid > 0 && a.px > 0) {
-          deltaBps = Math.max(deltaBps, Math.abs((a.px as number) / prevMid - 1) * 10_000);
+  
+        if (!snapshot) continue;
+        if (!snapshot.degraded) {
+          this.degradedLogMemo.delete(memoKey);
+          this.ignoredLogMemo.delete(memoKey);
         }
+        if (!snapshot.softStale) {
+          this.softStaleLogMemo.delete(memoKey);
+        }
+        if (this.allowedPools.size && !this.allowedPools.has(`${snapshot.venue}:${snapshot.ammId}`)) continue;
+        freshAmms.push(snapshot);
       }
-    }
-    if (this.lastEvalSig === evalSig && now - this.lastEvalAt < bucketMs) {
-      if (deltaBps !== Number.POSITIVE_INFINITY && deltaBps < MIN_PRICE_DELTA_BPS) {
+      const validAmms: AmmSnap[] = freshAmms;
+  
+      if (validAmms.length === 0) {
+        if (now - this.lastWaitLog >= this.P.waitLogMs) {
+          this.lastWaitLog = now;
+          logger.log("edge_waiting", {
+            have_raydium: false,
+            have_orca: false,
+            have_phoenix_mid: !!this.phxMid,
+            have_phoenix_book: !!this.phxBook,
+            reason: staleAmms.length ? "all_amm_snapshots_stale" : "no_amms",
+          });
+        }
         return;
       }
-    }
-    if (this.isRateLimited()) {
-      if (now - this.lastRateLimitLog >= this.P.waitLogMs) {
-        this.lastRateLimitLog = now;
-        logger.log("joiner_rate_limited_skip", { wait_ms: this.rateLimitedUntil - now });
+  
+      const stateSigParts: string[] = [];
+      if (Number.isFinite(bid) && Number.isFinite(ask)) {
+        stateSigParts.push(`phx:${bid.toFixed(6)}:${ask.toFixed(6)}`);
       }
-      return;
-    }
-    this.lastEvalSig = evalSig;
-    this.lastEvalAt = now;
-    this.lastEvalContext = {
-      bid,
-      ask,
-      amms: Object.fromEntries(validAmms.map((a) => [`${a.venue}:${a.ammId}`, Number(a.px ?? 0)])),
-    };
-
-    this.dlmmQuoteMemo.clear();
-
-    // Emit a single edge_report snapshot (Phoenix vs latest valid AMM mid)
-    const latestAmm = validAmms.slice().sort((a, b) => b.ts - a.ts)[0];
-    const ammPx = latestAmm?.px ?? (bid + ask) / 2;
-
-    const toPhoenixSellBps = (ammPx / bid - 1) * 10_000;
-    const toPhoenixBuyBps = (ask / ammPx - 1) * 10_000;
-    const absBps = Math.max(Math.abs(toPhoenixSellBps), Math.abs(toPhoenixBuyBps));
-    if (absBps >= this.P.minAbsBps) {
-      const payload = {
-        symbol: this.symbol,
-        amm_mid: Number(ammPx.toFixed(6)),
-        amm_mid_str: ammPx.toFixed(9),
-        phoenix_bid: Number(bid.toFixed(6)),
-        phoenix_bid_str: bid.toFixed(9),
-        phoenix_ask: Number(ask.toFixed(6)),
-        phoenix_ask_str: ask.toFixed(9),
-        phoenix_mid: Number(((bid + ask) / 2).toFixed(6)),
-        phoenix_source: "book",
-        toPhoenixSellBps: Number(toPhoenixSellBps.toFixed(4)),
-        toPhoenixBuyBps: Number(toPhoenixBuyBps.toFixed(4)),
-        absBps: Number(absBps.toFixed(4)),
-        validation_passed: true,
-        phoenix_book_method: (book as any).book_method ?? "unknown",
+      for (const a of validAmms) {
+        const mid = Number.isFinite(a.px) ? (a.px as number).toFixed(6) : "nan";
+        stateSigParts.push(`${a.venue}:${a.ammId}:${mid}:${a.ts ?? 0}`);
+      }
+      const evalSig = stateSigParts.join("|");
+      const bucketMs = Math.max(50, this.C.decisionBucketMs ?? 0);
+      let deltaBps = Number.POSITIVE_INFINITY;
+      if (this.lastEvalContext) {
+        const prev = this.lastEvalContext;
+        deltaBps = 0;
+        if (prev.bid > 0 && bid > 0) deltaBps = Math.max(deltaBps, Math.abs(bid / prev.bid - 1) * 10_000);
+        if (prev.ask > 0 && ask > 0) deltaBps = Math.max(deltaBps, Math.abs(ask / prev.ask - 1) * 10_000);
+        for (const a of validAmms) {
+          const key = `${a.venue}:${a.ammId}`;
+          const prevMid = prev.amms[key];
+          if (prevMid > 0 && a.px > 0) {
+            deltaBps = Math.max(deltaBps, Math.abs((a.px as number) / prevMid - 1) * 10_000);
+          }
+        }
+      }
+      if (this.lastEvalSig === evalSig && now - this.lastEvalAt < bucketMs) {
+        if (deltaBps !== Number.POSITIVE_INFINITY && deltaBps < MIN_PRICE_DELTA_BPS) {
+          return;
+        }
+      }
+      if (this.isRateLimited()) {
+        if (now - this.lastRateLimitLog >= this.P.waitLogMs) {
+          this.lastRateLimitLog = now;
+          logger.log("joiner_rate_limited_skip", { wait_ms: this.rateLimitedUntil - now });
+        }
+        return;
+      }
+      this.lastEvalSig = evalSig;
+      this.lastEvalAt = now;
+      this.lastEvalContext = {
+        bid,
+        ask,
+        amms: Object.fromEntries(validAmms.map((a) => [`${a.venue}:${a.ammId}`, Number(a.px ?? 0)])),
       };
-      const sig = JSON.stringify(payload);
-      if (sig !== this.lastSig) { logger.log("edge_report", payload); this.lastSig = sig; }
-    }
-
-    // Build L2 for optimizer (if available) — may be unused but harmless
-    let bookOpt: SizePhoenixBook | undefined;
-    if (Array.isArray((this.phxBook as any)?.levels_bids) && Array.isArray((this.phxBook as any)?.levels_asks)) {
-      const bids = ((this.phxBook as any).levels_bids as DepthSide[]).filter(l => l && l.px > 0 && l.qty > 0).map(l => ({ px: l.px, qtyBase: l.qty }));
-      const asks = ((this.phxBook as any).levels_asks as DepthSide[]).filter(l => l && l.px > 0 && l.qty > 0).map(l => ({ px: l.px, qtyBase: l.qty }));
-      if (bids.length && asks.length) bookOpt = { bids, asks, takerFeeBps: this.P.phoenixFeeBps };
-    }
-
-    // ── Unified 2-leg path enumerator (PHX<->AMM and AMM<->AMM) ─────────────
-    const includeDualPhoenix = envTrue("ENABLE_AMM_PHX", true);
-    const phoenixNodes: VenueNode[] = includeDualPhoenix
-      ? [
-        { kind: "phx", id: "phoenix_buy", feeBps: this.P.phoenixFeeBps },
-        { kind: "phx", id: "phoenix_sell", feeBps: this.P.phoenixFeeBps },
-      ]
-      : [{ kind: "phx", id: "phoenix", feeBps: this.P.phoenixFeeBps }];
-
-    const ammNodes: VenueNode[] = validAmms.map((a) => ({
-      kind: "amm" as const,
-      id: `${a.venue}:${a.ammId}`,
-      feeBps: a.feeBps,
-      amm: a,
-    }));
-
-    const nodes: VenueNode[] = [...phoenixNodes, ...ammNodes];
-
-    const candidates: PathCandidate[] = [];
-    const trackAmmAmm = envTrue("TRACK_AMM_AMM", true);
-    const execAmmAmm = envTrue("EXECUTE_AMM_AMM", false);
-    const midRef = (bid + ask) / 2;
-    const pathStats: Record<PathCandidate["path"], number> = {
-      "PHX->AMM": 0,
-      "AMM->PHX": 0,
-      "AMM->AMM": 0,
-    };
-    const bestPerPath = new Map<PathCandidate["path"], PathCandidate>();
-
-    const logPathPairs = PATH_PAIR_LOG_ENABLED;
-
-    for (const nodeSrc of nodes) {
-      for (const nodeDst of nodes) {
-        if (nodeSrc === nodeDst) continue;
-        // Skip PHX->PHX (same venue both sides)
-        if (nodeSrc.kind === "phx" && nodeDst.kind === "phx") continue;
-
-        // Path label compatible with rest of pipeline
-        const path: PathCandidate["path"] =
-          nodeSrc.kind === "phx" && nodeDst.kind === "amm" ? "PHX->AMM" :
-            nodeSrc.kind === "amm" && nodeDst.kind === "phx" ? "AMM->PHX" :
-              "AMM->AMM";
-
-        if (path === "AMM->AMM" && !trackAmmAmm && !execAmmAmm) continue;
-
+  
+      this.dlmmQuoteMemo.clear();
+  
+      // Emit a single edge_report snapshot (Phoenix vs latest valid AMM mid)
+      const latestAmm = validAmms.slice().sort((a, b) => b.ts - a.ts)[0];
+      const ammPx = latestAmm?.px ?? (bid + ask) / 2;
+  
+      const toPhoenixSellBps = (ammPx / bid - 1) * 10_000;
+      const toPhoenixBuyBps = (ask / ammPx - 1) * 10_000;
+      const absBps = Math.max(Math.abs(toPhoenixSellBps), Math.abs(toPhoenixBuyBps));
+      if (absBps >= this.P.minAbsBps) {
+        const payload = {
+          symbol: this.symbol,
+          amm_mid: Number(ammPx.toFixed(6)),
+          amm_mid_str: ammPx.toFixed(9),
+          phoenix_bid: Number(bid.toFixed(6)),
+          phoenix_bid_str: bid.toFixed(9),
+          phoenix_ask: Number(ask.toFixed(6)),
+          phoenix_ask_str: ask.toFixed(9),
+          phoenix_mid: Number(((bid + ask) / 2).toFixed(6)),
+          phoenix_source: "book",
+          toPhoenixSellBps: Number(toPhoenixSellBps.toFixed(4)),
+          toPhoenixBuyBps: Number(toPhoenixBuyBps.toFixed(4)),
+          absBps: Number(absBps.toFixed(4)),
+          validation_passed: true,
+          phoenix_book_method: (book as any).book_method ?? "unknown",
+        };
+        const sig = JSON.stringify(payload);
+        if (sig !== this.lastSig) { logger.log("edge_report", payload); this.lastSig = sig; }
+      }
+  
+      // Build L2 for optimizer (if available) — may be unused but harmless
+      let bookOpt: SizePhoenixBook | undefined;
+      if (Array.isArray((this.phxBook as any)?.levels_bids) && Array.isArray((this.phxBook as any)?.levels_asks)) {
+        const bids = ((this.phxBook as any).levels_bids as DepthSide[]).filter(l => l && l.px > 0 && l.qty > 0).map(l => ({ px: l.px, qtyBase: l.qty }));
+        const asks = ((this.phxBook as any).levels_asks as DepthSide[]).filter(l => l && l.px > 0 && l.qty > 0).map(l => ({ px: l.px, qtyBase: l.qty }));
+        if (bids.length && asks.length) bookOpt = { bids, asks, takerFeeBps: this.P.phoenixFeeBps };
+      }
+  
+      // ── Route plan enumeration (Phoenix + AMM legs) ─────────────
+      const enablePhoenixRoutes = envTrue("ENABLE_AMM_PHX", true);
+      const enableMultiHopRoutes = envTrue("ENABLE_MULTI_HOP_ROUTES", false);
+      const routeNodes: RouteNode[] = [];
+  
+      if (enablePhoenixRoutes && this.phoenixMarket) {
+        routeNodes.push({
+          kind: "phx",
+          id: "phoenix",
+          feeBps: this.P.phoenixFeeBps,
+          market: this.phoenixMarket,
+        });
+      }
+  
+      for (const amm of validAmms) {
+        routeNodes.push({
+          kind: "amm",
+          id: `${amm.venue}:${amm.ammId}`,
+          feeBps: amm.feeBps,
+          amm,
+        });
+      }
+  
+      const trackAmmAmm = envTrue("TRACK_AMM_AMM", true);
+      const execAmmAmm = envTrue("EXECUTE_AMM_AMM", false);
+      const includeAmmAmm = trackAmmAmm || execAmmAmm || enableMultiHopRoutes;
+  
+      const maxLegsRaw = Number(envNum("MAX_ROUTE_LEGS") ?? (enableMultiHopRoutes ? 3 : 2));
+      const maxLegs = Math.max(2, Math.min(8, Math.floor(maxLegsRaw)));
+      const routePlans = enumerateRoutePlans(routeNodes, {
+        includeAmmAmm: includeAmmAmm,
+        maxLegs,
+        maxPhoenix: enablePhoenixRoutes && this.phoenixMarket ? 1 : 0,
+      });
+  
+      const candidates: PathCandidate[] = [];
+      const pathStats = new Map<string, number>();
+      const bestPerPath = new Map<string, PathCandidate>();
+      const midRef = (bid + ask) / 2;
+  
+      const logPathPairs = PATH_PAIR_LOG_ENABLED;
+  
+      for (const plan of routePlans) {
+        if (plan.nodes.length < 2) continue;
+        const hasAmmAmmEdge = plan.nodes.some((node, idx) =>
+          node.kind === "amm" && idx + 1 < plan.nodes.length && plan.nodes[idx + 1].kind === "amm"
+        );
+        if (hasAmmAmmEdge && !includeAmmAmm) continue;
+  
         if (logPathPairs) {
           const payload = {
             t: new Date().toISOString(),
             symbol: this.symbol,
-            path,
-            src: nodeSrc.kind === "amm" ? `${nodeSrc.amm.venue}:${nodeSrc.amm.ammId}` : nodeSrc.id,
-            dst: nodeDst.kind === "amm" ? `${nodeDst.amm.venue}:${nodeDst.amm.ammId}` : nodeDst.id,
+            path: plan.path,
+            nodes: plan.nodes.map((node) =>
+              node.kind === "amm" ? `${node.amm.venue}:${node.amm.ammId}` : `phx:${node.market}`
+            ),
           } as const;
           try { logger.log("path_pair_considered", payload); } catch { /* ignore */ }
           appendPathPairLog(payload as unknown as Record<string, unknown>);
         }
-
-        const candidate = await this.evaluatePathCandidate({
-          nodeSrc,
-          nodeDst,
-          path,
-          bid,
-          ask,
-          midRef,
-          trackAmmAmm,
-          execAmmAmm,
-          latestAmm,
-        });
-
-        if (candidate) {
-          pathStats[path] = (pathStats[path] ?? 0) + 1;
-          candidates.push(candidate);
-          const prevBest = bestPerPath.get(path);
-          if (!prevBest || candidate.pnlNet > prevBest.pnlNet) {
-            bestPerPath.set(path, candidate);
+  
+        const candidate = await this.evaluateRoutePlan({ plan, bid, ask, midRef });
+        if (!candidate) continue;
+  
+        if (hasAmmAmmEdge && !execAmmAmm) {
+          if (trackAmmAmm) {
+            logger.log("amm_amm_tracked", {
+              symbol: this.symbol,
+              path: candidate.path,
+              size_base: round(candidate.size, 9),
+              buy_px: round(candidate.buyPx),
+              sell_px: round(candidate.sellPx),
+              edge_bps_net: round(candidate.bpsNet, 4),
+              expected_pnl: round(candidate.pnlNet, 6),
+              note: "not executable in this phase",
+            });
           }
+          continue;
+        }
+  
+        candidates.push(candidate);
+        pathStats.set(candidate.path, (pathStats.get(candidate.path) ?? 0) + 1);
+        const prevBest = bestPerPath.get(candidate.path);
+        if (!prevBest || candidate.pnlNet > prevBest.pnlNet) {
+          bestPerPath.set(candidate.path, candidate);
         }
       }
-    }
-
-    try {
-      const paths: Record<string, unknown> = {};
-      const summarizeCandidate = (path: PathCandidate["path"], cand: PathCandidate | undefined, count: number) => {
-        const key = path === "PHX->AMM"
-          ? "phx_to_amm"
-          : path === "AMM->PHX"
-            ? "amm_to_phx"
-            : "amm_to_amm";
-
-        if (!cand) {
-          paths[key] = { available: false, candidates: count };
-          return;
-        }
-
-        const summary: Record<string, unknown> = {
-          available: true,
-          candidates: count,
-          edge_bps_net: round(cand.bpsNet, 4),
-          pnl_quote: round(cand.pnlNet, 6),
-          size_base: round(cand.size, 9),
-        };
-
-        if (path === "PHX->AMM") {
-          summary.src = "phoenix";
-          summary.dst = `${cand.amm.venue}:${cand.amm.ammId}`;
-        } else if (path === "AMM->PHX") {
-          summary.src = `${cand.amm.venue}:${cand.amm.ammId}`;
-          summary.dst = "phoenix";
-        } else {
-          summary.src = `${cand.amm.venue}:${cand.amm.ammId}`;
-          summary.dst = cand.ammDst ? `${cand.ammDst.venue}:${cand.ammDst.ammId}` : "unknown";
-        }
-
-        paths[key] = summary;
-      };
-
-      summarizeCandidate("PHX->AMM", bestPerPath.get("PHX->AMM"), pathStats["PHX->AMM"] ?? 0);
-      summarizeCandidate("AMM->PHX", bestPerPath.get("AMM->PHX"), pathStats["AMM->PHX"] ?? 0);
-      summarizeCandidate("AMM->AMM", bestPerPath.get("AMM->AMM"), pathStats["AMM->AMM"] ?? 0);
-
-      logger.log("path_best_snapshot", {
-        symbol: this.symbol,
-        ...paths,
-      });
-    } catch {
-      /* ignore logging failures */
-    }
-
-    try {
-      logger.log("path_candidate_counts", {
-        symbol: this.symbol,
-        phx_to_amm: pathStats["PHX->AMM"],
-        amm_to_phx: pathStats["AMM->PHX"],
-        amm_to_amm: pathStats["AMM->AMM"],
-      });
-    } catch {
-      /* ignore logging failures */
-    }
-
-    // Choose the best candidate among all paths
-    const best = candidates.sort((a, b) => b.pnlNet - a.pnlNet)[0];
-    if (!best) {
-      if (this.C.logSimFields) logger.log("would_not_trade", {
-        symbol: this.symbol,
-        reason: "no_profitable_opportunities_found",
-        size_grid_count: 1,
-        validation_enabled: true,
-      });
-      this.onDecision(false, Number.NaN, Number.NaN, undefined);
-      return;
-    }
-
-    // RPC sim (optional) — only for PHX paths
-    const base: any = {
-      symbol: this.symbol,
-      path: best.path,
-      side: best.path === "AMM->PHX" ? "sell" : "buy",
-      amm_venue: best.amm.venue,
-      ...(best.path === "AMM->AMM" ? { amm_dst_venue: best.ammDst?.venue } : {}),
-      trade_size_base: round(best.size, 9),
-      recommended_size_base: round(best.size, 9),
-      threshold_bps: round(this.P.thresholdBps, 4),
-      slippage_bps: round(this.P.flatSlippageBps, 4),
-      phoenix_slippage_bps: round(this.C.phoenixSlippageBps, 4),
-      slippage_mode: this.C.activeSlippageMode,
-      phoenix_source: "book",
-      phoenix_book_method: (book as any).book_method ?? "unknown",
-      phoenix_slot: this.phxSlot ?? null,
-      buy_px: round(best.buyPx),
-      sell_px: round(best.sellPx),
-      edge_bps_net: round(best.bpsNet, 4),
-      expected_pnl: round(best.pnlNet, 6),
-      fees_bps: { phoenix: this.P.phoenixFeeBps, amm: best.amm.feeBps, ...(best.ammDst ? { amm_dst: best.ammDst.feeBps } : {}) },
-      amm_slot: best.amm.slot ?? null,
-      amm_ts: best.amm.ts ?? null,
-      ...(best.ammDst
-        ? {
-          amm_dst_slot: best.ammDst.slot ?? null,
-          amm_dst_ts: best.ammDst.ts ?? null,
-        }
-        : {}),
-      fixed_tx_cost_quote: round(this.P.fixedTxCostQuote, 6),
-      decision_min_base:
-        envNum("DECISION_MIN_BASE") ??
-        this.P.decisionMinBase ??
-        this.C.decisionMinBase ??
-        envNum("SIZEOPT_MIN_BASE") ??
-        this.P.minBase ??
-        this.P.minTradeBase,
-      size_grid_count: 1,
-      validation_enabled: true,
-    };
-
-    const hasRes = !!best.amm.reserves && best.amm.reserves.base > 0 && best.amm.reserves.quote > 0;
-    const ammEffPx = ((): number | undefined => {
-      if (best.amm.venue === "orca") {
-        // already included in buy/sellPx; report impact relative to mid
-        return best.path === "AMM->PHX"
-          ? best.buyPx
-          : best.sellPx;
-      }
-      if (best.path === "AMM->PHX") {
-        return hasRes
-          ? cpmmBuyQuotePerBase(best.amm.reserves!.base, best.amm.reserves!.quote, best.size, best.amm.feeBps)
-          : this.midBuyQuotePerBase(best.amm.px, best.amm.feeBps, this.P.flatSlippageBps);
-      } else if (best.path === "PHX->AMM") {
-        return hasRes
-          ? cpmmSellQuotePerBase(best.amm.reserves!.base, best.amm.reserves!.quote, best.size, best.amm.feeBps)
-          : this.midSellQuotePerBase(best.amm.px, best.amm.feeBps, this.P.flatSlippageBps);
-      } else {
-        return undefined;
-      }
-    })();
-    if (ammEffPx != null) {
-      base.amm_eff_px = round(ammEffPx);
-      base.amm_price_impact_bps = round((ammEffPx / best.amm.px - 1) * 10_000, 4);
-    }
-
-    if (this.C.useRpcSim && this.rpcSim && best.path !== "AMM->AMM" && best.amm.reserves) {
       try {
-        const out = await this.rpcSim({
-          path: best.path as "AMM->PHX" | "PHX->AMM",
-          sizeBase: best.size,
-          ammMid: best.amm.px,
-          reserves: hasRes ? { base: best.amm.reserves.base, quote: best.amm.reserves.quote } : undefined,
-          ammFeeBps: best.amm.feeBps,
-        });
-        if (out) {
-          if (typeof out.rpc_eff_px === "number" && Number.isFinite(out.rpc_eff_px)) base.rpc_eff_px = round(out.rpc_eff_px);
-          if (typeof out.rpc_price_impact_bps === "number" && Number.isFinite(out.rpc_price_impact_bps)) base.rpc_price_impact_bps = round(out.rpc_price_impact_bps, 4);
-          if (typeof out.rpc_sim_ms === "number" && out.rpc_sim_ms >= 0) base.rpc_sim_ms = out.rpc_sim_ms;
-          if (typeof out.rpc_sim_mode === "string") base.rpc_sim_mode = out.rpc_sim_mode;
-          if (typeof out.rpc_qty_out === "number" && Number.isFinite(out.rpc_qty_out)) base.rpc_qty_out = round(out.rpc_qty_out, 9);
-          if (typeof out.rpc_units === "number" && Number.isFinite(out.rpc_units)) { base.rpc_units = out.rpc_units; base.compute_units = out.rpc_units; }
-          if (typeof out.prioritization_fee === "number" && Number.isFinite(out.prioritization_fee)) base.prioritization_fee = out.prioritization_fee;
-          this.onRpcSample?.({ ms: (out.rpc_sim_ms ?? 0), blocked: false });
+        const summary: Record<string, unknown> = {};
+        const extra: Record<string, unknown> = {};
+        for (const [pathKey, count] of pathStats.entries()) {
+          const best = bestPerPath.get(pathKey);
+          const payload = best
+            ? {
+              available: true,
+              candidates: count,
+              edge_bps_net: round(best.bpsNet, 4),
+              pnl_quote: round(best.pnlNet, 6),
+              size_base: round(best.size, 9),
+              legs: best.legs.length,
+            }
+            : { available: false, candidates: count };
+          const alias =
+            pathKey === "PHX->AMM"
+              ? "phx_to_amm"
+              : pathKey === "AMM->PHX"
+                ? "amm_to_phx"
+                : pathKey === "AMM->AMM"
+                  ? "amm_to_amm"
+                  : null;
+          if (alias) summary[alias] = payload;
+          else extra[pathKey] = payload;
         }
-      } catch (e: any) {
-        base.rpc_sim_error = String(e?.message ?? e);
+        if (Object.keys(extra).length) summary.multi = extra;
+        logger.log("path_best_snapshot", {
+          symbol: this.symbol,
+          ...summary,
+        });
+      } catch {
+        /* ignore logging failures */
       }
-    }
-
-    const rpcEff = (base as any).rpc_eff_px;
-    if (rpcEff != null && Number.isFinite(rpcEff) && base.amm_eff_px != null) {
-      const delta_bps = Math.abs((rpcEff / base.amm_eff_px - 1) * 10_000);
-      const RPC_TOL_BPS = Number(process.env.RPC_SIM_TOL_BPS ?? 2);
-      if (delta_bps > RPC_TOL_BPS) {
-        base.rpc_deviation_bps = round(delta_bps, 4);
-        base.guard_deviation_bps = round(delta_bps, 4);
-        base.guard_blocked = true;
-        this.onRpcSample?.({ ms: (base as any).rpc_sim_ms ?? 0, blocked: true });
-        logger.log("would_not_trade", { ...base, reason: `rpc deviation > ${RPC_TOL_BPS} bps` });
-        this.onDecision(false, best.bpsNet, best.pnlNet, undefined);
+  
+      try {
+        logger.log("path_candidate_counts", {
+          symbol: this.symbol,
+          counts: Object.fromEntries(pathStats),
+        });
+      } catch {
+        /* ignore logging failures */
+      }
+  
+      // Choose the best candidate among all paths
+      const sortedCandidates = [...candidates].sort((a, b) => b.pnlNet - a.pnlNet);
+      const bestOverall = sortedCandidates[0];
+      if (!bestOverall) {
+        if (this.C.logSimFields) logger.log("would_not_trade", {
+          symbol: this.symbol,
+          reason: "no_profitable_opportunities_found",
+          size_grid_count: 1,
+          validation_enabled: true,
+        });
+        decisionSent = true;
+        this.onDecision(false, Number.NaN, Number.NaN, undefined);
         return;
       }
-      base.guard_deviation_bps = round(delta_bps, 4);
-      base.guard_blocked = false;
-      this.onRpcSample?.({ ms: (base as any).rpc_sim_ms ?? 0, blocked: false });
-    }
-
-    const safetyBps = Number(process.env.PNL_SAFETY_BPS ?? "0") || 0;
-    const wantBps = this.P.thresholdBps + safetyBps;
-    const wouldTrade = best.bpsNet >= wantBps && best.pnlNet > 0;
-
-    if (wouldTrade) {
-      const notionalQuote = best.size * ((best.buyPx + best.sellPx) / 2);
-      noteDecision(notionalQuote);
-      logger.log("would_trade", { ...base, safety_bps: round(safetyBps, 4), reason: "profitable_opportunity_validated" });
-    } else {
-      const reason =
-        best.pnlNet <= 0
-          ? "negative expected pnl after fees/slippage at s*"
-          : `edge below threshold+safety (net_bps=${round(best.bpsNet, 4)} < ${wantBps})`;
-      logger.log("would_not_trade", { ...base, safety_bps: round(safetyBps, 4), reason });
-    }
-
-    // Decision callback (includes AMM->AMM details if present)
-    this.onDecision(wouldTrade, best.bpsNet, best.pnlNet, {
-      path: best.path,
-      side: best.path === "AMM->PHX" ? "sell" : "buy",
-      buy_px: round(best.buyPx),
-      sell_px: round(best.sellPx),
-      recommended_size_base: best.size,
-      amm_venue: best.amm.venue,
-      amm_pool_id: best.amm.ammId,
-      amm_meta: { poolKind: best.amm.poolKind, feeBps: best.amm.feeBps, slot: best.amm.slot ?? null, ts: best.amm.ts },
-      ...(best.path === "AMM->AMM"
-        ? {
-          amm_dst_venue: best.ammDst?.venue,
-          amm_dst_pool_id: best.ammDst?.ammId,
-          amm_dst_meta: best.ammDst
-            ? { poolKind: best.ammDst.poolKind, feeBps: best.ammDst.feeBps, slot: best.ammDst.slot ?? null, ts: best.ammDst.ts }
-            : undefined,
-        }
-        : {}),
-    });
-
-    // Feature emission — ONLY for PHX paths (compat with 1-arg and 2-arg emitFeature signatures)
-    if (best.path === "AMM->PHX" || best.path === "PHX->AMM") {
-      const featPayload = featureFromEdgeAndDecision(
-        {
-          symbol: this.symbol,
-          amm_base_reserve: best.amm.reserves?.base,
-          amm_quote_reserve: best.amm.reserves?.quote,
-          amm_base_decimals: best.amm.reserves?.baseDecimals,
-          amm_quote_decimals: best.amm.reserves?.quoteDecimals,
-          phoenix_source: "book",
-          phoenix_book_method: (book as any).book_method,
-          book_ttl_ms: this.C.bookTtlMs,
-        },
-        {
-          path: best.path as "AMM->PHX" | "PHX->AMM",
-          side: best.path === "AMM->PHX" ? "sell" : "buy",
-          edge_bps_gross: round(best.bpsGross, 4),
-          buy_px: round(best.buyPx),
-          sell_px: round(best.sellPx),
-          expected_pnl: round(best.pnlNet, 6),
-          threshold_bps: this.P.thresholdBps,
-          slippage_bps: this.P.flatSlippageBps,
-          trade_size_base: best.size,
-          would_trade: wouldTrade,
-        }
-      );
-
-      // Arity-flexible call so TS is happy whether emitFeature expects (payload) or (topic, payload)
-      const ef: any = emitFeature as any;
+      const safetyBps = Number(process.env.PNL_SAFETY_BPS ?? "0") || 0;
+      const wantBps = this.P.thresholdBps + safetyBps;
+      const bestValidCandidate = sortedCandidates.find((cand) => cand.pnlNet > 0 && cand.bpsNet >= wantBps);
+      const maxNetBps = sortedCandidates.reduce((max, cand) => Math.max(max, cand.bpsNet), Number.NEGATIVE_INFINITY);
       try {
-        if (typeof ef === "function") {
-          if (ef.length >= 2) ef("edge_feature", featPayload);
-          else ef(featPayload);
+        logger.log("best_valid_candidate_debug", {
+          symbol: this.symbol,
+          total_candidates: sortedCandidates.length,
+          valid_candidates_count: sortedCandidates.filter((cand) => cand.pnlNet > 0 && cand.bpsNet >= wantBps).length,
+          want_bps: round(wantBps, 4),
+          max_net_bps_in_cycle: Number.isFinite(maxNetBps) ? round(maxNetBps, 4) : null,
+          had_candidate: Boolean(bestValidCandidate),
+        });
+      } catch { /* ignore logging failures */ }
+      const best = bestValidCandidate ?? bestOverall;
+  
+      // RPC sim (optional) — only for PHX paths
+      const ammLegs = best.legs.filter((leg): leg is AmmExecutionLeg => leg.kind === "amm");
+      const primaryAmmLeg = ammLegs[0] ?? null;
+      const secondaryAmmLeg = ammLegs[1] ?? null;
+      const primaryAmm = best.primaryAmm ?? null;
+      const secondaryAmm = best.secondaryAmm ?? null;
+      const phoenixLeg = best.legs.find((leg): leg is PhoenixExecutionLeg => leg.kind === "phoenix") ?? null;
+  
+      const decisionSide = phoenixLeg
+        ? phoenixLeg.side
+        : primaryAmmLeg
+          ? (primaryAmmLeg.direction === "quoteToBase" ? "buy" : "sell")
+          : (best.startAction === "sell" ? "sell" : "buy");
+  
+      const base: any = {
+        symbol: this.symbol,
+        path: best.path,
+        side: decisionSide,
+        trade_size_base: round(best.size, 9),
+        recommended_size_base: round(best.size, 9),
+        threshold_bps: round(this.P.thresholdBps, 4),
+        slippage_bps: round(this.P.flatSlippageBps, 4),
+        phoenix_slippage_bps: round(this.C.phoenixSlippageBps, 4),
+        slippage_mode: this.C.activeSlippageMode,
+        phoenix_source: "book",
+        phoenix_book_method: (book as any).book_method ?? "unknown",
+        phoenix_slot: this.phxSlot ?? null,
+        buy_px: round(best.buyPx),
+        sell_px: round(best.sellPx),
+        edge_bps_net: round(best.bpsNet, 4),
+        expected_pnl: round(best.pnlNet, 6),
+        fixed_tx_cost_quote: round(this.P.fixedTxCostQuote, 6),
+        decision_min_base:
+          envNum("DECISION_MIN_BASE") ??
+          this.P.decisionMinBase ??
+          this.C.decisionMinBase ??
+          envNum("SIZEOPT_MIN_BASE") ??
+          this.P.minBase ??
+          this.P.minTradeBase,
+        size_grid_count: 1,
+        validation_enabled: true,
+        legs: best.legs,
+      };
+  
+      const feeSummary: Record<string, number> = {};
+      if (phoenixLeg) feeSummary.phoenix = this.P.phoenixFeeBps;
+      if (primaryAmm) feeSummary.amm = primaryAmm.feeBps;
+      if (secondaryAmm) feeSummary.amm_dst = secondaryAmm.feeBps;
+      base.fees_bps = feeSummary;
+  
+      if (primaryAmm) {
+        base.amm_venue = primaryAmm.venue;
+        base.amm_pool_id = primaryAmm.ammId;
+        base.amm_meta = {
+          poolKind: primaryAmm.poolKind,
+          feeBps: primaryAmm.feeBps,
+          slot: primaryAmm.slot ?? null,
+          ts: primaryAmm.ts ?? null,
+        };
+        base.amm = { pool: primaryAmm.ammId, venue: primaryAmm.venue, meta: base.amm_meta };
+        base.amm_slot = primaryAmm.slot ?? null;
+        base.amm_ts = primaryAmm.ts ?? null;
+      }
+  
+      if (secondaryAmm) {
+        base.amm_dst_venue = secondaryAmm.venue;
+        base.amm_dst_pool_id = secondaryAmm.ammId;
+        base.amm_dst_meta = {
+          poolKind: secondaryAmm.poolKind,
+          feeBps: secondaryAmm.feeBps,
+          slot: secondaryAmm.slot ?? null,
+          ts: secondaryAmm.ts ?? null,
+        };
+        base.amm_dst = { pool: secondaryAmm.ammId, venue: secondaryAmm.venue, meta: base.amm_dst_meta };
+      }
+  
+      const hasRes = !!primaryAmm && primaryAmm.reserves && primaryAmm.reserves.base > 0 && primaryAmm.reserves.quote > 0;
+      const ammEffPx = ((): number | undefined => {
+        if (!primaryAmm || !primaryAmmLeg) return undefined;
+        if (primaryAmm.venue === "orca") {
+          return primaryAmmLeg.direction === "quoteToBase" ? best.buyPx : best.sellPx;
         }
-      } catch {
-        /* noop */
+        const pxFallback = Number.isFinite(primaryAmm.px) ? primaryAmm.px : midRef;
+        if (primaryAmmLeg.direction === "quoteToBase") {
+          return hasRes
+            ? cpmmBuyQuotePerBase(primaryAmm.reserves!.base, primaryAmm.reserves!.quote, best.size, primaryAmm.feeBps)
+            : this.midBuyQuotePerBase(pxFallback, primaryAmm.feeBps, this.P.flatSlippageBps);
+        }
+        return hasRes
+          ? cpmmSellQuotePerBase(primaryAmm.reserves!.base, primaryAmm.reserves!.quote, best.size, primaryAmm.feeBps)
+          : this.midSellQuotePerBase(pxFallback, primaryAmm.feeBps, this.P.flatSlippageBps);
+      });
+  
+      const rpcEff = (base as any).rpc_eff_px;
+      if (rpcEff != null && Number.isFinite(rpcEff) && base.amm_eff_px != null) {
+        const delta_bps = Math.abs((rpcEff / base.amm_eff_px - 1) * 10_000);
+        const RPC_TOL_BPS = Number(process.env.RPC_SIM_TOL_BPS ?? 2);
+        if (delta_bps > RPC_TOL_BPS) {
+          base.rpc_deviation_bps = round(delta_bps, 4);
+          base.guard_deviation_bps = round(delta_bps, 4);
+          base.guard_blocked = true;
+          this.onRpcSample?.({ ms: (base as any).rpc_sim_ms ?? 0, blocked: true });
+          logger.log("would_not_trade", { ...base, reason: `rpc deviation > ${RPC_TOL_BPS} bps` });
+          decisionSent = true;
+          this.onDecision(false, best.bpsNet, best.pnlNet, undefined);
+          return;
+        }
+        base.guard_deviation_bps = round(delta_bps, 4);
+        base.guard_blocked = false;
+        this.onRpcSample?.({ ms: (base as any).rpc_sim_ms ?? 0, blocked: false });
+      }
+  
+      const wouldTrade = Boolean(bestValidCandidate);
+  
+      let decisionReason: string;
+      const reasonPnlMismatch = false;
+      const reasonRpcDeviation = base.guard_blocked ? "rpc_deviation_block" : undefined;
+  
+      decisionReason = "would_trade";
+      if (wouldTrade) {
+        const notionalQuote = best.size * ((best.buyPx + best.sellPx) / 2);
+        noteDecision(notionalQuote);
+        logger.log("would_trade", { ...base, safety_bps: round(safetyBps, 4), reason: "would_trade" });
+      } else {
+        if (reasonRpcDeviation) {
+          decisionReason = reasonRpcDeviation;
+        } else if (best.pnlNet <= 0) {
+          decisionReason = "negative_expected_pnl";
+        } else if (best.bpsNet < wantBps) {
+          decisionReason = "edge_below_threshold";
+        } else if (reasonPnlMismatch) {
+          decisionReason = "pnl_mismatch";
+        } else {
+          decisionReason = "no_valid_candidate";
+        }
+        logger.log("would_not_trade", { ...base, safety_bps: round(safetyBps, 4), reason: decisionReason });
+      }
+  
+      const legVenue = (leg: ExecutionLeg): string => leg.kind === "phoenix" ? "phoenix" : leg.venue;
+      const firstLeg = best.legs[0] ?? null;
+      const lastLeg = best.legs[best.legs.length - 1] ?? null;
+      const srcVenue = firstLeg ? legVenue(firstLeg) : (primaryAmm?.venue ?? "unknown");
+      const dstVenue = lastLeg ? legVenue(lastLeg) : undefined;
+  
+      recordCandidateStat({
+        ts: Date.now(),
+        symbol: this.symbol,
+        path: best.path,
+        srcVenue,
+        dstVenue,
+        wouldTrade,
+        edgeBps: round(best.bpsNet, 4),
+        pnlQuote: round(best.pnlNet, 6),
+        sizeBase: best.size,
+        reason: decisionReason,
+      });
+  
+      const decisionDetails: DecisionHookDetails = {
+        path: best.path,
+        side: decisionSide,
+        buy_px: round(best.buyPx),
+        sell_px: round(best.sellPx),
+        recommended_size_base: best.size,
+        edge_bps_gross: round(best.bpsGross, 4),
+        edge_bps_net: round(best.bpsNet, 4),
+        expected_pnl_quote: round(best.pnlNet, 6),
+        decision_reason: decisionReason,
+        legs: best.legs,
+      };
+      if (primaryAmm) {
+        decisionDetails.amm_venue = primaryAmm.venue;
+        decisionDetails.amm_pool_id = primaryAmm.ammId;
+        decisionDetails.amm_meta = {
+          poolKind: primaryAmm.poolKind,
+          feeBps: primaryAmm.feeBps,
+          slot: primaryAmm.slot ?? null,
+          ts: primaryAmm.ts,
+        };
+      }
+      if (secondaryAmm) {
+        decisionDetails.amm_dst_venue = secondaryAmm.venue;
+        decisionDetails.amm_dst_pool_id = secondaryAmm.ammId;
+        decisionDetails.amm_dst_meta = {
+          poolKind: secondaryAmm.poolKind,
+          feeBps: secondaryAmm.feeBps,
+          slot: secondaryAmm.slot ?? null,
+          ts: secondaryAmm.ts,
+        };
+      }
+  
+      // Decision callback (includes AMM->AMM details if present)
+      decisionSent = true;
+      this.onDecision(wouldTrade, best.bpsNet, best.pnlNet, decisionDetails);
+  
+      // Feature emission — ONLY for PHX paths (compat with 1-arg and 2-arg emitFeature signatures)
+      if (phoenixLeg && primaryAmm && (best.path === "AMM->PHX" || best.path === "PHX->AMM")) {
+        const featPayload = featureFromEdgeAndDecision(
+          {
+            symbol: this.symbol,
+            amm_base_reserve: primaryAmm.reserves?.base,
+            amm_quote_reserve: primaryAmm.reserves?.quote,
+            amm_base_decimals: primaryAmm.reserves?.baseDecimals,
+            amm_quote_decimals: primaryAmm.reserves?.quoteDecimals,
+            phoenix_source: "book",
+            phoenix_book_method: (book as any).book_method,
+            book_ttl_ms: this.C.bookTtlMs,
+          },
+          {
+            path: best.path as "AMM->PHX" | "PHX->AMM",
+            side: phoenixLeg.side,
+            edge_bps_gross: round(best.bpsGross, 4),
+            buy_px: round(best.buyPx),
+            sell_px: round(best.sellPx),
+            expected_pnl: round(best.pnlNet, 6),
+            threshold_bps: this.P.thresholdBps,
+            slippage_bps: this.P.flatSlippageBps,
+            trade_size_base: best.size,
+            would_trade: wouldTrade,
+          }
+        );
+  
+        // Arity-flexible call so TS is happy whether emitFeature expects (payload) or (topic, payload)
+        const ef: any = emitFeature as any;
+        try {
+          if (typeof ef === "function") {
+            if (ef.length >= 2) ef("edge_feature", featPayload);
+            else ef(featPayload);
+          }
+        } catch {
+          /* noop */
+        }
+      }
+    } catch (err) {
+      logger.log("decision_cycle_error", {
+        symbol: this.symbol,
+        err: String((err as any)?.stack ?? err),
+        stage: "maybeReport",
+      });
+    } finally {
+      if (!decisionSent) {
+        try {
+          this.onDecision(false, Number.NaN, Number.NaN, undefined);
+          decisionSent = true;
+        } catch {
+          /* swallow */
+        }
       }
     }
   }

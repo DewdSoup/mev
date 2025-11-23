@@ -9,6 +9,8 @@ type HeartbeatMetric = {
     lastWsMs?: number;
     lastSource?: string;
     synthetic?: boolean;
+    wsUrl?: string;
+    endpointLabel?: string;
 };
 
 const heartbeatMap = new Map<string, HeartbeatMetric>();
@@ -33,6 +35,8 @@ export function recordHeartbeatMetric(input: {
     wsAt?: number | null;
     source?: string | null;
     synthetic?: boolean;
+    wsUrl?: string | null;
+    endpointLabel?: string | null;
 }): void {
     const key = `${input.venue}:${input.poolId}`;
     const existing = heartbeatMap.get(key) ?? { venue: input.venue, poolId: input.poolId };
@@ -48,6 +52,12 @@ export function recordHeartbeatMetric(input: {
     if (typeof input.synthetic === "boolean") {
         existing.synthetic = input.synthetic;
     }
+    if (typeof input.wsUrl === "string" && input.wsUrl) {
+        existing.wsUrl = input.wsUrl;
+    }
+    if (typeof input.endpointLabel === "string" && input.endpointLabel) {
+        existing.endpointLabel = input.endpointLabel;
+    }
     heartbeatMap.set(key, existing);
 }
 
@@ -60,6 +70,8 @@ export function summarizeHeartbeatByVenue(now = Date.now()): {
         heartbeat_age_ms_avg: number | null;
         ws_age_ms_max: number | null;
         ws_age_ms_avg: number | null;
+        ws_endpoints?: string[];
+        ws_endpoint_labels?: string[];
     }>;
     pools: HeartbeatMetric[];
 } {
@@ -69,6 +81,8 @@ export function summarizeHeartbeatByVenue(now = Date.now()): {
         missingHeartbeat: number;
         heartbeatAges: number[];
         wsAges: number[];
+        wsUrls: Set<string>;
+        wsEndpointLabels: Set<string>;
     }>();
 
     const pools: HeartbeatMetric[] = [];
@@ -79,7 +93,15 @@ export function summarizeHeartbeatByVenue(now = Date.now()): {
 
         let bucket = venueAccum.get(metric.venue);
         if (!bucket) {
-            bucket = { pools: 0, withHeartbeat: 0, missingHeartbeat: 0, heartbeatAges: [], wsAges: [] };
+            bucket = {
+                pools: 0,
+                withHeartbeat: 0,
+                missingHeartbeat: 0,
+                heartbeatAges: [],
+                wsAges: [],
+                wsUrls: new Set<string>(),
+                wsEndpointLabels: new Set<string>(),
+            };
             venueAccum.set(metric.venue, bucket);
         }
 
@@ -91,6 +113,8 @@ export function summarizeHeartbeatByVenue(now = Date.now()): {
             bucket.missingHeartbeat += 1;
         }
         if (wsAge != null) bucket.wsAges.push(wsAge);
+        if (metric.wsUrl) bucket.wsUrls.add(metric.wsUrl);
+        if (metric.endpointLabel) bucket.wsEndpointLabels.add(metric.endpointLabel);
 
         pools.push({ ...metric });
     }
@@ -103,6 +127,8 @@ export function summarizeHeartbeatByVenue(now = Date.now()): {
         heartbeat_age_ms_avg: number | null;
         ws_age_ms_max: number | null;
         ws_age_ms_avg: number | null;
+        ws_endpoints?: string[];
+        ws_endpoint_labels?: string[];
     }> = {};
 
     for (const [venue, bucket] of venueAccum.entries()) {
@@ -123,6 +149,8 @@ export function summarizeHeartbeatByVenue(now = Date.now()): {
             heartbeat_age_ms_avg: hbAvg,
             ws_age_ms_max: wsMax,
             ws_age_ms_avg: wsAvg,
+            ws_endpoints: bucket.wsUrls.size ? Array.from(bucket.wsUrls) : undefined,
+            ws_endpoint_labels: bucket.wsEndpointLabels.size ? Array.from(bucket.wsEndpointLabels) : undefined,
         };
     }
 

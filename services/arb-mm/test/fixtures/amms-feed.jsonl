@@ -1,0 +1,2 @@
+{"event":"amms_price","ts":1760689200000,"venue":"raydium","ammId":"58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2","poolKind":"cpmm","px":188.0,"baseDecimals":9,"quoteDecimals":6,"base_int":"5000000000000","quote_int":"940000000000","feeBps":25,"symbol":"SOL/USDC","slot":100}
+{"event":"amms_price","ts":1760689200100,"venue":"raydium","ammId":"58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2","poolKind":"cpmm","px":187.0,"baseDecimals":9,"quoteDecimals":6,"base_int":"5000000000000","quote_int":"935000000000","feeBps":25,"symbol":"SOL/USDC","slot":101}

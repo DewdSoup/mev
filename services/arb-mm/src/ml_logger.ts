@@ -5,7 +5,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { logger as base } from "@mev/storage";
+import { getRunRoot, logger as base } from "@mev/storage";
 import { writeMlEvent } from "./ml_events.js";
 
 // local, file-safe timestamp (YYYYMMDDTHHMMSSmmmZ → sans colons)
@@ -34,6 +34,29 @@ const SESSION_LOGS_DIR = sessionDirHint
 
 const SESSION_FILE = path.join(SESSION_LOGS_DIR, `${SESSION_ID}.events.jsonl`);
 
+// Optional structured WS logs (accepted by logger.log via structural typing)
+export type WsLogEvent =
+  | {
+    type: "ws_subscription";
+    source: string;
+    venue: string;
+    marketOrPoolKey?: string;
+    ws_url?: string;
+    event?: string;
+    label?: string;
+    ts?: number | string;
+  }
+  | {
+    type: "ws_connection_state";
+    source: string;
+    venue: string;
+    marketOrPoolKey?: string;
+    ws_url?: string;
+    event: string;
+    ts?: number | string;
+    error_message?: string;
+  };
+
 // ─────────────────────────────────────────────────────────────────────────────
 // small io helpers
 function getBool(k: string, d = false) {
@@ -53,6 +76,93 @@ function appendJsonl(obj: any) {
   } catch { }
 }
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ── Tx execution JSONL (per-run) ─────────────────────────────────────────────
+export type TxExecPhase = "attempt" | "sim_start" | "sim_ok" | "sim_err";
+
+export interface TxExecEvent {
+  ts?: number;
+  attempt_id: string;
+  phase: TxExecPhase;
+  exec_mode?: string;
+  path_label?: string;
+  venue_src?: string;
+  venue_dst?: string;
+  pool_src?: string;
+  pool_dst?: string;
+  size_base?: number;
+  size_quote?: number;
+  notional_quote?: number;
+  expected_pnl_quote?: number;
+  edge_bps?: number;
+  net_bps?: number;
+  sim_ok?: boolean;
+  sim_err_type?: string;
+  sim_err_message?: string;
+  units_consumed?: number | null;
+  logs_tail?: string[] | null;
+  sim_err_raw?: string;
+}
+
+const TX_EXEC_FILE = path.join(getRunRoot(), "tx-exec.jsonl");
+let txExecStream: fs.WriteStream | null = null;
+let txExecClosed = false;
+
+function ensureTxExecStream(): fs.WriteStream | null {
+  if (txExecClosed) return null;
+  if (txExecStream) return txExecStream;
+  try {
+    ensureDir(path.dirname(TX_EXEC_FILE));
+    txExecStream = fs.createWriteStream(TX_EXEC_FILE, { flags: "a" });
+  } catch {
+    txExecStream = null;
+  }
+  return txExecStream;
+}
+
+function closeTxExecStream() {
+  txExecClosed = true;
+  try { txExecStream?.end(); } catch { /* ignore */ }
+  txExecStream = null;
+}
+
+process.once("beforeExit", closeTxExecStream);
+process.once("SIGINT", closeTxExecStream);
+process.once("SIGTERM", closeTxExecStream);
+
+function normalizeLogsTail(logs: any, limit = 10): string[] | undefined {
+  if (!Array.isArray(logs)) return undefined;
+  const norm = logs
+    .map((line) => (typeof line === "string" ? line : JSON.stringify(line)))
+    .filter((line) => line && line.length > 0);
+  if (!norm.length) return undefined;
+  return norm.slice(-limit);
+}
+
+function capString(raw: string | undefined, max = 2000): string | undefined {
+  if (!raw) return undefined;
+  return raw.length > max ? `${raw.slice(0, max)}...` : raw;
+}
+
+export function logTxExecEvent(ev: TxExecEvent) {
+  const stream = ensureTxExecStream();
+  if (!stream) return;
+  const rec: TxExecEvent = {
+    ...ev,
+    ts: ev.ts ?? Date.now(),
+  };
+  if (ev.logs_tail !== undefined) {
+    rec.logs_tail = normalizeLogsTail(ev.logs_tail) ?? null;
+  }
+  if (ev.sim_err_raw) {
+    rec.sim_err_raw = capString(ev.sim_err_raw);
+  }
+  try {
+    stream.write(JSON.stringify(rec) + "\n");
+  } catch {
+    /* swallow write errors */
+  }
+}
 
 type Stats = {
   considered: number;

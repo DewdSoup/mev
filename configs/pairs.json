@@ -17,8 +17,8 @@
           "feeBps": 25,
           "freshness": {
             "slotLagSlots": 25,
-            "maxAgeMs": 20000,
-            "heartbeatGraceMs": 20000
+            "maxAgeMs": 9000,
+            "heartbeatGraceMs": 12000
           }
         },
         {
@@ -28,8 +28,8 @@
           "feeBps": 400,
           "freshness": {
             "slotLagSlots": 25,
-            "maxAgeMs": 20000,
-            "heartbeatGraceMs": 20000
+            "maxAgeMs": 9000,
+            "heartbeatGraceMs": 12000
           }
         },
         {
@@ -39,8 +39,8 @@
           "feeBps": 200,
           "freshness": {
             "slotLagSlots": 25,
-            "maxAgeMs": 20000,
-            "heartbeatGraceMs": 20000
+            "maxAgeMs": 9000,
+            "heartbeatGraceMs": 12000
           }
         },
         {
@@ -50,8 +50,8 @@
           "feeBps": 100,
           "freshness": {
             "slotLagSlots": 25,
-            "maxAgeMs": 20000,
-            "heartbeatGraceMs": 20000
+            "maxAgeMs": 9000,
+            "heartbeatGraceMs": 12000
           }
         },
         {
@@ -61,8 +61,8 @@
           "feeBps": 100,
           "freshness": {
             "slotLagSlots": 25,
-            "maxAgeMs": 20000,
-            "heartbeatGraceMs": 20000
+            "maxAgeMs": 9000,
+            "heartbeatGraceMs": 12000
           }
         },
         {
@@ -73,8 +73,8 @@
           "enabled": false,
           "freshness": {
             "slotLagSlots": 25,
-            "maxAgeMs": 20000,
-            "heartbeatGraceMs": 20000
+            "maxAgeMs": 9000,
+            "heartbeatGraceMs": 12000
           }
         },
         {
@@ -84,8 +84,8 @@
           "feeBps": 4,
           "freshness": {
             "slotLagSlots": 40,
-            "maxAgeMs": 25000,
-            "heartbeatGraceMs": 25000
+            "maxAgeMs": 10000,
+            "heartbeatGraceMs": 13000
           }
         },
         {
@@ -95,8 +95,8 @@
           "feeBps": 2,
           "freshness": {
             "slotLagSlots": 40,
-            "maxAgeMs": 25000,
-            "heartbeatGraceMs": 25000
+            "maxAgeMs": 10000,
+            "heartbeatGraceMs": 13000
           }
         },
         {
@@ -106,8 +106,8 @@
           "feeBps": 5,
           "freshness": {
             "slotLagSlots": 40,
-            "maxAgeMs": 25000,
-            "heartbeatGraceMs": 25000
+            "maxAgeMs": 10000,
+            "heartbeatGraceMs": 13000
           }
         },
         {
@@ -117,8 +117,8 @@
           "feeBps": 30,
           "freshness": {
             "slotLagSlots": 40,
-            "maxAgeMs": 25000,
-            "heartbeatGraceMs": 25000
+            "maxAgeMs": 10000,
+            "heartbeatGraceMs": 13000
           }
         },
         {
@@ -126,60 +126,53 @@
           "id": "BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y",
           "poolKind": "dlmm",
           "feeBps": 10,
-          "freshness": {
-            "slotLagSlots": 80,
-            "maxAgeMs": 60000,
-            "heartbeatGraceMs": 30000,
-            "tradeableWhenDegraded": true
-          }
+          "enabled": false
         },
         {
           "kind": "meteora",
           "id": "BVRbyLjjfSBcoyiYFuxbgKYnWuiFaF9CSXEa5vdSZ9Hh",
           "poolKind": "dlmm",
           "feeBps": 20,
-          "freshness": {
-            "slotLagSlots": 80,
-            "maxAgeMs": 60000,
-            "heartbeatGraceMs": 30000,
-            "tradeableWhenDegraded": true
-          }
+          "enabled": false
         },
         {
           "kind": "meteora",
           "id": "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6",
           "poolKind": "dlmm",
           "feeBps": 4,
-          "freshness": {
-            "slotLagSlots": 80,
-            "maxAgeMs": 60000,
-            "heartbeatGraceMs": 30000,
-            "tradeableWhenDegraded": true
-          }
+          "enabled": false
         },
         {
           "kind": "meteora",
           "id": "HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR",
           "poolKind": "dlmm",
           "feeBps": 1,
-          "freshness": {
-            "slotLagSlots": 80,
-            "maxAgeMs": 60000,
-            "heartbeatGraceMs": 30000,
-            "tradeableWhenDegraded": true
-          }
+          "enabled": false
         },
         {
           "kind": "meteora",
           "id": "CgqwPLSFfht89pF5RSKGUUMFj5zRxoUt4861w2SkXaqY",
           "poolKind": "dlmm",
           "feeBps": 5,
-          "freshness": {
-            "slotLagSlots": 80,
-            "maxAgeMs": 60000,
-            "heartbeatGraceMs": 30000,
-            "tradeableWhenDegraded": true
-          }
+          "enabled": false
+        },
+        {
+          "kind": "lifinity",
+          "id": "86eq4kdBkUCHGdCC2SfcqGHRCBGhp2M89aCmuvvxaXsm",
+          "poolKind": "cpmm",
+          "feeBps": 13,
+          "baseDecimals": 9,
+          "quoteDecimals": 6,
+          "enabled": false
+        },
+        {
+          "kind": "lifinity",
+          "id": "DrRd8gYMJu9XGxLhwTCPdHNLXCKHsxJtMpbn62YqmwQe",
+          "poolKind": "cpmm",
+          "feeBps": 13,
+          "baseDecimals": 9,
+          "quoteDecimals": 6,
+          "enabled": false
         }
       ]
     }

@@ -13,7 +13,7 @@ import { fileURLToPath } from "url";
 import * as dotenv from "dotenv";
 import { PublicKey, Keypair } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
-import { logger } from "@mev/storage";
+import { logger, logTxExecEvent } from "./ml_logger.js";
 
 import {
     EdgeJoiner,
@@ -31,8 +31,10 @@ import { tryAssertRaydiumFeeBps } from "./util/raydium.js";
 import { PublisherSupervisor } from "./publishers/supervisor.js";
 import { prewarmPhoenix } from "./util/phoenix.js";
 import { loadPairsFromEnvOrDefault, type PairSpec } from "./registry/pairs.js";
+import type { ExecutionLeg } from "./types/execution.js";
 import { MarketStateProvider } from "./market/index.js";
 import { rpcClient, rpc } from "@mev/rpc-facade";
+import { getPoolTuning, getVenueTuning } from "./config/venues.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -54,6 +56,11 @@ const __dirname = path.dirname(__filename);
     process.env.SHADOW_TRADING = "0";
     process.env.__ENV_LIVE_LOCKED = "1";
 })();
+
+const EXEC_MODE = String(process.env.EXEC_MODE ?? "SIM_ONLY").trim().toUpperCase();
+const SIM_ALLOW_PNL_MISMATCH =
+    String(process.env.SIM_ALLOW_PNL_MISMATCH ?? "0").trim().toLowerCase() === "1" ||
+    String(process.env.SIM_ALLOW_PNL_MISMATCH ?? "0").trim().toLowerCase() === "true";
 
 const ewma = (prev: number, x: number, a = 0.1) =>
     (!Number.isFinite(prev) || prev <= 0 ? Math.round(x) : Math.round(prev + (x - prev) * a));
@@ -124,10 +131,15 @@ class PairPipeline {
     private rpcMsP50 = 0;
     private rpcMsP95 = 0;
     private rpcBlocked = 0;
+    private attemptCounter = 0;
 
     private ammVenueByPool = new Map<string, { venue: string; poolKind?: string; feeBps?: number; baseMint: string; quoteMint: string }>();
     private _ammFeeBps: number;
     private _phxFeeBps: number;
+
+    private nextAttemptId() {
+        return `att_${Date.now().toString(36)}_${(this.attemptCounter++).toString(36)}`;
+    }
 
     constructor(
         private pair: PairSpec,
@@ -138,8 +150,16 @@ class PairPipeline {
     ) {
         const enableRaydiumClmm = String(process.env.ENABLE_RAYDIUM_CLMM ?? "1").trim() !== "0";
 
-        // Resolve fees (pair overrides -> JSON/ENV -> defaults)
-        const ammFeeInit = this.resolveFeeBps("AMM", pair.ammPool, cfg.AMM_TAKER_FEE_BPS);
+        const primaryVenueName = String(pair.adapters?.amm ?? pair.ammVenues?.[0]?.venue ?? "raydium").toLowerCase();
+        const primaryVenueDefaults = getVenueTuning(primaryVenueName) ?? {};
+        const primaryPoolDefaults = getPoolTuning(pair.ammPool) ?? {};
+
+        const venueFeeHint = typeof primaryPoolDefaults.feeBps === "number"
+            ? primaryPoolDefaults.feeBps
+            : primaryVenueDefaults.feeBps;
+
+        // Resolve fees (structured config -> pair overrides -> JSON/ENV -> defaults)
+        const ammFeeInit = this.resolveFeeBps("AMM", pair.ammPool, venueFeeHint ?? cfg.AMM_TAKER_FEE_BPS);
         const phxFeeInit = this.resolveFeeBps("PHOENIX", pair.phoenixMarket, cfg.PHOENIX_TAKER_FEE_BPS);
         this._ammFeeBps = ammFeeInit;
         this._phxFeeBps = phxFeeInit;
@@ -159,20 +179,37 @@ class PairPipeline {
             const poolId = String(venue.poolId ?? "").trim();
             if (!poolId) continue;
             if (!this.ammVenueByPool.has(poolId)) {
+                const venueName = String(venue.venue ?? pair.adapters?.amm ?? "raydium").toLowerCase();
+                const poolDefaults = getPoolTuning(poolId) ?? {};
+                const venueDefaults = getVenueTuning(venueName) ?? {};
+                const feeHint = typeof venue.feeBps === "number"
+                    ? venue.feeBps
+                    : typeof poolDefaults.feeBps === "number"
+                        ? poolDefaults.feeBps
+                        : venueDefaults.feeBps;
+
                 this.ammVenueByPool.set(poolId, {
-                    venue: String(venue.venue ?? pair.adapters?.amm ?? "raydium").toLowerCase(),
+                    venue: venueName,
                     poolKind: venue.poolKind,
-                    feeBps: venue.feeBps,
+                    feeBps: typeof feeHint === "number" ? feeHint : undefined,
                     baseMint: pair.baseMint,
                     quoteMint: pair.quoteMint,
                 });
             }
         }
         if (!this.ammVenueByPool.has(pair.ammPool)) {
+            const fallbackVenueName = String(pair.adapters?.amm ?? "raydium").toLowerCase();
+            const fallbackDefaults = getVenueTuning(fallbackVenueName) ?? {};
+            const fallbackPoolDefaults = getPoolTuning(pair.ammPool) ?? {};
+            const fallbackFeeHint = typeof fallbackPoolDefaults.feeBps === "number"
+                ? fallbackPoolDefaults.feeBps
+                : fallbackDefaults.feeBps;
+
             this.ammVenueByPool.set(pair.ammPool, {
-                venue: String(pair.adapters?.amm ?? "raydium").toLowerCase(),
+                venue: fallbackVenueName,
                 baseMint: pair.baseMint,
                 quoteMint: pair.quoteMint,
+                feeBps: typeof fallbackFeeHint === "number" ? fallbackFeeHint : undefined,
             });
         }
 
@@ -202,6 +239,7 @@ class PairPipeline {
                 useRpcSim: this.cfg.USE_RPC_SIM,
                 // Expose here as well in case joiner reads it from options bag
                 decisionMinBase: pair.sizing?.decisionMinBase ?? this.cfg.DECISION_MIN_BASE,
+                allowPnlMismatchInSim: EXEC_MODE === "SIM_ONLY" && SIM_ALLOW_PNL_MISMATCH,
             },
             this._onDecision,
             undefined as RpcSimFn | undefined, // executor handles tx-level sim; joiner doesn't need it
@@ -240,32 +278,95 @@ class PairPipeline {
     };
 
     private _onDecision: DecisionHook = (wouldTrade, _edgeNetBps, _expectedPnl, d) => {
-        if (!d) return;
+        console.log("MULTIPAIR_ONDECISION_MARKER", Date.now(), EXEC_MODE, Boolean(d));
+        const edgeNetBps = Number(_edgeNetBps ?? 0);
+        const expPnl = Number(_expectedPnl ?? 0);
+        const attemptId = this.nextAttemptId();
+        const hadDecision = Boolean(d);
+        const baseReason = hadDecision
+            ? ((d as any)?.decision_reason ?? "unknown")
+            : "no_candidate_details";
+        try {
+            logger.log("opportunity_debug_marker", {
+                attempt_id: attemptId,
+                exec_mode: EXEC_MODE,
+                had_decision: hadDecision,
+                reason: baseReason,
+            });
+        } catch { /* ignore */ }
+
+        if (!d) {
+            try {
+                logger.log("opportunity_blocked", {
+                    attempt_id: attemptId,
+                    exec_mode: EXEC_MODE,
+                    reason: "no_candidate_details",
+                    edge_bps_gross: null,
+                    edge_bps_net: null,
+                    expected_pnl_quote: null,
+                });
+            } catch { /* ignore */ }
+            return;
+        }
+
+        const legs = Array.isArray((d as any)?.legs) ? ((d as any).legs as ExecutionLeg[]) : [];
+        const phoenixLeg = legs.find((leg) => leg.kind === "phoenix") as any;
+        const firstAmmLeg = legs.find((leg) => leg.kind === "amm") as any;
+        const sizeBase = d.recommended_size_base && d.recommended_size_base > 0
+            ? d.recommended_size_base
+            : (Number(process.env.LIVE_SIZE_BASE ?? 0) || this.cfg.TRADE_SIZE_BASE);
+        const notional = coalesceRound(6, sizeBase * ((d.buy_px + d.sell_px) / 2));
+        const threshold = Number(this.cfg.TRADE_THRESHOLD_BPS ?? 0);
+        const minNetProfitBps = Number(process.env.MIN_NET_PROFIT_BPS ?? this.cfg.MIN_NET_PROFIT_BPS ?? NaN);
+        const minProfitableBps = Number(process.env.MIN_PROFITABLE_BPS ?? this.cfg.MIN_PROFITABLE_BPS ?? NaN);
+        const pnlSafetyBps = Number(process.env.PNL_SAFETY_BPS ?? 0);
+        const edgeGrossBps = (d as any)?.edge_bps_gross != null ? Number(roundN((d as any).edge_bps_gross, 4)) : undefined;
+        const decisionReason = (d as any)?.decision_reason ?? (expPnl <= 0 ? "negative_expected_pnl" : undefined);
+
+        const logBlocked = (reason: string) => {
+            try {
+                logger.log("opportunity_blocked", {
+                    attempt_id: attemptId,
+                    exec_mode: EXEC_MODE,
+                    path: d.path,
+                    size_base: roundN(sizeBase, 6),
+                    expected_pnl_quote: Number(roundN(expPnl, 6)),
+                    edge_net_bps: Number(roundN(edgeNetBps, 4)),
+                    edge_gross_bps: edgeGrossBps,
+                    thresholds: {
+                        trade_threshold_bps: threshold,
+                        min_net_profit_bps: Number.isFinite(minNetProfitBps) ? minNetProfitBps : undefined,
+                        min_profitable_bps: Number.isFinite(minProfitableBps) ? minProfitableBps : undefined,
+                        pnl_safety_bps: pnlSafetyBps,
+                    },
+                    reason,
+                });
+            } catch { /* ignore */ }
+        };
 
         // Allowed path gate (optional)
         const ALLOWED = String(process.env.EXEC_ALLOWED_PATH ?? "both");
-        if (ALLOWED !== "both" && d.path && d.path !== ALLOWED) return;
+        if (ALLOWED !== "both" && d?.path && d.path !== ALLOWED) {
+            logBlocked("path_filtered");
+            return;
+        }
 
-        // Final EV gate handled by joiner; only execute when wouldTrade=true
-        if (!wouldTrade) return;
+        // Final EV gate handled by joiner; emit blocked when wouldTrade=false
+        if (!wouldTrade) {
+            logBlocked(decisionReason ?? "edge_below_threshold");
+            return;
+        }
 
-        const sizeBase =
-            (d.recommended_size_base && d.recommended_size_base > 0
-                ? d.recommended_size_base
-                : (Number(process.env.LIVE_SIZE_BASE ?? 0) || this.cfg.TRADE_SIZE_BASE));
-
-        const notional = coalesceRound(6, sizeBase * ((d.buy_px + d.sell_px) / 2));
-
-        const srcPoolId = d.amm_pool_id ?? this.pair.ammPool;
-        const srcVenue = String(d.amm_venue ?? this.ammVenueByPool.get(srcPoolId)?.venue ?? this.pair.adapters?.amm ?? "raydium").toLowerCase();
-        const srcMeta = (d as any).amm_meta ?? this.ammVenueByPool.get(srcPoolId);
+        const srcPoolId = d?.amm_pool_id ?? firstAmmLeg?.poolId ?? this.pair.ammPool;
+        const srcVenue = String(d?.amm_venue ?? firstAmmLeg?.venue ?? this.ammVenueByPool.get(srcPoolId)?.venue ?? this.pair.adapters?.amm ?? "raydium").toLowerCase();
+        const srcMeta = d ? (d as any).amm_meta ?? this.ammVenueByPool.get(srcPoolId) : this.ammVenueByPool.get(srcPoolId);
 
         const payload: any = {
-            path: d.path,
+            path: d?.path ?? "unknown",
             size_base: sizeBase,
-            buy_px: d.buy_px,
-            sell_px: d.sell_px,
-            notional_quote: notional,
+            buy_px: d?.buy_px,
+            sell_px: d?.sell_px,
+            notional_quote: d ? notional : undefined,
             atomic: true,
             pair: this.pair.id,
             amm_venue: srcVenue,
@@ -274,22 +375,69 @@ class PairPipeline {
             amm_meta: srcMeta,
             base_mint: this.pair.baseMint,
             quote_mint: this.pair.quoteMint,
+            legs,
         };
 
-        if (d.path === "AMM->AMM") {
-            if (d.amm_dst_pool_id) {
+        if (d?.path === "AMM->AMM") {
+            if (d?.amm_dst_pool_id) {
                 const dstVenue = String(d.amm_dst_venue ?? this.ammVenueByPool.get(d.amm_dst_pool_id)?.venue ?? "raydium").toLowerCase();
                 const dstMeta = (d as any).amm_dst_meta ?? this.ammVenueByPool.get(d.amm_dst_pool_id);
                 payload.amm_dst = { pool: d.amm_dst_pool_id, venue: dstVenue, meta: dstMeta };
                 payload.amm_dst_meta = dstMeta;
             }
         } else {
+            const phoenixSide = (phoenixLeg?.side ?? d?.side) as "buy" | "sell";
             payload.phoenix = {
                 market: this.pair.phoenixMarket,
-                side: d.side as "buy" | "sell",
-                limit_px: d.side === "buy" ? d.buy_px : d.sell_px,
+                side: phoenixSide,
+                limit_px: phoenixSide === "buy" ? d?.buy_px : d?.sell_px,
             };
         }
+
+        const attemptMeta = {
+            attempt_id: attemptId,
+            exec_mode: EXEC_MODE,
+            path: payload.path,
+            size_base: roundN(sizeBase, 6),
+            expected_pnl_quote: Number(roundN(expPnl, 6)),
+            edge_bps: Number(roundN(edgeNetBps, 4)),
+            edge_gross_bps: edgeGrossBps,
+            amm_venue: payload.amm_venue,
+            amm_pool_id: payload.amm_pool_id,
+            notional_quote: Number(roundN(notional, 6)),
+            legs: legs.length,
+        };
+        try { logger.log("opportunity_attempt", attemptMeta); } catch { /* ignore */ }
+        try {
+            const pathLabelRaw = (payload.path ?? "").toLowerCase();
+            const pathLabel = pathLabelRaw === "phx->amm"
+                ? "phx_amm"
+                : pathLabelRaw === "amm->phx"
+                    ? "amm_phx"
+                    : pathLabelRaw === "amm->amm"
+                        ? "amm_amm"
+                        : pathLabelRaw.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || undefined;
+            logTxExecEvent({
+                phase: "attempt",
+                attempt_id: attemptId,
+                exec_mode: EXEC_MODE,
+                path_label: pathLabel,
+                venue_src: srcVenue,
+                venue_dst: payload.phoenix ? "phoenix" : payload.amm_dst?.venue,
+                pool_src: srcPoolId,
+                pool_dst: payload.amm_dst?.pool,
+                size_base: roundN(sizeBase, 6),
+                notional_quote: Number(roundN(notional, 6)),
+                expected_pnl_quote: Number(roundN(expPnl, 6)),
+                edge_bps: edgeGrossBps ?? Number(roundN(edgeNetBps, 4)),
+                net_bps: Number(roundN(edgeNetBps, 4)),
+            });
+        } catch { /* ignore */ }
+
+        payload.attempt_id = attemptId;
+        payload.expected_pnl_quote = expPnl;
+        payload.edge_bps = edgeNetBps;
+        payload.exec_mode = EXEC_MODE;
 
         if (this.liveExec) (this.liveExec as any)?.maybeExecute?.(payload);
     };
@@ -316,6 +464,16 @@ async function main() {
         ].join("  ")
     );
     logger.log("arb-multipair boot", { rpc: maskUrl(RPC), pairs: PAIRS.map(p => p.id) });
+    logger.log("pair_pipeline_venues", {
+        pairs: PAIRS.map((p) => ({
+            id: p.id,
+            venues: (p.ammVenues ?? []).map(v => ({
+                kind: v.venue,
+                id: v.poolId,
+                enabled: v.enabled !== false,
+            })),
+        })),
+    });
 
     // Embedded publishers (optional; same as single-process live)
     const providerEnabled = String(process.env.ENABLE_MARKET_PROVIDER ?? "0") === "1";
@@ -402,6 +560,10 @@ async function main() {
     await initSessionRecorder(conn, (accounts as any).owner, CFG);
     const payer: Keypair = (accounts as any).owner as Keypair;
     const exec = new LiveExecutor(conn, payer);
+    logger.log("executor_fee_payer", {
+        source: "arb-mm",
+        fee_payer: payer.publicKey.toBase58(),
+    });
     await (exec as any).startPhoenix?.();
 
     // Prewarm phoenix caches for all markets

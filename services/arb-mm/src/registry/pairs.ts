@@ -10,6 +10,8 @@ export type PairAmmVenue = {
     poolId: string;
     poolKind?: string;
     feeBps?: number;
+    baseDecimals?: number;
+    quoteDecimals?: number;
     enabled?: boolean;
     freshness?: {
         slotLagSlots?: number;
@@ -66,66 +68,149 @@ function readJsonMaybe(absPath: string): any | undefined {
     }
 }
 
-function normalizePairsJson(raw: any): PairSpec[] | undefined {
-    const arr = Array.isArray(raw?.pairs) ? raw.pairs : Array.isArray(raw) ? raw : undefined;
-    if (!arr || !arr.length) return undefined;
+const NON_EMPTY_STRING = (value: unknown): string | null => {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed : null;
+};
 
-    const out: PairSpec[] = [];
-    for (const entry of arr) {
-        if (!entry) continue;
-        const baseMint = String(entry.baseMint ?? "").trim();
-        const quoteMint = String(entry.quoteMint ?? "").trim();
-        const phoenixMarket = String(entry.phoenixMarket ?? entry.phoenix?.market ?? "").trim();
-        const venues: PairAmmVenue[] = [];
-        const venusArr = Array.isArray(entry.venues) ? entry.venues : [];
-        for (const v of venusArr) {
-            if (!v || String(v.kind ?? "").toLowerCase() === "phoenix") continue;
-            const poolId = String(v.id ?? v.poolId ?? "").trim();
-            if (!poolId) continue;
-            const rawFreshness = typeof v.freshness === "object" && v.freshness !== null ? v.freshness as Record<string, unknown> : undefined;
-            let freshness: PairAmmVenue["freshness"] | undefined;
-            if (rawFreshness) {
-                const slotLag = Number(rawFreshness.slotLag ?? rawFreshness.slotLagSlots ?? rawFreshness.slot_lag ?? rawFreshness.slot_lag_slots);
-                const maxAge = Number(rawFreshness.maxAgeMs ?? rawFreshness.max_age_ms);
-                const heartbeatGrace = Number(rawFreshness.heartbeatGraceMs ?? rawFreshness.heartbeat_grace_ms ?? rawFreshness.heartbeatMs ?? rawFreshness.heartbeat_ms);
-                const tradeable = rawFreshness.tradeableWhenDegraded ?? rawFreshness.tradeable_when_degraded;
-                const tmp: PairAmmVenue["freshness"] = {};
-                if (Number.isFinite(slotLag) && Number(slotLag) > 0) tmp.slotLagSlots = Number(slotLag);
-                if (Number.isFinite(maxAge) && Number(maxAge) > 0) tmp.maxAgeMs = Number(maxAge);
-                if (Number.isFinite(heartbeatGrace) && Number(heartbeatGrace) > 0) tmp.heartbeatGraceMs = Number(heartbeatGrace);
-                if (typeof tradeable === "boolean") tmp.tradeableWhenDegraded = tradeable;
-                if (Object.keys(tmp).length) freshness = tmp;
-            }
-            venues.push({
-                venue: String(v.kind ?? v.venue ?? "").toLowerCase(),
-                poolId,
-                poolKind: typeof v.poolKind === "string" ? v.poolKind : typeof v.pool_kind === "string" ? v.pool_kind : undefined,
-                feeBps: typeof v.feeBps === "number" ? v.feeBps : typeof v.fee_bps === "number" ? v.fee_bps : undefined,
-                enabled: typeof v.enabled === "boolean" ? v.enabled : undefined,
-                freshness,
-            });
-        }
+function formatErrors(source: string, errors: string[]): never {
+    const header = `[pairs.json] invalid configuration (${source})`;
+    const body = errors.map((e) => ` - ${e}`).join("\n");
+    throw new Error(`${header}\n${body}`);
+}
 
-        const primary = venues[0];
-        if (!baseMint || !quoteMint || !phoenixMarket || !primary) continue;
+function normalizeFreshness(raw: any): PairAmmVenue["freshness"] | undefined {
+    if (!raw || typeof raw !== "object") return undefined;
+    const slotLag = Number(
+        (raw as any).slotLag ??
+        (raw as any).slotLagSlots ??
+        (raw as any).slot_lag ??
+        (raw as any).slot_lag_slots
+    );
+    const maxAge = Number(
+        (raw as any).maxAgeMs ??
+        (raw as any).max_age_ms
+    );
+    const heartbeat = Number(
+        (raw as any).heartbeatGraceMs ??
+        (raw as any).heartbeat_grace_ms ??
+        (raw as any).heartbeatMs ??
+        (raw as any).heartbeat_ms
+    );
+    const tradeable = (raw as any).tradeableWhenDegraded ?? (raw as any).tradeable_when_degraded;
+    const out: PairAmmVenue["freshness"] = {};
+    if (Number.isFinite(slotLag) && slotLag > 0) out.slotLagSlots = Number(slotLag);
+    if (Number.isFinite(maxAge) && maxAge > 0) out.maxAgeMs = Number(maxAge);
+    if (Number.isFinite(heartbeat) && heartbeat > 0) out.heartbeatGraceMs = Number(heartbeat);
+    if (typeof tradeable === "boolean") out.tradeableWhenDegraded = tradeable;
+    return Object.keys(out).length ? out : undefined;
+}
 
-        const id = String(entry.id ?? entry.symbol ?? `${phoenixMarket}:${primary.poolId}`);
-        const symbol = String(entry.symbol ?? id).trim();
-        out.push({
-            id,
-            symbol,
-            baseMint,
-            quoteMint,
-            phoenixMarket,
-            ammPool: primary.poolId,
-            ammVenues: venues,
-            fees: entry.fees,
-            sizing: entry.sizing,
-            adapters: { amm: primary.venue, phoenix: "phoenix" },
-        });
+export function parsePairsConfig(raw: unknown, source = "configs/pairs.json"): PairSpec[] {
+    const arr = Array.isArray((raw as any)?.pairs) ? (raw as any).pairs : Array.isArray(raw) ? raw : null;
+    if (!arr) {
+        throw new Error(`[pairs.json] ${source} must be an array or an object with a "pairs" array`);
     }
 
-    return out.length ? out : undefined;
+    const errors: string[] = [];
+    const out: PairSpec[] = [];
+
+    arr.forEach((entry: any, index: number) => {
+        const ctx = `${source}[${index}]`;
+        if (!entry || typeof entry !== "object") {
+            errors.push(`${ctx} must be an object`);
+            return;
+        }
+
+        const baseMint = NON_EMPTY_STRING((entry as any).baseMint);
+        if (!baseMint) errors.push(`${ctx}.baseMint must be a non-empty string`);
+
+        const quoteMint = NON_EMPTY_STRING((entry as any).quoteMint);
+        if (!quoteMint) errors.push(`${ctx}.quoteMint must be a non-empty string`);
+
+        const phoenixMarket =
+            NON_EMPTY_STRING((entry as any).phoenixMarket) ??
+            NON_EMPTY_STRING((entry as any)?.phoenix?.market);
+        if (!phoenixMarket) errors.push(`${ctx}.phoenixMarket must be a non-empty string (phoenix.market allowed)`);
+
+        const venuesRaw = Array.isArray((entry as any).venues) ? (entry as any).venues : [];
+        if (!venuesRaw.length) {
+            errors.push(`${ctx}.venues must contain at least one venue entry`);
+            return;
+        }
+
+        const venues: PairAmmVenue[] = [];
+        venuesRaw.forEach((venueRaw: any, vIndex: number) => {
+            const vCtx = `${ctx}.venues[${vIndex}]`;
+            if (!venueRaw || typeof venueRaw !== "object") {
+                errors.push(`${vCtx} must be an object`);
+                return;
+            }
+
+            const venueKind = NON_EMPTY_STRING((venueRaw as any).kind ?? (venueRaw as any).venue);
+            if (!venueKind) {
+                errors.push(`${vCtx}.kind must be a non-empty string`);
+                return;
+            }
+
+            const kindLower = venueKind.toLowerCase();
+            const poolId = NON_EMPTY_STRING((venueRaw as any).id ?? (venueRaw as any).poolId);
+            if (kindLower !== "phoenix" && !poolId) {
+                errors.push(`${vCtx}.id must be provided for venue kind "${venueKind}"`);
+                return;
+            }
+
+            const baseDecimalsRaw = (venueRaw as any).baseDecimals ?? (venueRaw as any).base_decimals;
+            const quoteDecimalsRaw = (venueRaw as any).quoteDecimals ?? (venueRaw as any).quote_decimals;
+            const feeBpsRaw = (venueRaw as any).feeBps ?? (venueRaw as any).fee_bps;
+
+            venues.push({
+                venue: kindLower,
+                poolId: poolId ?? "",
+                poolKind: NON_EMPTY_STRING((venueRaw as any).poolKind ?? (venueRaw as any).pool_kind) ?? undefined,
+                feeBps: Number.isFinite(Number(feeBpsRaw)) ? Number(feeBpsRaw) : undefined,
+                baseDecimals: Number.isFinite(Number(baseDecimalsRaw)) ? Number(baseDecimalsRaw) : undefined,
+                quoteDecimals: Number.isFinite(Number(quoteDecimalsRaw)) ? Number(quoteDecimalsRaw) : undefined,
+                enabled: typeof (venueRaw as any).enabled === "boolean" ? (venueRaw as any).enabled : undefined,
+                freshness: normalizeFreshness((venueRaw as any).freshness),
+            });
+        });
+
+        const ammVenues = venues.filter((v) => v.venue !== "phoenix" && v.poolId && v.enabled !== false);
+        const primary = ammVenues[0];
+        if (!primary) {
+            errors.push(`${ctx}.venues must include at least one enabled non-phoenix venue`);
+        }
+
+        const id =
+            NON_EMPTY_STRING((entry as any).id) ??
+            NON_EMPTY_STRING((entry as any).symbol) ??
+            (phoenixMarket && primary ? `${phoenixMarket}:${primary.poolId}` : null);
+
+        if (baseMint && quoteMint && phoenixMarket && primary) {
+            out.push({
+                id: id ?? `${phoenixMarket}:${primary.poolId}`,
+                symbol: NON_EMPTY_STRING((entry as any).symbol) ?? (id ?? `${phoenixMarket}:${primary.poolId}`),
+                baseMint,
+                quoteMint,
+                phoenixMarket,
+                ammPool: primary.poolId,
+                ammVenues,
+                fees: (entry as any).fees,
+                sizing: (entry as any).sizing,
+                adapters: { amm: primary.venue, phoenix: "phoenix" },
+            });
+        }
+    });
+
+    if (errors.length) {
+        formatErrors(source, errors);
+    }
+    if (!out.length) {
+        throw new Error(`[pairs.json] ${source} produced no enabled pairs after validation`);
+    }
+    return out;
 }
 
 export function loadPairsFromEnvOrDefault(): PairSpec[] {
@@ -133,15 +218,13 @@ export function loadPairsFromEnvOrDefault(): PairSpec[] {
     if (fromEnv && fs.existsSync(fromEnv)) {
         const abs = path.isAbsolute(fromEnv) ? fromEnv : path.resolve(process.cwd(), fromEnv);
         const parsed = readJsonMaybe(abs);
-        const normalized = normalizePairsJson(parsed);
-        if (normalized && normalized.length) return normalized;
+        if (parsed != null) return parsePairsConfig(parsed, abs);
     }
 
     const defaultPath = path.resolve(process.cwd(), "configs", "pairs.json");
     if (fs.existsSync(defaultPath)) {
         const parsed = readJsonMaybe(defaultPath);
-        const normalized = normalizePairsJson(parsed);
-        if (normalized && normalized.length) return normalized;
+        if (parsed != null) return parsePairsConfig(parsed, defaultPath);
     }
 
     // Fallback: single SOL/USDC via env (your current baseline)
